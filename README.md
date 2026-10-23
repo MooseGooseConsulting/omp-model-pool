@@ -203,13 +203,48 @@ Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
 `@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
 unauthenticated filtering with fail-open vs `strict` block, stable phase across
 an availability change, restart reset, main-session advance with sub exclusion
-and a transcript/`getSessionFile`-based load signal (metadata-only resumed
-session, unwritten transcript, unreadable entries), profile- and
-`PI_CONFIG_DIR`-aware state paths, and opt-in persistence (cross-process
-continuation, abandoned-lock reclaim, a live holder's lock never stolen, a
-4-process × 5-pick contention run, disabled-is-in-memory-only, schema- and
-malformed-state fail-open, version-1 replacement, non-boolean opt-in ignored,
-flat-config opt-in, and in-process serialization).
+and a session-header load signal (metadata-only resumed session, session created
+by this process, unreadable header, unparseable timestamp), the real-host apply
+contract (a resolved `Model` is passed, and a refusal or a wrong active model is
+never logged as a rotation), profile- and `PI_CONFIG_DIR`-aware state paths, and
+opt-in persistence (cross-process continuation, abandoned-lock reclaim, a live
+holder's lock never stolen, a 4-process × 5-pick contention run,
+disabled-is-in-memory-only, schema- and malformed-state fail-open, version-1
+replacement, non-boolean opt-in ignored, flat-config opt-in, and in-process
+serialization).
+
+## Live integration test (optional)
+
+`npm test` is a fake host: it proves the pool logic, and it is why a wrong
+`setModel` argument survived a green suite. The real host is covered separately
+by an opt-in suite that runs an installed OMP:
+
+```bash
+npm run test:live
+```
+
+It proves main-session rotation end to end: two fresh OMP *processes* share one
+state file over a `[B, A]` pool while the starting model is pinned to `A`, so
+each run has to change the model to pass and the two runs have to differ. The
+evidence is the `model`/`provider` OMP recorded on the assistant turn, not the
+extension's log line — the log only reports what the extension asked for, which
+is the claim under test.
+
+Safety properties, since it spends real turns:
+
+- routes must be marked free by the provider's own catalog (`isFree`) *and*
+  present in OMP's registry. OMP's registry alone is not enough: it advertises
+  `:free` ids the provider then rejects with 404, and reports `unknown` pricing
+  for every zero-cost entry. `OMP_LIVE_ROUTES=a,b` pins the pair.
+- everything lands under one temp root: its own `--session-dir`, cwd, config
+  overlay and state file. The owner's config is hashed before and after and the
+  run fails if any file changed. No plugin is installed.
+- `--no-extensions -e <this repo>`, `--no-prewalk`, `--no-skills`, `--no-rules`,
+  `--no-title`, plus an overlay disabling prewalk and the advisor, so nothing
+  else runs and no paid role is reachable.
+- anything unproven reports `skip` with the reason rather than passing.
+
+Role (subagent) rotation is **not** covered yet — see the note below.
 
 ## API (tests / hosts)
 
