@@ -51,6 +51,14 @@ function makeHarness() {
   return { handlers, logs, notified, setModels, pi };
 }
 
+// The host applies a resolved `Model`, so assertions compare `provider/id`
+// identities; the original values in `setModels` are kept for shape checks.
+function appliedIds(setModels) {
+  return setModels.map((m) =>
+    m !== null && typeof m === "object" ? `${m.provider}/${m.id}` : String(m),
+  );
+}
+
 function subCtx(models, agentKind = "sub") {
   return {
     agent: { kind: agentKind, name: "task", id: "1" },
@@ -214,7 +222,7 @@ describe("main-session rotation", () => {
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
-    assert.deepEqual(setModels, ["p/x", "p/y", "p/x"]);
+    assert.deepEqual(appliedIds(setModels), ["p/x", "p/y", "p/x"]);
     // Sub sessions (incl. depth-0 /tan clones, which are kind=sub) never rotate.
     const n = setModels.length;
     await handlers.session_start(
@@ -266,7 +274,7 @@ describe("main-session rotation", () => {
       { type: "custom_message", customType: "widget", content: "hi", display: false },
     ], freshHeader());
     await handlers.session_start({ type: "session_start" }, fresh);
-    assert.deepEqual(setModels, ["p/x"], "startup metadata is not a conversation");
+    assert.deepEqual(appliedIds(setModels), ["p/x"], "startup metadata is not a conversation");
   });
 
   it("does not treat a tool result as a restored conversation", async () => {
@@ -276,7 +284,7 @@ describe("main-session rotation", () => {
       { type: "message", message: { role: "toolResult", content: "output" } },
     ], freshHeader());
     await handlers.session_start({ type: "session_start" }, fresh);
-    assert.deepEqual(setModels, ["p/x"], "only user/assistant turns mark a session as loaded");
+    assert.deepEqual(appliedIds(setModels), ["p/x"], "only user/assistant turns mark a session as loaded");
   });
 
   it("does not rotate a resumed session whose saved entries are metadata only", async () => {
@@ -301,7 +309,7 @@ describe("main-session rotation", () => {
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
     const fresh = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], freshHeader());
     await handlers.session_start({ type: "session_start" }, fresh);
-    assert.deepEqual(setModels, ["p/x"], "the startup metadata a new session carries is not a load");
+    assert.deepEqual(appliedIds(setModels), ["p/x"], "the startup metadata a new session carries is not a load");
   });
 
   it("rotates a new session even when its transcript is already on disk", async () => {
@@ -317,7 +325,7 @@ describe("main-session rotation", () => {
       const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], freshHeader());
       ctx.sessionManager.getSessionFile = () => sessionFile; // present, and deliberately ignored
       await handlers.session_start({ type: "session_start" }, ctx);
-      assert.deepEqual(setModels, ["p/x"], "a materialized transcript is not proof of a resume");
+      assert.deepEqual(appliedIds(setModels), ["p/x"], "a materialized transcript is not proof of a resume");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -353,6 +361,100 @@ describe("main-session rotation", () => {
       { agent: { kind: "main", name: "main", id: "Main" }, models: makeModels(["p/x", "p/y"]), ui: { notify: () => {} } },
     );
     assert.deepEqual(setModels, [], "unknown novelty must not risk overriding a restored model");
+  });
+
+  // --- real-host apply contract -------------------------------------------------
+  // The handler must hand the host a resolved Model and must not report a
+  // rotation it did not achieve. The fake host previously accepted a string, so
+  // these cases are what the old mock could not catch.
+
+  it("applies the resolved model object and confirms the host took it", async () => {
+    const { pi, handlers, setModels, logs } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    // Model a host that really applies the model rather than one whose
+    // `current()` cannot confirm anything, so the confirmation path is exercised
+    // positively instead of being skipped.
+    pi.setModel = async (m) => {
+      setModels.push(m);
+      ctx.models.current = () => m;
+    };
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.equal(setModels.length, 1);
+    const applied = setModels[0];
+    assert.equal(typeof applied, "object", "the host takes a Model, not a string");
+    assert.equal(applied.provider, "p");
+    assert.equal(applied.id, "x");
+    assert.ok(
+      logs.some(([l, m]) => l === "info" && m.includes("main session applied")),
+      "success is logged once the host confirms the model",
+    );
+  });
+
+  it("does not claim a rotation when the host refuses the model", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    pi.setModel = async () => false; // the host's "no credential for that model"
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("host refused")));
+    assert.ok(!logs.some(([, m]) => m.includes("main session applied")), "a refusal is not a rotation");
+  });
+
+  it("does not claim a rotation when the registry stops resolving the pick between choose and apply", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    // Filtering resolves each pool entry first, so the apply-time lookup is the
+    // third call. Failing only there exercises the defensive branch for a
+    // registry that changes under the handler; failing every call instead would
+    // never reach it, because an unresolvable pool is empty and returns early.
+    const real = ctx.models.resolve.bind(ctx.models);
+    let seen = 0;
+    ctx.models.resolve = (spec) => {
+      seen += 1;
+      return seen <= 2 ? real(spec) : null; // null, not undefined: the host may report either
+    };
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("could not resolve")));
+    assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
+  });
+
+  it("tolerates a host that reports null instead of undefined", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    // `current()` returning null after a successful apply must not throw: the
+    // host's confirmation is optional, not required.
+    ctx.models.current = () => null;
+    pi.setModel = async () => undefined;
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "info" && m.includes("main session applied")));
+    assert.ok(
+      !logs.some(([, m]) => m.includes("session_start error")),
+      "a null current model is a handled case, not an exception",
+    );
+  });
+
+  it("warns when the session keeps a different model than requested", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    ctx.models.current = () => ({ provider: "other", id: "model" });
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("but the session reports")));
+    assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
+  });
+
+  it("survives a host that throws from setModel", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    pi.setModel = async () => {
+      throw new Error("boom");
+    };
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("session_start error")));
   });
 });
 
@@ -440,7 +542,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       await handlers.session_start({ type: "session_start" }, main);
       mod.resetCounters();
       await handlers.session_start({ type: "session_start" }, main);
-      assert.deepEqual(setModels, ["p/x", "p/y"]);
+      assert.deepEqual(appliedIds(setModels), ["p/x", "p/y"]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
