@@ -139,6 +139,13 @@ describe("per-role round robin", () => {
     assert.equal(r.model, "p/a");
   });
 
+  it("ignores wrapper option keys in a flat config", () => {
+    const { pi } = makeHarness();
+    // A flat map keeps its option keys at the top level; only real roles become pools.
+    mod.default(pi, { slow: ["p/a"], strict: true, persistCounters: false, mainSessionRole: "default" });
+    assert.deepEqual(Object.keys(mod.getPools()), ["slow"]);
+  });
+
   it("leaves unconfigured roles untouched", () => {
     const { pi, handlers } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a"] } });
@@ -236,6 +243,16 @@ describe("main-session rotation", () => {
       subCtx(models),
     );
     assert.equal(r.model, "p/a");
+  });
+
+  it("does not rotate when main-session rotation is disabled", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] }, enableMainSessionRotation: false });
+    await handlers.session_start(
+      { type: "session_start" },
+      mainCtx(makeModels(["p/x", "p/y"]), [], freshHeader()),
+    );
+    assert.deepEqual(setModels, [], "enableMainSessionRotation:false keeps subagent cycling only");
   });
 
   it("does nothing when the main role pool is unconfigured", async () => {
@@ -747,6 +764,13 @@ describe("state file path resolution", () => {
 
 describe("strict policy boundary", () => {
   const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+
+  it("hard-blocks every role when strict is the boolean true", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: true });
+    const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
+    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
+  });
 
   it("does not hard-block when the model registry is unreadable", () => {
     const { pi, handlers } = makeHarness();

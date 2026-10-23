@@ -1,0 +1,522 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const mod = await import("../dist/index.js");
+
+// Every test isolates itself: a fresh temp dir is the OMP agent dir (so the
+// default config path can never be the real ~/.omp), the pool-config env vars
+// are cleared, and the module counters are reset. `node --test` isolates files
+// but not tests within a file, so each test must also present a distinct config
+// source signature to force a reload of module state.
+const ENV_KEYS = [
+  "PI_CODING_AGENT_DIR",
+  "OMP_MODEL_POOLS_JSON",
+  "OMP_MODEL_POOL_CONFIG",
+  "OMP_MODEL_POOL_STATE",
+  "OMP_PROFILE",
+  "PI_PROFILE",
+  "PI_CONFIG_DIR",
+];
+
+let tmpDirs = [];
+let savedEnv = {};
+
+function freshDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cfg-"));
+  tmpDirs.push(dir);
+  return dir;
+}
+
+function writeText(file, text) {
+  fs.writeFileSync(file, text);
+}
+
+function writeJson(file, value) {
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function makeHarness() {
+  const handlers = {};
+  const commands = {};
+  const logs = [];
+  const setModels = [];
+  const pi = {
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+    registerCommand: (name, options) => {
+      commands[name] = options;
+    },
+    setModel: async (model) => {
+      setModels.push(model);
+    },
+    logger: {
+      info: (...a) => logs.push(["info", a.join(" ")]),
+      warn: (...a) => logs.push(["warn", a.join(" ")]),
+      debug: (...a) => logs.push(["debug", a.join(" ")]),
+      error: (...a) => logs.push(["error", a.join(" ")]),
+    },
+  };
+  return { handlers, commands, logs, setModels, pi };
+}
+
+function parseSelector(spec) {
+  const i = String(spec).indexOf("/");
+  return i >= 0
+    ? { provider: String(spec).slice(0, i), id: String(spec).slice(i + 1) }
+    : { provider: "", id: String(spec) };
+}
+
+// A registry whose `list()` (authenticated) and `resolve()` (known selectors)
+// can be controlled independently — the difference between them is exactly what
+// authenticated membership means.
+function modelsFrom({ listed = [], resolvable = listed, listThrows = false, resolveThrows = false } = {}) {
+  const listedModels = listed.map(parseSelector);
+  const resolvableSet = new Set(resolvable);
+  return {
+    list: () => {
+      if (listThrows) throw new Error("registry down");
+      return listedModels.map((m) => ({ ...m }));
+    },
+    current: () => undefined,
+    resolve: (spec) => {
+      if (resolveThrows) throw new Error("resolve down");
+      const t = String(spec).trim();
+      return resolvableSet.has(t) ? parseSelector(t) : undefined;
+    },
+  };
+}
+
+function subCtx(models) {
+  return {
+    agent: { kind: "sub", name: "task", id: "1" },
+    models,
+    ui: { notify: () => {} },
+  };
+}
+
+const ROUTE_EV = {
+  type: "before_subagent_spawn",
+  agent: "reviewer",
+  invocationKind: "task",
+  modelRole: "@slow",
+  patterns: ["@slow"],
+};
+
+function warns(logs) {
+  return logs.filter(([level]) => level === "warn").map(([, message]) => message);
+}
+
+beforeEach(() => {
+  savedEnv = {};
+  for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
+  for (const key of ENV_KEYS) delete process.env[key];
+  process.env.PI_CODING_AGENT_DIR = freshDir();
+  mod.resetCounters();
+});
+
+afterEach(() => {
+  for (const key of ENV_KEYS) {
+    if (savedEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedEnv[key];
+  }
+  for (const dir of tmpDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+  tmpDirs = [];
+});
+
+describe("configuration precedence and provenance", () => {
+  it("A1: inline OMP_MODEL_POOLS_JSON is runtime-only and wins", () => {
+    process.env.OMP_MODEL_POOLS_JSON = JSON.stringify({ slow: ["p/inline-a1"] });
+    const { pi } = makeHarness();
+    mod.default(pi);
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "inline-env");
+    assert.equal(src.writable, false);
+    assert.deepEqual(mod.getPools().slow, ["p/inline-a1"]);
+  });
+
+  it("A2: an explicit OMP_MODEL_POOL_CONFIG file is writable with a resolved path", () => {
+    const file = path.join(freshDir(), "pools.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "file-env");
+    assert.equal(src.writable, true);
+    assert.equal(src.path, path.resolve(file));
+    assert.deepEqual(mod.getPools().slow, ["p/a"]);
+  });
+
+  it("A3: the profile default file is used when nothing higher-priority exists", () => {
+    const file = mod.resolveDefaultConfigFilePath();
+    writeJson(file, { pools: { slow: ["p/default"] } });
+    const { pi } = makeHarness();
+    mod.default(pi);
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "default-file");
+    assert.equal(src.writable, true);
+    assert.equal(src.path, mod.resolveDefaultConfigFilePath());
+    assert.deepEqual(mod.getPools().slow, ["p/default"]);
+  });
+
+  it("A4: no configuration at all reports kind none and empty pools", () => {
+    const { pi } = makeHarness();
+    mod.default(pi);
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "none");
+    assert.equal(src.writable, true);
+    assert.deepEqual(Object.keys(mod.getPools()), []);
+  });
+
+  it("A5: malformed inline JSON warns and falls through without throwing", () => {
+    process.env.OMP_MODEL_POOLS_JSON = "{ not json";
+    const { pi, logs } = makeHarness();
+    assert.doesNotThrow(() => mod.default(pi));
+    assert.ok(
+      warns(logs).some((m) => m.includes("OMP_MODEL_POOLS_JSON") && m.includes("not valid JSON")),
+      "a warning is logged for the malformed inline source",
+    );
+    assert.equal(mod.getConfigSource().kind, "none");
+    assert.deepEqual(Object.keys(mod.getPools()), []);
+  });
+
+  it("A6: a malformed explicit file is not writable and refuses edits", async () => {
+    const file = path.join(freshDir(), "broken.json");
+    writeText(file, "{ not json");
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi, logs } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().writable, false);
+    assert.ok(warns(logs).some((m) => m.includes("could not be read")));
+    // Spec: an unreadable authoritative source disables saving -> { ok: false }.
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.equal(
+      outcome.ok,
+      false,
+      `src/index.ts defect: savePoolEdit accepted the edit as runtime-only instead of refusing; got ${JSON.stringify(outcome)}`,
+    );
+  });
+
+  it("A7: programmatic options are runtime-only and take precedence", () => {
+    const { pi } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/opt"] } });
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "options");
+    assert.equal(src.writable, false);
+    assert.deepEqual(mod.getPools().slow, ["p/opt"]);
+  });
+});
+
+describe("default-file discovery and no-write-on-load", () => {
+  it("B8: resolveDefaultConfigFilePath honors PI_CODING_AGENT_DIR, then the profile", () => {
+    const base = process.env.PI_CODING_AGENT_DIR;
+    assert.equal(
+      mod.resolveDefaultConfigFilePath(),
+      path.join(path.resolve(base), "model-pool.json"),
+    );
+    process.env.OMP_PROFILE = "work";
+    assert.equal(
+      mod.resolveDefaultConfigFilePath(),
+      path.join(os.homedir(), ".omp", "profiles", "work", "agent", "model-pool.json"),
+    );
+  });
+
+  it("B9: loading, status and doctor never create the default file", async () => {
+    const { pi, commands } = makeHarness();
+    mod.default(pi);
+    const file = mod.resolveDefaultConfigFilePath();
+    assert.equal(fs.existsSync(file), false, "loading must not create the config file");
+    const ctx = {
+      agent: { kind: "main", name: "main", id: "Main" },
+      models: modelsFrom({ listed: ["p/a"] }),
+      ui: { notify: () => {} },
+    };
+    await commands["model-pool"].handler("status", ctx);
+    await commands["model-pool"].handler("doctor", ctx);
+    assert.equal(fs.existsSync(file), false, "status and doctor are read-only");
+  });
+});
+
+describe("automatic save transactions", () => {
+  it("C10: the first edit creates the nested default file and a reload sees it", async () => {
+    const { pi } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().kind, "none");
+    const file = mod.resolveDefaultConfigFilePath();
+    assert.equal(fs.existsSync(file), false);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    assert.deepEqual(readJson(file), { pools: { slow: ["p/a"] } });
+
+    const { pi: pi2 } = makeHarness();
+    mod.default(pi2);
+    assert.deepEqual(mod.getPools().slow, ["p/a"]);
+  });
+
+  it("C11: a nested edit preserves unrelated top-level keys and other roles", async () => {
+    const file = path.join(freshDir(), "nested.json");
+    writeJson(file, {
+      pools: { slow: ["p/a"], fast: ["p/b"] },
+      persistCounters: false,
+      strict: false,
+      custom: { keep: true },
+    });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/c"]);
+    assert.equal(outcome.ok, true);
+    const doc = readJson(file);
+    assert.deepEqual(doc.pools.slow, ["p/a", "p/c"]);
+    assert.deepEqual(doc.pools.fast, ["p/b"]);
+    assert.equal(doc.persistCounters, false);
+    assert.equal(doc.strict, false);
+    assert.deepEqual(doc.custom, { keep: true });
+  });
+
+  it("C12: a flat edit stays flat and preserves other top-level keys", async () => {
+    const file = path.join(freshDir(), "flat.json");
+    writeJson(file, { slow: ["p/a"], persistCounters: false, note: "keep" });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+    assert.equal(outcome.ok, true);
+    const doc = readJson(file);
+    assert.deepEqual(doc.slow, ["p/a", "p/b"]);
+    assert.equal(doc.persistCounters, false);
+    assert.equal(doc.note, "keep");
+    assert.ok(!Object.prototype.hasOwnProperty.call(doc, "pools"), "a flat file must not gain a pools wrapper");
+  });
+
+  it("C13: a flat config refuses role names that collide with reserved keys", async () => {
+    const file = path.join(freshDir(), "flat-reserved.json");
+    writeJson(file, { slow: ["p/a"] });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    for (const reserved of [
+      "pools",
+      "mainSessionRole",
+      "enableMainSessionRotation",
+      "strict",
+      "persistCounters",
+      "stateFile",
+    ]) {
+      const outcome = await mod.savePoolEdit(reserved, ["p/x"]);
+      assert.equal(outcome.ok, false, `role "${reserved}" must be refused`);
+      assert.match(outcome.error, /collides/);
+    }
+  });
+
+  it("C14: deleting a role removes it, and the last deletion drops the pools key", async () => {
+    const file = path.join(freshDir(), "delete.json");
+    writeJson(file, { pools: { slow: ["p/a"] }, persistCounters: false });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", null);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    const doc = readJson(file);
+    assert.ok(!Object.prototype.hasOwnProperty.call(doc, "pools"));
+    assert.equal(doc.persistCounters, false);
+    assert.deepEqual(Object.keys(mod.getPools()), []);
+  });
+
+  it("C15: saving an empty pool is refused", async () => {
+    const { pi } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] } });
+    const outcome = await mod.savePoolEdit("slow", []);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /empty pool/);
+  });
+
+  it("C16: a missing explicit target is created on the first save, not on load", async () => {
+    const file = path.join(freshDir(), "later.json");
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().kind, "file-env");
+    assert.equal(mod.getConfigSource().writable, true);
+    assert.equal(fs.existsSync(file), false, "loading must not create the file");
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    assert.deepEqual(readJson(file), { pools: { slow: ["p/a"] } });
+  });
+
+  it("C17: a stale expectedRevision is refused and changes nothing", async () => {
+    const file = path.join(freshDir(), "stale.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const revision = mod.getConfigRevision();
+    const first = await mod.savePoolEdit("slow", ["p/a", "p/b"], revision);
+    assert.equal(first.ok, true);
+    const stale = await mod.savePoolEdit("slow", ["p/z"], revision);
+    assert.equal(stale.ok, false);
+    assert.deepEqual(readJson(file).pools.slow, ["p/a", "p/b"]);
+    assert.deepEqual(mod.getPools().slow, ["p/a", "p/b"]);
+  });
+
+  it("C18: an out-of-band file change is detected and not overwritten", async () => {
+    const file = path.join(freshDir(), "conflict.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const external = { pools: { slow: ["p/a", "p/external"] } };
+    writeJson(file, external);
+    const outcome = await mod.savePoolEdit("slow", ["p/b"]);
+    assert.equal(outcome.ok, false);
+    assert.deepEqual(readJson(file), external, "the external change must survive");
+    assert.deepEqual(mod.getPools().slow, ["p/a"]);
+  });
+
+  it("C19: a config path equal to the state path is refused", async () => {
+    const file = path.join(freshDir(), "collide.json");
+    const doc = { pools: { slow: ["p/a"] }, stateFile: file };
+    writeJson(file, doc);
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /state file/);
+    assert.deepEqual(readJson(file), doc);
+  });
+
+  it("C20: an inline source edits in memory only and writes no file", async () => {
+    process.env.OMP_MODEL_POOLS_JSON = JSON.stringify({ slow: ["p/a"] });
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: true });
+    assert.deepEqual(mod.getPools().slow, ["p/a", "p/b"]);
+    assert.equal(fs.existsSync(mod.resolveDefaultConfigFilePath()), false);
+  });
+});
+
+describe("rebinding and replacement", () => {
+  it("D21: a runtime edit survives a re-bind while the inline source is unchanged", async () => {
+    process.env.OMP_MODEL_POOLS_JSON = JSON.stringify({ slow: ["p/d21"] });
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/d21", "p/d21b"]);
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.runtimeOnly, true);
+    assert.deepEqual(mod.getPools().slow, ["p/d21", "p/d21b"]);
+
+    const { pi: pi2 } = makeHarness();
+    mod.default(pi2);
+    assert.deepEqual(mod.getPools().slow, ["p/d21", "p/d21b"], "the runtime edit is kept, not reset to the document");
+  });
+
+  it("D22: configurePools replaces the active configuration", () => {
+    const { pi } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] } });
+    mod.configurePools({ pools: { fast: ["p/x"] } });
+    assert.deepEqual(Object.keys(mod.getPools()), ["fast"]);
+    assert.deepEqual(mod.getPools().fast, ["p/x"]);
+  });
+});
+
+describe("authenticated membership", () => {
+  it("E23: an entry that resolves but is not listed is unavailable", async () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/ghost", "p/a"] } });
+    const models = modelsFrom({ listed: ["p/a"], resolvable: ["p/ghost", "p/a"] });
+
+    const picked = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
+    assert.equal(picked.model, "p/a");
+
+    const report = mod.diagnosePools(models);
+    const role = report.roles.find((r) => r.role === "slow");
+    assert.equal(role.entries[0].eligible, false);
+    assert.match(role.entries[0].reason, /not authenticated/);
+    assert.equal(role.entries[1].eligible, true);
+  });
+
+  it("E24: a readable but empty registry makes every entry unavailable", async () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] } });
+    const models = modelsFrom({ listed: [], resolvable: ["p/a"] });
+
+    const picked = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
+    assert.equal(picked, undefined);
+
+    const report = mod.diagnosePools(models);
+    assert.equal(report.registryReadable, true);
+    assert.equal(report.roles[0].entries[0].eligible, false);
+  });
+
+  it("E25: a missing or throwing registry fails open and reports unreadable", async () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] } });
+
+    const missing = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(undefined));
+    assert.equal(missing, undefined);
+    assert.equal(mod.diagnosePools(undefined).registryReadable, false);
+
+    const throwing = modelsFrom({ listed: ["p/a"], listThrows: true });
+    const thrown = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(throwing));
+    assert.equal(thrown, undefined);
+    assert.equal(mod.diagnosePools(throwing).registryReadable, false);
+  });
+
+  it("E26: strict hard-blocks only when the registry is readable and empty of matches", async () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
+
+    const blocked = await handlers.before_subagent_spawn(
+      ROUTE_EV,
+      subCtx(modelsFrom({ listed: ["p/other"] })),
+    );
+    assert.deepEqual(blocked, {
+      block: true,
+      reason: "model-pool: no authenticated model available for role @slow",
+    });
+
+    const unreadable = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(undefined));
+    assert.equal(unreadable, undefined);
+  });
+
+  it("E27: diagnosePools eligibility matches what the router picks", async () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/ghost", "p/b"] } });
+    const models = modelsFrom({ listed: ["p/a", "p/b"], resolvable: ["p/a", "p/ghost", "p/b"] });
+
+    const report = mod.diagnosePools(models);
+    assert.deepEqual(report.roles[0].entries.map((e) => e.eligible), [true, false, true]);
+
+    const first = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
+    const second = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
+    assert.equal(first.model, "p/a");
+    assert.equal(second.model, "p/b");
+  });
+});
