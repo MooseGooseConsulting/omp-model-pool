@@ -259,8 +259,7 @@ describe("cross-process counter persistence (opt-in)", () => {
     }
   });
 
-  it("serializes parallel picks through the lock (no duplicate slot)", async () => {
-    const { dir, file } = tmpStateFile();
+  it("serializes parallel picks through the lock (no duplicate slot)", async () => {    const { dir, file } = tmpStateFile();
     try {
       const { pi, handlers } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
@@ -292,5 +291,71 @@ describe("cross-process counter persistence (opt-in)", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("refuses a state file from an unknown schema (fail open, file untouched)", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ version: 2, counters: { slow: 5 } }));
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a"); // falls back to in-memory, ignores the foreign cursor
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2); // not overwritten
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("state file path resolution", () => {
+  it("expands a leading ~ and never returns a literal ~ path", () => {
+    const p = mod.resolveStateFilePath("~/custom/state.json");
+    assert.ok(path.isAbsolute(p), p);
+    assert.ok(!p.includes("~"), p);
+    assert.equal(p, path.resolve(path.join(os.homedir(), "custom", "state.json")));
+  });
+
+  it("honors PI_CODING_AGENT_DIR as the base for relative and default paths", () => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    const base = path.join(os.tmpdir(), "mmm-agent");
+    process.env.PI_CODING_AGENT_DIR = base;
+    try {
+      assert.equal(mod.resolveStateFilePath("state.json"), path.resolve(base, "state.json"));
+      assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(base), "model-musical-models-state.json"));
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+describe("strict policy boundary", () => {
+  const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+
+  it("does not hard-block when the model registry is unreadable", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
+    const noRegistry = { agent: { kind: "sub" }, models: undefined, ui: { notify: () => {} } };
+    assert.equal(handlers.before_subagent_spawn(ev, noRegistry), undefined);
+  });
+
+  it("does not hard-block when the registry read throws", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
+    const throwing = {
+      agent: { kind: "sub" },
+      models: { list: () => { throw new Error("registry down"); }, current: () => undefined, resolve: () => undefined },
+      ui: { notify: () => {} },
+    };
+    assert.equal(handlers.before_subagent_spawn(ev, throwing), undefined);
+  });
+
+  it("still hard-blocks when the registry answers that nothing is authenticated", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
+    const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
+    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
   });
 });

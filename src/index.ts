@@ -179,13 +179,38 @@ export function resetCounters(): void {
 // never silently reset (it is left for the operator to repair or delete).
 // ---------------------------------------------------------------------------
 
-/** Resolve the state file: explicit option > `OMP_MODEL_POOL_STATE` > OMP agent dir. */
+/** OMP agent dir. Honors `PI_CODING_AGENT_DIR` (named profiles), else `~/.omp/agent`. */
+function agentDir(): string {
+  const fromEnv = process.env["PI_CODING_AGENT_DIR"];
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return path.resolve(expandTilde(fromEnv.trim()));
+  return path.join(os.homedir(), ".omp", "agent");
+}
+
+/** Expand a leading `~`. `path.resolve` does not, so a literal `~` directory would be created. */
+function expandTilde(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/**
+ * Resolve the state file: explicit option > `OMP_MODEL_POOL_STATE` > agent dir.
+ * A relative path (and a bare `~`) resolves against the agent dir, never the
+ * process CWD, so two processes started from different directories still share.
+ */
 export function resolveStateFilePath(explicit?: string): string {
+  const base = agentDir();
   const fromOption = typeof explicit === "string" ? explicit.trim() : "";
-  if (fromOption.length > 0) return path.resolve(fromOption);
+  if (fromOption.length > 0) {
+    const expanded = expandTilde(fromOption);
+    return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(base, expanded);
+  }
   const fromEnv = process.env["OMP_MODEL_POOL_STATE"];
-  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return path.resolve(fromEnv.trim());
-  return path.join(os.homedir(), ".omp", "agent", DEFAULT_STATE_FILE);
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
+    const expanded = expandTilde(fromEnv.trim());
+    return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(base, expanded);
+  }
+  return path.join(base, DEFAULT_STATE_FILE);
 }
 
 /** Parse `{ version: 1, counters: { role: int } }`; undefined when malformed. */
@@ -197,7 +222,12 @@ function parseState(raw: string): Record<string, number> | undefined {
     return undefined;
   }
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
-  const rawCounters = (obj as Record<string, unknown>)["counters"];
+  const record = obj as Record<string, unknown>;
+  // Read-side schema guard: a state file written by a future/foreign schema is
+  // refused rather than half-read (the caller then fails open).
+  const version = record["version"];
+  if (version !== undefined && version !== 1) return undefined;
+  const rawCounters = record["counters"];
   if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) return undefined;
   const out: Record<string, number> = Object.create(null);
   for (const [key, value] of Object.entries(rawCounters as Record<string, unknown>)) {
@@ -246,6 +276,8 @@ function sleep(ms: number): Promise<void> {
 /** Run `fn` while holding an atomic-directory lock; stale locks are reclaimed. */
 async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
   const lock = `${file}.lock`;
+  const owner = path.join(lock, "owner");
+  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
@@ -266,13 +298,30 @@ async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
       await sleep(20);
     }
   }
+  let tokenWritten = false;
+  try {
+    fs.writeFileSync(owner, token, { mode: 0o600 });
+    tokenWritten = true;
+  } catch {
+    // Best-effort: without a token, release falls back to unconditional removal.
+  }
   try {
     return fn();
   } finally {
-    try {
-      fs.rmSync(lock, { recursive: true, force: true });
-    } catch {
-      // Lock release is best-effort.
+    if (tokenWritten) {
+      // Release only a lock we still own. If ours was reclaimed as stale and a
+      // new holder took it, deleting that lock would admit a third writer.
+      try {
+        if (fs.readFileSync(owner, "utf8").trim() === token) fs.rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // Unverifiable: leave it for the stale reclaimer rather than break a live lock.
+      }
+    } else {
+      try {
+        fs.rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // Lock release is best-effort.
+      }
     }
   }
 }
@@ -422,17 +471,25 @@ function modelIdentity(m: ModelLike): string {
  * Keep pool entries that resolve AND are present in the authenticated list.
  * Returns the surviving selectors in pool order (original strings preserved so
  * the child re-resolves exactly what the operator configured).
+ *
+ * `registryReadable` distinguishes "the model registry says none of these are
+ * authenticated" (a real empty pool) from "we could not read the registry at
+ * all" (a transient host/registry failure). Only the former may hard-block
+ * under `strict`; the latter always fails open.
  */
-function filterAvailable(selectors: string[], models: ModelsQuery | undefined): string[] {
-  if (models === undefined) return [];
-  let available: ModelLike[];
+function filterAvailable(
+  selectors: string[],
+  models: ModelsQuery | undefined,
+): { available: string[]; registryReadable: boolean } {
+  if (models === undefined) return { available: [], registryReadable: false };
+  let listed: ModelLike[];
   try {
-    available = models.list() ?? [];
+    listed = models.list() ?? [];
   } catch {
-    return [];
+    return { available: [], registryReadable: false };
   }
   const identities = new Set<string>();
-  for (const m of available) {
+  for (const m of listed) {
     const id = modelIdentity(m);
     if (id.length > 0) identities.add(id);
   }
@@ -449,10 +506,10 @@ function filterAvailable(selectors: string[], models: ModelsQuery | undefined): 
     // Membership is by canonical identity when known; a resolved model without
     // an id still counts if resolve() itself succeeded and the list is empty
     // (hosts that report no authenticated models yet still resolve aliases).
-    if (id.length > 0 && !identities.has(id) && available.length > 0) continue;
+    if (id.length > 0 && !identities.has(id) && listed.length > 0) continue;
     out.push(selector);
   }
-  return out;
+  return { available: out, registryReadable: true };
 }
 
 /** Advance the role counter and return the pick plus its pool position. */
@@ -515,12 +572,15 @@ function handleBeforeSubagentSpawn(
     const pool = activeConfig.pools[roleKey];
     if (pool === undefined || pool.length === 0) return undefined; // Unconfigured role: core behavior unchanged.
 
-    const available = filterAvailable(pool, ctx.models);
+    const { available, registryReadable } = filterAvailable(pool, ctx.models);
     if (available.length === 0) {
-      safeLog(pi, "warn", `[model-pool] empty pool for role=${roleKey} agent=${event.agent} kind=${event.invocationKind}; leaving spawn unmodified`);
-      if (isStrictForRole(roleKey)) {
+      // Hard-block only when the registry actually answered "none of these are
+      // authenticated"; an unreadable registry is a transient failure, not a
+      // reason to refuse the spawn.
+      if (isStrictForRole(roleKey) && registryReadable) {
         return { block: true, reason: `model-pool: no authenticated model available for role @${roleKey}` };
       }
+      safeLog(pi, "warn", `[model-pool] empty pool for role=${roleKey} agent=${event.agent} kind=${event.invocationKind} registryReadable=${registryReadable}; leaving spawn unmodified`);
       return undefined;
     }
 
@@ -558,9 +618,9 @@ async function handleSessionStart(
     const pool = activeConfig.pools[roleKey];
     if (pool === undefined || pool.length === 0) return;
 
-    const available = filterAvailable(pool, ctx.models);
+    const { available, registryReadable } = filterAvailable(pool, ctx.models);
     if (available.length === 0) {
-      safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey}; leaving model unchanged`);
+      safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey} registryReadable=${registryReadable}; leaving model unchanged`);
       return;
     }
     const { picked, index, persisted } = await pickForRole(pi, roleKey, available);

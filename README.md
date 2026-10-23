@@ -58,6 +58,9 @@ order:
 3. `OMP_MODEL_POOL_CONFIG` — path to a JSON file as above.
 
 `stateFile` also honors `OMP_MODEL_POOL_STATE` when the option is unset.
+Relative paths — and a leading `~` — resolve against the OMP agent dir
+(`PI_CODING_AGENT_DIR` when set, else `~/.omp/agent`), never the process CWD,
+so processes started from different directories still share one cycle.
 
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
@@ -86,6 +89,10 @@ omp --extension ./omp-musical-models
   `mainSessionRole` (default `"default"`), then `pi.setModel(picked)` plus a
   UI notify. Disabled with `enableMainSessionRotation: false`.
 - Handler errors fail open (log, return nothing) unless `strict` applies.
+- `strict` hard-blocks only when the model registry actually answered and none
+  of the pool's entries are authenticated. An unreadable registry (no
+  `ctx.models`, or a throwing `list()`) is a transient failure and always fails
+  open, never a refusal.
 - Core fallback is preserved: the returned single `model` keeps role identity
   so `retry.fallbackChains` / prewalk / advisor semantics still apply. If the
   requirement ever becomes "model must never change mid-instance", verify
@@ -104,10 +111,15 @@ omp --extension ./omp-musical-models
   OS process), which is the usual case for `omp -p`.
 - With `persistCounters: true` the pick becomes a read-modify-write against
   `stateFile` (`~/.omp/agent/model-musical-models-state.json` by default),
-  serialized by an atomic-directory lock so parallel processes never draw the
-  same slot. Every failure is fail-open: a bad read/write logs and falls back
-  to the in-memory counter, and a malformed state file is left untouched for
-  the operator to repair or delete rather than silently reset.
+  serialized by an atomic-directory lock so parallel processes on the **same
+  machine and filesystem** never draw the same slot. The lock is not
+  distributed: state is not shared across machines, and a network filesystem
+  with weak attribute caching weakens the stale-lock check. A release never
+  removes a lock it no longer owns, so a reclaimed stale lock cannot cascade.
+- Every failure is fail-open: a bad read/write logs and falls back to the
+  in-memory counter, and a state file that is malformed or carries an unknown
+  `version` is left untouched for the operator to repair or delete rather than
+  silently reset.
 - Revived / resumed children do not advance (the event fires once per new
   child, never on revive/resume).
 - New main sessions share the same counters when roles overlap;
