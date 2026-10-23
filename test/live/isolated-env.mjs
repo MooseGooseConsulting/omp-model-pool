@@ -158,18 +158,26 @@ export function createIsolatedEnv({ poolConfig, repoRoot, label = "run" }) {
     env,
     ompArgs,
     /**
-     * Remove this run's root. Returns true when it is actually gone.
+     * Remove this run's root, retrying briefly. Resolves true when it is gone.
      *
-     * The result is returned rather than swallowed: on Windows a locked file
-     * leaves the tree half-removed (`sessions/` and the manifest gone, `work/`
-     * behind), and silently swallowing that hid the fact that the sweep below
-     * could not collect the remainder either.
+     * The retry is not defensive padding: the first removal reliably fails on
+     * Windows because a child process handle is still closing, and the same tree
+     * deletes cleanly a moment later. Without the retry, cleanup left a partial
+     * root (`work/` behind) that also defeated the sweep's layout guard, so the
+     * two bugs hid each other.
+     *
+     * The result is returned rather than swallowed so a genuinely stuck tree is
+     * visible in the run report instead of only in the temp dir.
      */
-    cleanup() {
-      try {
-        rmSync(root, { recursive: true, force: true });
-      } catch {
-        // Fall through to the existence check, which is the real answer.
+    async cleanup() {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // Expected while handles close; the existence check below decides.
+        }
+        if (!existsSync(root)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 200));
       }
       return !existsSync(root);
     },
