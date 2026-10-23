@@ -157,12 +157,21 @@ export function createIsolatedEnv({ poolConfig, repoRoot, label = "run" }) {
     extensionFile,
     env,
     ompArgs,
+    /**
+     * Remove this run's root. Returns true when it is actually gone.
+     *
+     * The result is returned rather than swallowed: on Windows a locked file
+     * leaves the tree half-removed (`sessions/` and the manifest gone, `work/`
+     * behind), and silently swallowing that hid the fact that the sweep below
+     * could not collect the remainder either.
+     */
     cleanup() {
       try {
         rmSync(root, { recursive: true, force: true });
       } catch {
-        // Best effort; the root is under the OS temp dir and safely named.
+        // Fall through to the existence check, which is the real answer.
       }
+      return !existsSync(root);
     },
   };
 }
@@ -182,8 +191,13 @@ export function writeRunManifest(isolated, data) {
  * after the fact, not only by the run that made the mess.
  *
  * Deliberately narrow: only `omp-live-*` directories under the OS temp dir, only
- * once they are older than an hour, and only when they have the layout this
- * module creates. Anything else in the temp dir is left alone.
+ * once they are older than an hour, and only when they carry part of the layout
+ * this module creates.
+ *
+ * The layout check is `work` OR `sessions`, not both. Requiring both was the
+ * original bug here: a partial cleanup leaves exactly one of them, so the guard
+ * skipped the only shape that actually needed collecting — which was also the
+ * case the PR description claimed was handled.
  */
 export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
   const removed = [];
@@ -199,9 +213,11 @@ export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
     const full = path.join(os.tmpdir(), entry.name);
     try {
       if (now - statSync(full).mtimeMs < olderThanMs) continue; // possibly a run in flight
-      if (!existsSync(path.join(full, "work")) || !existsSync(path.join(full, "sessions"))) continue;
+      const ours =
+        existsSync(path.join(full, "work")) || existsSync(path.join(full, "sessions"));
+      if (!ours) continue;
       rmSync(full, { recursive: true, force: true });
-      removed.push(full);
+      if (!existsSync(full)) removed.push(full);
     } catch {
       // Best effort.
     }

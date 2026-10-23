@@ -12,7 +12,7 @@
 //     from each other. Pinning also guarantees no unconfigured model is called.
 //
 // Anything unproven is reported as skipped with the reason, never as a pass.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -302,6 +302,12 @@ async function main() {
       results,
     });
     isolated.cleanup();
+    const gone = !existsSync(isolated.root);
+    record(
+      "run root removed",
+      gone ? "pass" : "fail",
+      gone ? "temp root deleted" : `${isolated.root} survived (the sweep collects it later)`,
+    );
   }
 
   console.log(`\n${results.length - failures}/${results.length} checks passed`);
