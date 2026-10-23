@@ -11,5 +11,6 @@
   },
   "mainSessionRole": "default",
   "strict": false,
-  "enableMainSessionRotation": true
+  "enableMainSessionRotation": true,
+  "persistCounters": false
 }

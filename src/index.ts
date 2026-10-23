@@ -22,6 +22,7 @@
 // semantics are preserved, not replaced.
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,15 @@ export interface ModelPoolConfig {
    * `true` blocks every empty-pool spawn; an array blocks only the listed roles.
    */
   strict?: boolean | string[];
+  /**
+   * Opt-in cross-process counter persistence. `false` (default) keeps the
+   * in-memory counters only, so every OMP process starts its own cycle.
+   * `true` reads and writes the shared state file under a cross-process lock,
+   * so sequential `omp` processes (each a fresh OS process) continue the cycle.
+   */
+  persistCounters?: boolean;
+  /** State file for `persistCounters`. Default: `OMP_MODEL_POOL_STATE` or `~/.omp/agent/model-musical-models-state.json`. */
+  stateFile?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,11 +124,20 @@ export interface ModelPoolConfig {
 
 const counters: Record<string, number> = Object.create(null);
 
+/** State file name under the OMP agent dir when no explicit/env path is given. */
+const DEFAULT_STATE_FILE = "model-musical-models-state.json";
+/** Cross-process lock acquisition budget (spawn-critical section is milliseconds). */
+const LOCK_TIMEOUT_MS = 6000;
+/** A lock older than this is assumed abandoned by a crashed process. */
+const STALE_LOCK_MS = 120_000;
+
 const activeConfig: Required<Omit<ModelPoolConfig, "strict">> & { strict: boolean | string[] } = {
   pools: Object.create(null),
   mainSessionRole: "default",
   enableMainSessionRotation: true,
   strict: false,
+  persistCounters: false,
+  stateFile: resolveStateFilePath(),
 };
 
 /** Replace the active pool configuration (used by the factory and tests). */
@@ -128,6 +147,8 @@ export function configurePools(next: ModelPoolConfig | undefined | null): void {
   activeConfig.mainSessionRole = normalized.mainSessionRole;
   activeConfig.enableMainSessionRotation = normalized.enableMainSessionRotation;
   activeConfig.strict = normalized.strict;
+  activeConfig.persistCounters = normalized.persistCounters;
+  activeConfig.stateFile = normalized.stateFile;
 }
 
 /** Read-only snapshot of the active pools (tests / diagnostics). */
@@ -145,6 +166,127 @@ export function getCounters(): Record<string, number> {
 /** Reset all round-robin counters (tests; mirrors an OMP restart). */
 export function resetCounters(): void {
   for (const k of Object.keys(counters)) delete counters[k];
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in cross-process counter persistence.
+//
+// Counters normally live in memory, so each OMP process starts its own cycle.
+// When `persistCounters` is on, the pick is a read-modify-write against a
+// shared JSON state file, serialized by an atomic-directory lock so parallel
+// processes do not double-pick. Every failure here is fail-open: the caller
+// logs and falls back to the in-memory counter, and a malformed state file is
+// never silently reset (it is left for the operator to repair or delete).
+// ---------------------------------------------------------------------------
+
+/** Resolve the state file: explicit option > `OMP_MODEL_POOL_STATE` > OMP agent dir. */
+export function resolveStateFilePath(explicit?: string): string {
+  const fromOption = typeof explicit === "string" ? explicit.trim() : "";
+  if (fromOption.length > 0) return path.resolve(fromOption);
+  const fromEnv = process.env["OMP_MODEL_POOL_STATE"];
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return path.resolve(fromEnv.trim());
+  return path.join(os.homedir(), ".omp", "agent", DEFAULT_STATE_FILE);
+}
+
+/** Parse `{ version: 1, counters: { role: int } }`; undefined when malformed. */
+function parseState(raw: string): Record<string, number> | undefined {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
+  const rawCounters = (obj as Record<string, unknown>)["counters"];
+  if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) return undefined;
+  const out: Record<string, number> = Object.create(null);
+  for (const [key, value] of Object.entries(rawCounters as Record<string, unknown>)) {
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) out[key] = value;
+  }
+  return out;
+}
+
+/** Read counters from disk. Missing file → empty; malformed file → throw (no silent reset). */
+function readPersistedCounters(file: string): Record<string, number> {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null);
+    throw err;
+  }
+  const parsed = parseState(raw);
+  if (parsed === undefined) throw new Error(`invalid model-pool state at ${file}`);
+  return parsed;
+}
+
+/** Write the state via a unique temp file + atomic rename (mode 0600). */
+function writeStateAtomic(file: string, next: Record<string, number>): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, counters: next }, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    fs.renameSync(tmp, file);
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Temp cleanup is best-effort.
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Run `fn` while holding an atomic-directory lock; stale locks are reclaimed. */
+async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
+  const lock = `${file}.lock`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      fs.mkdirSync(lock);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > STALE_LOCK_MS) {
+          fs.rmSync(lock, { recursive: true, force: true });
+          continue;
+        }
+      } catch (statErr) {
+        if ((statErr as NodeJS.ErrnoException).code !== "ENOENT") throw statErr;
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for model-pool lock ${lock}`);
+      await sleep(20);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.rmSync(lock, { recursive: true, force: true });
+    } catch {
+      // Lock release is best-effort.
+    }
+  }
+}
+
+/** Atomically select and advance the role cursor in the shared state file. */
+function advancePersisted(roleKey: string, poolLength: number, file: string): Promise<{ slot: number }> {
+  return withStateLock(file, () => {
+    const persisted = readPersistedCounters(file);
+    const cursor = persisted[roleKey] ?? 0;
+    const slot = poolLength === 0 ? 0 : cursor % poolLength;
+    persisted[roleKey] = cursor + 1;
+    writeStateAtomic(file, persisted);
+    return { slot };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +317,22 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
   mainSessionRole: string;
   enableMainSessionRotation: boolean;
   strict: boolean | string[];
+  persistCounters: boolean;
+  stateFile: string;
 } {
   const pools: Record<string, string[]> = Object.create(null);
   const rawPools: unknown = raw?.pools ?? raw;
   if (rawPools !== null && typeof rawPools === "object" && !Array.isArray(rawPools)) {
     for (const [k, v] of Object.entries(rawPools as Record<string, unknown>)) {
       // Skip the wrapper-level option keys when a flat config is passed.
-      if (raw?.pools === undefined && (k === "mainSessionRole" || k === "enableMainSessionRotation" || k === "strict")) {
+      if (
+        raw?.pools === undefined &&
+        (k === "mainSessionRole" ||
+          k === "enableMainSessionRotation" ||
+          k === "strict" ||
+          k === "persistCounters" ||
+          k === "stateFile")
+      ) {
         continue;
       }
       const key = normalizeRoleKey(k);
@@ -196,6 +347,8 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
     mainSessionRole,
     enableMainSessionRotation: raw?.enableMainSessionRotation ?? true,
     strict: raw?.strict ?? false,
+    persistCounters: raw?.persistCounters ?? false,
+    stateFile: resolveStateFilePath(raw?.stateFile),
   };
 }
 
@@ -311,6 +464,32 @@ function pickRoundRobin(roleKey: string, available: string[]): { picked: string;
   return { picked, index: slot };
 }
 
+/**
+ * Pick for a role, honoring `persistCounters`. A persistence failure logs and
+ * falls back to the in-memory counter (fail open) rather than aborting a spawn.
+ */
+async function pickForRole(
+  pi: ExtensionApiLike,
+  roleKey: string,
+  available: string[],
+): Promise<{ picked: string; index: number; persisted: boolean }> {
+  if (!activeConfig.persistCounters) {
+    return { ...pickRoundRobin(roleKey, available), persisted: false };
+  }
+  try {
+    const { slot } = await advancePersisted(roleKey, available.length, activeConfig.stateFile);
+    counters[roleKey] = (counters[roleKey] ?? 0) + 1; // mirror for diagnostics/tests
+    return { picked: available[slot] as string, index: slot, persisted: true };
+  } catch (err) {
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] persisted counter read/write failed; using in-memory counters: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ...pickRoundRobin(roleKey, available), persisted: false };
+  }
+}
+
 function describePick(roleKey: string, picked: string, index: number, total: number): string {
   return `pool ${roleKey}[${index + 1}/${total}]: ${picked}`;
 }
@@ -323,7 +502,7 @@ function handleBeforeSubagentSpawn(
   pi: ExtensionApiLike,
   event: BeforeSubagentSpawnEvent,
   ctx: ExtensionContextLike,
-): BeforeSubagentSpawnResult | undefined {
+): BeforeSubagentSpawnResult | undefined | Promise<BeforeSubagentSpawnResult | undefined> {
   try {
     // Explicit per-dispatch pin (no role alias) — preserve the deliberate pin.
     if (event.modelRole === undefined || event.modelRole === null) {
@@ -345,6 +524,13 @@ function handleBeforeSubagentSpawn(
       return undefined;
     }
 
+    if (activeConfig.persistCounters) {
+      return pickForRole(pi, roleKey, available).then(({ picked, index, persisted }) => {
+        const note = describePick(roleKey, picked, index, available.length);
+        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${picked} index=${index} total=${available.length} persisted=${persisted}`);
+        return { model: picked, note };
+      });
+    }
     const { picked, index } = pickRoundRobin(roleKey, available);
     const note = describePick(roleKey, picked, index, available.length);
     safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${picked} index=${index} total=${available.length}`);
@@ -377,9 +563,9 @@ async function handleSessionStart(
       safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey}; leaving model unchanged`);
       return;
     }
-    const { picked, index } = pickRoundRobin(roleKey, available);
+    const { picked, index, persisted } = await pickForRole(pi, roleKey, available);
     const note = describePick(roleKey, picked, index, available.length);
-    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${picked} index=${index} total=${available.length}`);
+    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${picked} index=${index} total=${available.length} persisted=${persisted}`);
     if (typeof pi.setModel === "function") {
       await pi.setModel(picked);
     }
@@ -412,13 +598,13 @@ export default function modelPoolExtension(pi: ExtensionApiLike, options?: Model
   safeLog(
     pi,
     "info",
-    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)}`,
+    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"}`,
   );
 
   pi.on("before_subagent_spawn", (event, ctx) =>
     handleBeforeSubagentSpawn(pi, event as BeforeSubagentSpawnEvent, ctx as ExtensionContextLike),
   );
   pi.on("session_start", (event, ctx) =>
-    void handleSessionStart(pi, event as SessionStartEvent, ctx as ExtensionContextLike),
+    handleSessionStart(pi, event as SessionStartEvent, ctx as ExtensionContextLike),
   );
 }
