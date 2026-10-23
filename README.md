@@ -46,8 +46,7 @@ Only roles you configure cycle.
   "mainSessionRole": "default",      // role rotated by session_start (bare name)
   "enableMainSessionRotation": true, // false keeps subagent cycling only
   "strict": false,                   // true | ["slow"] blocks empty-pool spawns
-  "persistCounters": false,          // true shares the cycle across OMP processes
-  "stateFile": "~/.omp/agent/model-pool-state.json" // optional; see below
+  "persistCounters": false           // true shares the cycle across OMP processes
 }
 ```
 
@@ -67,10 +66,13 @@ The agent dir follows OMP's own resolution rather than assuming the default
 profile: the config root is `~/<PI_CONFIG_DIR or .omp>`, a named profile
 (`OMP_PROFILE`, or the legacy `PI_PROFILE`) relocates it to
 `<root>/profiles/<name>/agent`, and `PI_CODING_AGENT_DIR` applies to the
-default profile only — a named profile ignores it. So two profiles never share
-one counter file, and a profile never writes state into another profile's
-directory. XDG relocation is **not** followed; set `stateFile` explicitly on a
-host that moved its agent directory with `omp config init-xdg`.
+default profile only — a named profile ignores it. So **by default** two
+profiles get separate counter files, and a profile does not write state into
+another profile's directory. An explicit `stateFile` (or
+`OMP_MODEL_POOL_STATE`) overrides all of that and is taken literally, so
+pointing two profiles at one path deliberately shares their cycle. XDG
+relocation is **not** followed; set `stateFile` explicitly on a host that moved
+its agent directory with `omp config init-xdg`.
 
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
