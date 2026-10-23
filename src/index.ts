@@ -69,8 +69,12 @@ interface ExtensionContextLike {
   agent?: { kind?: unknown; name?: unknown; id?: unknown };
   models?: ModelsQuery;
   ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
-  /** Read-only session manager; `getEntries()` distinguishes a new session from a loaded one. */
-  sessionManager?: { getEntries?: () => unknown };
+  /**
+   * Read-only session manager. `getSessionFile()` reports the durable
+   * transcript path, which distinguishes a loaded session from a new one;
+   * `getEntries()` is the fallback when no path is exposed.
+   */
+  sessionManager?: { getEntries?: () => unknown; getSessionFile?: () => unknown };
   cwd?: string;
   [key: string]: unknown;
 }
@@ -792,22 +796,60 @@ function hasConversationTurn(entries: unknown[]): boolean {
 }
 
 /**
- * Is this `session_start` a genuinely new session?
- * `true` new (no conversational turn yet), `false` a loaded session whose
- * transcript was restored, `undefined` when the host exposes too little to
- * tell. Only `true` rotates: an unknown answer must never risk overriding a
- * model that OMP just restored for a resumed session.
+ * Does the session already have its transcript in durable storage?
+ * `true` present, `false` absent, `undefined` when the host exposes no path.
+ *
+ * This is the load signal, because OMP's session persistence is lazy: the JSONL
+ * is written only once the history holds an assistant message, or an explicit
+ * `ensureOnDisk()` forces it — which is what `/new` does, precisely to preserve
+ * an empty session boundary across terminals. So a *resumed* session's file is
+ * already there when this handler runs, while a fresh session's
+ * `getSessionFile()` is an allocated path that leads nowhere.
  */
-function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
-  const manager = ctx.sessionManager;
-  if (manager === undefined || typeof manager.getEntries !== "function") return undefined;
+function sessionFileExists(manager: { getSessionFile?: () => unknown }): boolean | undefined {
+  if (typeof manager.getSessionFile !== "function") return undefined;
   try {
-    const entries = manager.getEntries();
-    if (!Array.isArray(entries)) return undefined;
-    return !hasConversationTurn(entries);
+    const file = manager.getSessionFile();
+    if (typeof file !== "string" || file.length === 0) return undefined;
+    return fs.existsSync(file);
   } catch {
     return undefined;
   }
+}
+
+/** Whether the entry list holds a conversational turn; `undefined` if it cannot be read. */
+function sessionHasConversationTurn(manager: { getEntries?: () => unknown }): boolean | undefined {
+  if (typeof manager.getEntries !== "function") return undefined;
+  try {
+    const entries = manager.getEntries();
+    if (!Array.isArray(entries)) return undefined;
+    return hasConversationTurn(entries);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Is this `session_start` a genuinely new session?
+ * `true` new, `false` a loaded session whose transcript was restored,
+ * `undefined` when the host exposes too little to tell. Only `true` rotates: an
+ * unknown answer must never risk overriding a model that OMP just restored.
+ *
+ * Two signals both mean "loaded": the transcript already exists on disk, or the
+ * entries already hold a conversational turn. The file is the decisive one — a
+ * session saved by `/new` with a model picked but no prompt yet holds only
+ * `session_init`/`model_change` metadata and no turn, and resuming it restores
+ * that model, so keying on turns alone would clobber it. Neither signal firing
+ * is only "new" when at least one was actually observable.
+ */
+function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
+  const manager = ctx.sessionManager;
+  if (manager === undefined) return undefined;
+  const hasFile = sessionFileExists(manager);
+  const hasTurn = sessionHasConversationTurn(manager);
+  if (hasFile === true || hasTurn === true) return false;
+  if (hasFile === undefined && hasTurn === undefined) return undefined;
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -59,14 +59,15 @@ function subCtx(models, agentKind = "sub") {
   };
 }
 
-// A main session. `entries` models what the host reports at `session_start`:
-// only a user/assistant message means the session was loaded from disk.
-function mainCtx(models, entries = []) {
+// A main session. `entries` and `sessionFile` model what the host reports at
+// `session_start`: a user/assistant message, or a transcript already on disk,
+// means the session was loaded rather than created by this process.
+function mainCtx(models, entries = [], sessionFile) {
   return {
     agent: { kind: "main", name: "main", id: "Main" },
     models,
     ui: { notify: () => {} },
-    sessionManager: { getEntries: () => entries },
+    sessionManager: { getEntries: () => entries, getSessionFile: () => sessionFile },
   };
 }
 
@@ -267,6 +268,58 @@ describe("main-session rotation", () => {
     ]);
     await handlers.session_start({ type: "session_start" }, fresh);
     assert.deepEqual(setModels, ["p/x"], "only user/assistant turns mark a session as loaded");
+  });
+
+  it("does not rotate a resumed session whose saved entries are metadata only", async () => {
+    // `/new`, pick a model, exit, resume. OMP calls ensureOnDisk() on an
+    // explicit new session to preserve the boundary, so the transcript exists
+    // while holding only session_init/model_change — no conversation. Rotating
+    // here would overwrite the model the resume restored.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-session-"));
+    try {
+      const sessionFile = path.join(dir, "session.jsonl");
+      fs.writeFileSync(sessionFile, "");
+      const { pi, handlers, setModels } = makeHarness();
+      mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+      const resumed = mainCtx(
+        makeModels(["p/x", "p/y"]),
+        [{ type: "session_init", id: "e1" }, { type: "model_change", model: "openai/gpt-5.2", id: "e2" }],
+        sessionFile
+      );
+      await handlers.session_start({ type: "session_start" }, resumed);
+      assert.deepEqual(setModels, [], "a saved session boundary keeps its restored model");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rotates a new session whose transcript does not exist on disk yet", async () => {
+    // Lazy persistence: a fresh session's allocated path leads nowhere, so the
+    // startup metadata it already carries must not read as a load.
+    const missing = path.join(os.tmpdir(), "mmm-session-absent", "session.jsonl");
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], missing);
+    await handlers.session_start({ type: "session_start" }, fresh);
+    assert.deepEqual(setModels, ["p/x"], "an unwritten transcript means a new session");
+  });
+
+  it("does not rotate when a transcript exists even with no readable entries", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-session-"));
+    try {
+      const sessionFile = path.join(dir, "session.jsonl");
+      fs.writeFileSync(sessionFile, "");
+      const { pi, handlers, setModels } = makeHarness();
+      mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+      const ctx = mainCtx(makeModels(["p/x", "p/y"]), [], sessionFile);
+      ctx.sessionManager.getEntries = () => {
+        throw new Error("unreadable");
+      };
+      await handlers.session_start({ type: "session_start" }, ctx);
+      assert.deepEqual(setModels, [], "the file alone is enough to call it loaded");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("does not rotate when the host cannot report session novelty", async () => {
