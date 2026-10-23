@@ -157,12 +157,29 @@ export function createIsolatedEnv({ poolConfig, repoRoot, label = "run" }) {
     extensionFile,
     env,
     ompArgs,
-    cleanup() {
-      try {
-        rmSync(root, { recursive: true, force: true });
-      } catch {
-        // Best effort; the root is under the OS temp dir and safely named.
+    /**
+     * Remove this run's root, retrying briefly. Resolves true when it is gone.
+     *
+     * The retry is not defensive padding: the first removal reliably fails on
+     * Windows because a child process handle is still closing, and the same tree
+     * deletes cleanly a moment later. Without the retry, cleanup left a partial
+     * root (`work/` behind) that also defeated the sweep's layout guard, so the
+     * two bugs hid each other.
+     *
+     * The result is returned rather than swallowed so a genuinely stuck tree is
+     * visible in the run report instead of only in the temp dir.
+     */
+    async cleanup() {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // Expected while handles close; the existence check below decides.
+        }
+        if (!existsSync(root)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 200));
       }
+      return !existsSync(root);
     },
   };
 }
@@ -182,8 +199,13 @@ export function writeRunManifest(isolated, data) {
  * after the fact, not only by the run that made the mess.
  *
  * Deliberately narrow: only `omp-live-*` directories under the OS temp dir, only
- * once they are older than an hour, and only when they have the layout this
- * module creates. Anything else in the temp dir is left alone.
+ * once they are older than an hour, and only when they carry part of the layout
+ * this module creates.
+ *
+ * The layout check is `work` OR `sessions`, not both. Requiring both was the
+ * original bug here: a partial cleanup leaves exactly one of them, so the guard
+ * skipped the only shape that actually needed collecting — which was also the
+ * case the PR description claimed was handled.
  */
 export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
   const removed = [];
@@ -195,13 +217,18 @@ export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
   }
   const now = Date.now();
   for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith("omp-live-")) continue;
+    // Ownership is the exact name shape `mkdtempSync` produces for this module,
+    // not a bare prefix: everything here is removed recursively, so a looser
+    // test would delete a directory this suite never created.
+    if (!entry.isDirectory() || !/^omp-live-[A-Za-z0-9]{6}$/.test(entry.name)) continue;
     const full = path.join(os.tmpdir(), entry.name);
     try {
       if (now - statSync(full).mtimeMs < olderThanMs) continue; // possibly a run in flight
-      if (!existsSync(path.join(full, "work")) || !existsSync(path.join(full, "sessions"))) continue;
+      const ours =
+        existsSync(path.join(full, "work")) || existsSync(path.join(full, "sessions"));
+      if (!ours) continue;
       rmSync(full, { recursive: true, force: true });
-      removed.push(full);
+      if (!existsSync(full)) removed.push(full);
     } catch {
       // Best effort.
     }
