@@ -180,6 +180,22 @@ Four read-only subagents ran concurrently. Config/state-safety and host/UI-contr
 
 `omp v18.12.6` is installed, but a print-mode run against it failed immediately with `Devin stream error failed_precondition: Your weekly usage quota has been exhausted`, so no provider turn can succeed and interactive TUI verification cannot be performed headlessly. No headless subcommand exposes command registration (there is no `extensions` command), so a no-provider-turn registration probe is not feasible with this CLI. Weak positive evidence only: the host started, initialized, and reached a provider call with `-e src/index.ts` without any extension-load error. Interactive picker/editor verification and `npm run test:live` were therefore **not** performed and are not claimed.
 
+### Review findings integrated
+
+Automated review ran on PR #11 (CodeAnt, CodeRabbit, Kilo Code Review, Codex). Four Codex findings were confirmed real and fixed in a follow-up commit, each with a regression test:
+
+1. **P1 — unchanged programmatic options discarded runtime edits.** Re-binding the factory for a child session re-applied the original options and wiped every runtime-only pool edit. Fixed with an `optionsSignature` guard mirroring the environment-source guard; `configurePools` now invalidates the signature so an explicit replacement still re-applies. Test `D23`.
+2. **P2 — a malformed explicit config did not fall through for routing.** A malformed `OMP_MODEL_POOL_CONFIG` returned an empty configuration instead of using the lower-priority profile default file. Fixed: routing falls through to the next source while editing stays disabled. Test `A8`.
+3. **P2 — deleting the final role changed a nested file's shape.** Dropping the empty `pools` key made the next load read the document as flat, so a later addition was written at the top level. Fixed by retaining the empty `pools` key; `C14` was rewritten to assert shape retention across a reload.
+4. **P2 — an unconfirmed apply was reported as a completed rotation.** When the host never reported `current()`, success was claimed anyway. Fixed: `applyModelToSession` reports `confirmed`, and both the picker and startup rotation report an unconfirmed outcome instead of success. The null-current startup case was rewritten and a new picker case added.
+
+Kilo Code Review's two suggestions were considered and declined, with reasons: the executed plan is deliberately kept as this PR's decision record, and splitting the README into `/docs` plus an `AGENTS.md` routing index is a documentation restructure outside this change's scope.
+
 ### Final outcome
 
-_To be completed after the delivery checklist: gate results, commit IDs, PR URL, review-request evidence._
+- Branch `feat/model-picker-qol`: `7dd1761` (feat), `b9e90a2` (test + CI), plus this review-fix commit.
+- Gate after the review fixes: `npm run typecheck` clean, `npm test` **109/109**, `git diff --check` clean.
+- PR: https://github.com/MooseGooseConsulting/omp-model-pool/pull/11
+- CI: `build-test (ubuntu-latest, 24)` pass, `build-test (windows-latest, 24)` pass; Graphite mergeability pass; Kilo Code Review pass; CodeAnt review completed; CodeRabbit still in progress.
+- Review request: `@codeant-ai: review` comment posted (https://github.com/MooseGooseConsulting/omp-model-pool/pull/11#issuecomment-6370831867). The repository has exactly one collaborator (the author), so no human reviewer could be requested without fabricating an identity.
+- Residual gap: interactive real-host verification and `npm run test:live` were not performed (the configured provider reports exhausted quota); no provider turn was spent and none is claimed.

@@ -282,6 +282,10 @@ function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
  */
 export function configurePools(next: ModelPoolConfig | undefined | null): void {
   applyNormalized(normalizeConfig(next));
+  // An explicit replacement invalidates the source signature, so a later
+  // no-options or same-options re-bind re-applies instead of assuming the
+  // active configuration still matches the last loaded source.
+  loadedSignature = undefined;
   configRevision += 1;
 }
 
@@ -869,21 +873,14 @@ function loadConfigWithSource(): LoadedConfig {
         warnings,
       };
     }
+    // Routing falls through to the next source (the profile default file, then
+    // empty), but editing is disabled: writing an edit while a shadowing
+    // higher-priority source is broken would divert it somewhere the operator
+    // did not intend it to be authoritative.
     warnings.push(
-      `OMP_MODEL_POOL_CONFIG could not be read (${resolved}): ${read.reason}; pool editing is disabled until it is repaired`,
+      `OMP_MODEL_POOL_CONFIG could not be read (${resolved}): ${read.reason}; routing falls through and pool editing is disabled until it is repaired`,
     );
-    return {
-      config: emptyConfig(),
-      source: {
-        kind: "file-env",
-        path: resolved,
-        writable: false,
-        label: resolved,
-        note: `unreadable: ${read.reason}`,
-      },
-      shape: "nested",
-      warnings,
-    };
+    blockedReason = `OMP_MODEL_POOL_CONFIG (${resolved}) could not be read: ${read.reason}`;
   }
 
   const fallback = resolveDefaultConfigFilePath();
@@ -925,6 +922,22 @@ function loadConfigWithSource(): LoadedConfig {
     shape: "none",
     warnings,
   };
+}
+
+/**
+ * Stable signature of a normalized options document.
+ *
+ * Programmatic options are also re-applied on every factory re-bind, so they
+ * need the same "unchanged source" comparison the environment source has;
+ * without it a child-session re-bind would silently discard runtime-only edits.
+ */
+function optionsSignature(normalized: ReturnType<typeof normalizeConfig>): string {
+  const pools = Object.keys(normalized.pools)
+    .sort()
+    .map((role) => `${role}=${(normalized.pools[role] ?? []).join(",")}`)
+    .join(";");
+  const strict = Array.isArray(normalized.strict) ? normalized.strict.join(",") : String(normalized.strict);
+  return `${pools}|${normalized.mainSessionRole}|${normalized.enableMainSessionRotation}|${strict}|${normalized.persistCounters}|${normalized.stateFile}`;
 }
 
 /** Signature that decides whether a re-bind must reload the environment source. */
@@ -992,8 +1005,10 @@ function buildDocument(
       : {};
   if (selectors === null) delete pools[roleKey];
   else pools[roleKey] = selectors;
-  if (Object.keys(pools).length === 0) delete base["pools"];
-  else base["pools"] = pools;
+  // Keep the `pools` key even when it is empty. Dropping it would make the next
+  // `detectShape()` read the document as flat, so a later role addition would be
+  // written at the top level and silently change the file's established shape.
+  base["pools"] = pools;
   return base;
 }
 
@@ -1513,7 +1528,15 @@ async function handleSessionStart(
       safeLog(pi, "warn", describeApplyFailure("main session", pick.picked, result));
       return;
     }
-    safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
+    if (result.confirmed) {
+      safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
+    } else {
+      safeLog(
+        pi,
+        "warn",
+        `[model-pool] main session: requested ${result.id} but the host did not confirm the active model`,
+      );
+    }
     try {
       ctx.ui?.notify?.(`model-pool: ${note}`, "info");
     } catch {
@@ -1534,7 +1557,17 @@ async function handleSessionStart(
 
 /** Why applying a model failed; the caller decides how to phrase the log. */
 type ApplyModelResult =
-  | { ok: true; id: string }
+  | {
+      ok: true;
+      id: string;
+      /**
+       * True only when the host reported the active model back and it matched.
+       * A host that cannot report its active model is not evidence of failure,
+       * but it is not evidence of success either, so callers must not present
+       * an unconfirmed apply as a completed rotation.
+       */
+      confirmed: boolean;
+    }
   | {
       ok: false;
       code: "unresolved" | "unauthenticated" | "registry-unreadable" | "no-set-model" | "refused" | "mismatch";
@@ -1600,7 +1633,7 @@ async function applyModelToSession(
   if (currentId.length > 0 && currentId !== id) {
     return { ok: false, code: "mismatch", detail: currentId };
   }
-  return { ok: true, id };
+  return { ok: true, id, confirmed: currentId.length > 0 };
 }
 
 /** Phrase an apply failure for the log, keeping the established wording. */
@@ -1836,7 +1869,15 @@ async function runModelPicker(pi: ExtensionApiLike, ctx: ExtensionContextLike): 
       notifyUser(ctx, `model-pool: ${result.detail}`, "error");
       return;
     }
-    notifyUser(ctx, `model-pool: switched to ${result.id}`, "info");
+    if (result.confirmed) {
+      notifyUser(ctx, `model-pool: switched to ${result.id}`, "info");
+    } else {
+      notifyUser(
+        ctx,
+        `model-pool: requested ${result.id}, but the host did not confirm the active model`,
+        "warning",
+      );
+    }
   } catch (err) {
     notifyUser(ctx, `model-pool: switch failed (${err instanceof Error ? err.message : String(err)})`, "error");
   }
@@ -2128,19 +2169,23 @@ function registerCommandSurface(pi: ExtensionApiLike): void {
  */
 export default function modelPoolExtension(pi: ExtensionApiLike, options?: ModelPoolConfig): void {
   if (options !== undefined) {
-    applyNormalized(normalizeConfig(options));
-    configSource = {
-      kind: "options",
-      writable: false,
-      label: "programmatic options",
-      note: "runtime-only: options cannot be rewritten",
-    };
-    configShape = "none";
-    configFingerprint = undefined;
-    configRevision += 1;
-    // Options always supersede a previously loaded source, so the next
-    // no-options re-bind must reload rather than assume it is unchanged.
-    loadedSignature = undefined;
+    const normalized = normalizeConfig(options);
+    const signature = `options:${optionsSignature(normalized)}`;
+    // Same guard as the environment source: a re-bind for a child session with
+    // identical options must not discard runtime-only edits made since.
+    if (signature !== loadedSignature) {
+      applyNormalized(normalized);
+      configSource = {
+        kind: "options",
+        writable: false,
+        label: "programmatic options",
+        note: "runtime-only: options cannot be rewritten",
+      };
+      configShape = "none";
+      configFingerprint = undefined;
+      configRevision += 1;
+      loadedSignature = signature;
+    }
   } else {
     const loaded = loadConfigWithSource();
     const signature = sourceSignature(loaded);

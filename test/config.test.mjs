@@ -219,6 +219,26 @@ describe("configuration precedence and provenance", () => {
     assert.equal(src.writable, false);
     assert.deepEqual(mod.getPools().slow, ["p/opt"]);
   });
+
+  it("A8: a malformed explicit file falls through to the default file for routing but disables editing", async () => {
+    const bad = path.join(freshDir(), "broken.json");
+    writeText(bad, "{ not json");
+    writeJson(mod.resolveDefaultConfigFilePath(), { pools: { slow: ["p/from-default"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = bad;
+    const { pi, logs } = makeHarness();
+    mod.default(pi);
+
+    // Routing still follows the documented precedence (the default file is the
+    // next source), but the broken higher-priority source blocks all editing.
+    assert.equal(mod.getConfigSource().kind, "default-file");
+    assert.equal(mod.getConfigSource().writable, false);
+    assert.deepEqual(mod.getPools().slow, ["p/from-default"]);
+    assert.ok(warns(logs).some((m) => m.includes("could not be read")));
+
+    const outcome = await mod.savePoolEdit("slow", ["p/x"]);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /disabled/);
+  });
 });
 
 describe("default-file discovery and no-write-on-load", () => {
@@ -327,7 +347,7 @@ describe("automatic save transactions", () => {
     }
   });
 
-  it("C14: deleting a role removes it, and the last deletion drops the pools key", async () => {
+  it("C14: deleting a role removes it, and the last deletion keeps the nested shape", async () => {
     const file = path.join(freshDir(), "delete.json");
     writeJson(file, { pools: { slow: ["p/a"] }, persistCounters: false });
     process.env.OMP_MODEL_POOL_CONFIG = file;
@@ -337,9 +357,21 @@ describe("automatic save transactions", () => {
     const outcome = await mod.savePoolEdit("slow", null);
     assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
     const doc = readJson(file);
-    assert.ok(!Object.prototype.hasOwnProperty.call(doc, "pools"));
+    // The empty `pools` key is kept deliberately: dropping it would make the
+    // next load read the document as flat, so a later role addition would be
+    // written at the top level and silently change the file's shape.
+    assert.deepEqual(doc.pools, {});
     assert.equal(doc.persistCounters, false);
     assert.deepEqual(Object.keys(mod.getPools()), []);
+
+    // Prove the shape survived a reload: re-adding the role stays nested.
+    const reload = makeHarness();
+    mod.default(reload.pi);
+    const added = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.deepEqual(added, { ok: true, runtimeOnly: false });
+    const after = readJson(file);
+    assert.deepEqual(after.pools, { slow: ["p/a"] });
+    assert.ok(!Object.prototype.hasOwnProperty.call(after, "slow"));
   });
 
   it("C15: saving an empty pool is refused", async () => {
@@ -443,6 +475,22 @@ describe("rebinding and replacement", () => {
     mod.configurePools({ pools: { fast: ["p/x"] } });
     assert.deepEqual(Object.keys(mod.getPools()), ["fast"]);
     assert.deepEqual(mod.getPools().fast, ["p/x"]);
+  });
+
+  it("D23: a runtime edit survives a re-bind with unchanged programmatic options", async () => {
+    const { pi } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/d23"] } });
+    const edit = await mod.savePoolEdit("slow", ["p/d23", "p/d23b"]);
+    assert.deepEqual(edit, { ok: true, runtimeOnly: true });
+    assert.deepEqual(mod.getPools().slow, ["p/d23", "p/d23b"]);
+
+    // A child-session re-bind with identical options must not discard the edit.
+    mod.default(pi, { pools: { slow: ["p/d23"] } });
+    assert.deepEqual(mod.getPools().slow, ["p/d23", "p/d23b"]);
+
+    // Different options are a genuine replacement.
+    mod.default(pi, { pools: { slow: ["p/d23c"] } });
+    assert.deepEqual(mod.getPools().slow, ["p/d23c"]);
   });
 });
 

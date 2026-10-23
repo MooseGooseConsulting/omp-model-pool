@@ -171,14 +171,32 @@ describe("/model-pool pick", () => {
     const beforePools = pools();
     const beforeCounters = counters();
 
+    const models = host.models(["p/a", "p/b"]);
+    // A host that really applies the model reports it back; success is only
+    // claimed once the new active model is confirmed.
+    host.pi.setModel = async (model) => {
+      host.setModels.push(model);
+      models.setCurrent(`${model.provider}/${model.id}`);
+    };
     host.pushSelect("p/b");
-    await runCommand(host, "pick", host.mainCtx(host.models(["p/a", "p/b"])));
+    await runCommand(host, "pick", host.mainCtx(models));
 
     assert.equal(host.setModels.length, 1);
     assert.deepEqual(host.setModels[0], { provider: "p", id: "b" });
     assert.ok(host.notified.some(([msg, type]) => type === "info" && msg.includes("switched to p/b")));
     assert.deepEqual(pools(), beforePools);
     assert.deepEqual(counters(), beforeCounters);
+  });
+
+  it("does not claim a switch when the host never confirms the active model", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: {} });
+    host.pushSelect("p/b");
+    await runCommand(host, "pick", host.mainCtx(host.models(["p/a", "p/b"])));
+
+    assert.equal(host.setModels.length, 1);
+    assert.ok(host.notified.some(([msg, type]) => type === "warning" && msg.includes("did not confirm")));
+    assert.ok(!host.notified.some(([msg]) => msg.includes("switched to")), "unconfirmed is not reported as a switch");
   });
 
   it("reports an error when the host refuses the model", async () => {

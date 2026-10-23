@@ -437,16 +437,18 @@ describe("main-session rotation", () => {
     assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
   });
 
-  it("tolerates a host that reports null instead of undefined", async () => {
+  it("tolerates a host that reports null instead of undefined, without claiming success", async () => {
     const { pi, handlers, logs } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
     const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
-    // `current()` returning null after a successful apply must not throw: the
-    // host's confirmation is optional, not required.
+    // `current()` returning null after a successful apply must not throw, and it
+    // is not evidence of success either: the host never confirmed the model, so
+    // the outcome is reported as unconfirmed rather than as a completed rotation.
     ctx.models.current = () => null;
     pi.setModel = async () => undefined;
     await handlers.session_start({ type: "session_start" }, ctx);
-    assert.ok(logs.some(([l, m]) => l === "info" && m.includes("main session applied")));
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("did not confirm the active model")));
+    assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
     assert.ok(
       !logs.some(([, m]) => m.includes("session_start error")),
       "a null current model is a handled case, not an exception",
