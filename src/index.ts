@@ -980,7 +980,7 @@ async function handleSessionStart(
     // resolved `Model` and reports `false` when it cannot apply one, so neither
     // failure may be logged as a successful rotation.
     const resolved = ctx.models?.resolve?.(pick.picked);
-    if (resolved === undefined || modelIdentity(resolved).length === 0) {
+    if (resolved === undefined || resolved === null || modelIdentity(resolved).length === 0) {
       safeLog(pi, "warn", `[model-pool] main session: host could not resolve ${pick.picked}; leaving model unchanged`);
       return;
     }
@@ -996,7 +996,7 @@ async function handleSessionStart(
     // Confirm rather than trust: a host that accepted the call but kept another
     // model would otherwise be reported as a rotation that never happened.
     const current = ctx.models?.current?.();
-    const currentId = current === undefined ? "" : modelIdentity(current);
+    const currentId = current === undefined || current === null ? "" : modelIdentity(current);
     if (currentId.length > 0 && currentId !== modelIdentity(resolved)) {
       safeLog(pi, "warn", `[model-pool] main session: asked for ${pick.picked} but the session reports ${currentId}`);
       return;

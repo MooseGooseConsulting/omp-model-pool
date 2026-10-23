@@ -52,7 +52,7 @@ function makeHarness() {
 }
 
 // The host applies a resolved `Model`, so assertions compare `provider/id`
-// identities; `rawApplied` keeps the original values for shape checks.
+// identities; the original values in `setModels` are kept for shape checks.
 function appliedIds(setModels) {
   return setModels.map((m) =>
     m !== null && typeof m === "object" ? `${m.provider}/${m.id}` : String(m),
@@ -368,16 +368,27 @@ describe("main-session rotation", () => {
   // rotation it did not achieve. The fake host previously accepted a string, so
   // these cases are what the old mock could not catch.
 
-  it("applies the resolved model object rather than the selector string", async () => {
-    const { pi, handlers, setModels } = makeHarness();
+  it("applies the resolved model object and confirms the host took it", async () => {
+    const { pi, handlers, setModels, logs } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
     const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    // Model a host that really applies the model rather than one whose
+    // `current()` cannot confirm anything, so the confirmation path is exercised
+    // positively instead of being skipped.
+    pi.setModel = async (m) => {
+      setModels.push(m);
+      ctx.models.current = () => m;
+    };
     await handlers.session_start({ type: "session_start" }, ctx);
     assert.equal(setModels.length, 1);
     const applied = setModels[0];
     assert.equal(typeof applied, "object", "the host takes a Model, not a string");
     assert.equal(applied.provider, "p");
     assert.equal(applied.id, "x");
+    assert.ok(
+      logs.some(([l, m]) => l === "info" && m.includes("main session applied")),
+      "success is logged once the host confirms the model",
+    );
   });
 
   it("does not claim a rotation when the host refuses the model", async () => {
@@ -402,11 +413,27 @@ describe("main-session rotation", () => {
     let seen = 0;
     ctx.models.resolve = (spec) => {
       seen += 1;
-      return seen <= 2 ? real(spec) : undefined;
+      return seen <= 2 ? real(spec) : null; // null, not undefined: the host may report either
     };
     await handlers.session_start({ type: "session_start" }, ctx);
     assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("could not resolve")));
     assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
+  });
+
+  it("tolerates a host that reports null instead of undefined", async () => {
+    const { pi, handlers, logs } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    // `current()` returning null after a successful apply must not throw: the
+    // host's confirmation is optional, not required.
+    ctx.models.current = () => null;
+    pi.setModel = async () => undefined;
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.ok(logs.some(([l, m]) => l === "info" && m.includes("main session applied")));
+    assert.ok(
+      !logs.some(([, m]) => m.includes("session_start error")),
+      "a null current model is a handled case, not an exception",
+    );
   });
 
   it("warns when the session keeps a different model than requested", async () => {

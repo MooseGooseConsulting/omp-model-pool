@@ -113,7 +113,11 @@ omp --extension ./omp-model-pool
   answer also skips rather than guessing.
   Otherwise: same
   resolve → pick → advance against `mainSessionRole` (default `"default"`),
-  then `pi.setModel(picked)` plus a UI notify. Disabled with
+  then apply it: resolve the selector to a `Model` with
+  `ctx.models.resolve()`, await `pi.setModel(model)`, and only notify once the
+  host confirms it now reports that model. A refusal (`false`), an unresolvable
+  selector, or a host that keeps a different model logs a warning and leaves the
+  model alone — none of them is reported as a rotation. Disabled with
   `enableMainSessionRotation: false`.
 - Handler errors fail open (log, return nothing) unless `strict` applies.
 - `strict` hard-blocks only when the model registry actually answered and none
