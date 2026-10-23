@@ -97,16 +97,21 @@ omp --extension ./omp-model-pool
 - `session_start` (secondary): `before_subagent_spawn` never fires for the
   main session, so main-session rotation is a `session_start` handler gated on
   `ctx.agent?.kind === "main"` (checked via `kind`, never `depth`: `/tan`
-  clones are subs at depth 0). It rotates a **genuinely new** session only:
-  `session_start` also fires for a loaded session, so a session whose
-  `ctx.sessionManager.getEntries()` already holds a user or assistant message
-  (a restored conversation) keeps the model OMP restored, and so does an
-  unknown answer — overriding a restored model mid-conversation would
-  invalidate prompt caches. Novelty is decided by whether a conversational turn
-  exists, not by whether the entry list is empty: a new session legitimately
-  carries `session_init`, title/mode/model and usage entries, and another
-  extension's `session_start` handler may already have appended its own state
-  with `pi.appendEntry`. Otherwise: same
+  clones are subs at depth 0). It rotates a **genuinely new** session only.
+  `session_start` also fires for a loaded session, and overriding a restored
+  model mid-conversation would invalidate prompt caches, so two signals both
+  mean "loaded": the session header predates this process
+  (`ctx.sessionManager.getHeader().timestamp`), or the entries already hold a
+  user or assistant message. The header is the decisive one because it is the
+  only thing that separates a resume from a new session: `/new` and
+  `omp --session <path>` both materialize a transcript immediately for a session
+  that is genuinely new, so a transcript existing proves nothing, while a path
+  that cannot be statted would look absent and clobber a resume. Entries alone
+  are not enough either: a new session legitimately carries `session_init`,
+  title/mode/model and usage records, and another extension's `session_start`
+  handler may already have appended its own with `pi.appendEntry`. An unknown
+  answer also skips rather than guessing.
+  Otherwise: same
   resolve → pick → advance against `mainSessionRole` (default `"default"`),
   then `pi.setModel(picked)` plus a UI notify. Disabled with
   `enableMainSessionRotation: false`.
@@ -198,7 +203,8 @@ Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
 `@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
 unauthenticated filtering with fail-open vs `strict` block, stable phase across
 an availability change, restart reset, main-session advance with sub exclusion
-and a conversation-based resume/no-novelty gate, profile- and
+and a transcript/`getSessionFile`-based load signal (metadata-only resumed
+session, unwritten transcript, unreadable entries), profile- and
 `PI_CONFIG_DIR`-aware state paths, and opt-in persistence (cross-process
 continuation, abandoned-lock reclaim, a live holder's lock never stolen, a
 4-process × 5-pick contention run, disabled-is-in-memory-only, schema- and

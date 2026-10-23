@@ -69,8 +69,12 @@ interface ExtensionContextLike {
   agent?: { kind?: unknown; name?: unknown; id?: unknown };
   models?: ModelsQuery;
   ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
-  /** Read-only session manager; `getEntries()` distinguishes a new session from a loaded one. */
-  sessionManager?: { getEntries?: () => unknown };
+  /**
+   * Read-only session manager. `getHeader()` reports the session's creation
+   * timestamp, which distinguishes a session this process created from one it
+   * loaded; `getEntries()` is the content fallback.
+   */
+  sessionManager?: { getEntries?: () => unknown; getHeader?: () => unknown };
   cwd?: string;
   [key: string]: unknown;
 }
@@ -792,22 +796,86 @@ function hasConversationTurn(entries: unknown[]): boolean {
 }
 
 /**
- * Is this `session_start` a genuinely new session?
- * `true` new (no conversational turn yet), `false` a loaded session whose
- * transcript was restored, `undefined` when the host exposes too little to
- * tell. Only `true` rotates: an unknown answer must never risk overriding a
- * model that OMP just restored for a resumed session.
+ * Roughly when this process started. The extension module loads during startup,
+ * before any session event fires, so it is a usable reference point for "was
+ * this session created by me or by an earlier run?".
  */
-function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
-  const manager = ctx.sessionManager;
-  if (manager === undefined || typeof manager.getEntries !== "function") return undefined;
+const PROCESS_STARTED_AT = Date.now();
+/**
+ * A session header written within this window of process start belongs to the
+ * session this process just created. Without the slack, a header written a few
+ * milliseconds before the extension loads would read as a previous process's.
+ */
+const SESSION_OWN_STARTUP_WINDOW_MS = 5000;
+
+/**
+ * Was this session created before this process started?
+ *
+ * This is the new-vs-resumed discriminator, and it deliberately does not consult
+ * the filesystem. `/new` calls `ensureOnDisk()` before returning, and
+ * `omp --session <missing path>` materializes a header immediately, so a
+ * transcript can exist for a session that is genuinely new — reading a path
+ * would suppress rotation for that new session, while a path that cannot be
+ * statted would look absent and clobber a resumed one. The header's creation
+ * timestamp has neither ambiguity: a session this process created carries a
+ * timestamp from the last few seconds, and a resumed one carries the moment it
+ * was first created, possibly days ago.
+ *
+ * `true` older (loaded), `false` created by this process, `undefined` when the
+ * header is unavailable or unusable.
+ */
+function sessionPredatesProcess(manager: { getHeader?: () => unknown }): boolean | undefined {
+  if (typeof manager.getHeader !== "function") return undefined;
   try {
-    const entries = manager.getEntries();
-    if (!Array.isArray(entries)) return undefined;
-    return !hasConversationTurn(entries);
+    const header = manager.getHeader();
+    if (header === null || typeof header !== "object") return undefined;
+    const timestamp = (header as Record<string, unknown>)["timestamp"];
+    if (typeof timestamp !== "string") return undefined;
+    const createdAt = Date.parse(timestamp);
+    if (!Number.isFinite(createdAt)) return undefined;
+    return createdAt < PROCESS_STARTED_AT - SESSION_OWN_STARTUP_WINDOW_MS;
   } catch {
     return undefined;
   }
+}
+
+/** Whether the entry list holds a conversational turn; `undefined` if it cannot be read. */
+function sessionHasConversationTurn(manager: { getEntries?: () => unknown }): boolean | undefined {
+  if (typeof manager.getEntries !== "function") return undefined;
+  try {
+    const entries = manager.getEntries();
+    if (!Array.isArray(entries)) return undefined;
+    return hasConversationTurn(entries);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Is this `session_start` a genuinely new session?
+ * `true` new, `false` a loaded session whose transcript and model were
+ * restored, `undefined` when the host exposes too little to tell. Only `true`
+ * rotates: an unknown answer must never risk overriding a model that OMP just
+ * restored.
+ *
+ * Two signals both mean "loaded": the header predates this process — the
+ * discriminator that sees through `/new` and `--session <missing>` both
+ * materializing a transcript for a new session — or the entries already hold a
+ * conversational turn, which catches a restored transcript whatever the header
+ * says.
+ *
+ * Only the header can prove the opposite. A session saved with no conversation
+ * looks identical either way, so the entries can establish "loaded" and nothing
+ * more: without a usable header timestamp this returns `undefined` and no
+ * rotation happens, rather than assuming a resume is new.
+ */
+function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
+  const manager = ctx.sessionManager;
+  if (manager === undefined) return undefined;
+  const predates = sessionPredatesProcess(manager);
+  const hasTurn = sessionHasConversationTurn(manager);
+  if (predates === true || hasTurn === true) return false;
+  return predates === false ? true : undefined;
 }
 
 // ---------------------------------------------------------------------------
