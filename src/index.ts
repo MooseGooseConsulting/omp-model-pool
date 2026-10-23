@@ -92,7 +92,15 @@ interface ExtensionApiLike {
     handler: (event: SessionStartEvent, ctx: ExtensionContextLike) => void | Promise<void>,
   ): void;
   on(event: string, handler: (...args: never[]) => unknown): void;
-  setModel?(model: string): void | Promise<void>;
+  /**
+   * Apply a model to the live session.
+   *
+   * The host takes a resolved `Model`, not a selector string — passing the
+   * string silently does nothing on the real host. Resolves `false` when it
+   * cannot apply the model (no credential for it), so the result must be read
+   * rather than assumed.
+   */
+  setModel?(model: ModelLike): void | Promise<unknown>;
   logger?: {
     info?: (...args: unknown[]) => void;
     warn?: (...args: unknown[]) => void;
@@ -968,9 +976,32 @@ async function handleSessionStart(
     if (pick === undefined) return;
     const note = describePick(roleKey, pick.picked, pick.index, pool.length);
     safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-    if (typeof pi.setModel === "function") {
-      await pi.setModel(pick.picked);
+    // Applying the pick is a separate step from choosing it. The host wants a
+    // resolved `Model` and reports `false` when it cannot apply one, so neither
+    // failure may be logged as a successful rotation.
+    const resolved = ctx.models?.resolve?.(pick.picked);
+    if (resolved === undefined || modelIdentity(resolved).length === 0) {
+      safeLog(pi, "warn", `[model-pool] main session: host could not resolve ${pick.picked}; leaving model unchanged`);
+      return;
     }
+    if (typeof pi.setModel !== "function") {
+      safeLog(pi, "warn", "[model-pool] main session: host exposes no setModel; leaving model unchanged");
+      return;
+    }
+    const applied = await pi.setModel(resolved);
+    if (applied === false) {
+      safeLog(pi, "warn", `[model-pool] main session: host refused ${pick.picked}; leaving model unchanged`);
+      return;
+    }
+    // Confirm rather than trust: a host that accepted the call but kept another
+    // model would otherwise be reported as a rotation that never happened.
+    const current = ctx.models?.current?.();
+    const currentId = current === undefined ? "" : modelIdentity(current);
+    if (currentId.length > 0 && currentId !== modelIdentity(resolved)) {
+      safeLog(pi, "warn", `[model-pool] main session: asked for ${pick.picked} but the session reports ${currentId}`);
+      return;
+    }
+    safeLog(pi, "info", `[model-pool] main session applied ${modelIdentity(resolved)}`);
     try {
       ctx.ui?.notify?.(`model-pool: ${note}`, "info");
     } catch {
