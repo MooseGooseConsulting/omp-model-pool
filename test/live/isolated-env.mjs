@@ -217,7 +217,10 @@ export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
   }
   const now = Date.now();
   for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith("omp-live-")) continue;
+    // Ownership is the exact name shape `mkdtempSync` produces for this module,
+    // not a bare prefix: everything here is removed recursively, so a looser
+    // test would delete a directory this suite never created.
+    if (!entry.isDirectory() || !/^omp-live-[A-Za-z0-9]{6}$/.test(entry.name)) continue;
     const full = path.join(os.tmpdir(), entry.name);
     try {
       if (now - statSync(full).mtimeMs < olderThanMs) continue; // possibly a run in flight

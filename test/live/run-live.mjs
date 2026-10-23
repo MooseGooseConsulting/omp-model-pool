@@ -101,7 +101,7 @@ async function discoverFreeRoutes(env) {
     if (bad.length > 0) {
       return { routes: [], reason: `OMP_LIVE_ROUTES not free+resolvable: ${bad.join(", ")}` };
     }
-    return { routes: [...new Set(override)].slice(0, 2), reason: "" };
+    return { routes: [...new Set(override)].slice(0, 3), reason: "" };
   }
 
   // A reasoning route will happily emit a long chain of thought for a one-word
@@ -323,23 +323,24 @@ async function main() {
       changed.length === 0 ? "pass" : "fail",
       changed.length === 0 ? "all hashes unchanged" : `changed: ${changed.join(", ")}`,
     );
-    writeRunManifest(isolated, {
-      phase: "complete",
-      ompArgs: isolated.ompArgs,
-      routes: { pinnedStart: routeA, pool: [routeB, routeA] },
-      ownerConfigBefore: beforeHashes,
-      ownerConfigAfter: afterHashes,
-      results,
-    });
+    // Cleanup is checked and recorded BEFORE the manifest is serialized. Writing
+    // the manifest first produced a stale artefact: it claimed completion with
+    // no cleanup result, and it is exactly the file left behind to explain why
+    // a root survived.
     const removed = await isolated.cleanup();
-    // Not a hard failure: a killed run leaves handles open, and a surviving
-    // root says nothing about the extension. It is reported, and the sweep
-    // collects it on a later run.
     record(
       "run root removed",
       removed ? "pass" : "skip",
       removed ? "temp root deleted" : `${isolated.root} survived a killed run; the sweep collects it later`,
     );
+    writeRunManifest(isolated, {
+      phase: "complete",
+      ompArgs: isolated.ompArgs,
+      routes: { pinnedStart: pin, pool: [routeB, routeA] },
+      ownerConfigBefore: beforeHashes,
+      ownerConfigAfter: afterHashes,
+      results,
+    });
   }
 
   console.log(`\n${results.length - failures}/${results.length} checks passed`);
