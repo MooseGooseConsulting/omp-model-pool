@@ -221,7 +221,11 @@ describe("/model-pool pick", () => {
     await runCommand(host, "pick", host.mainCtx(models));
 
     assert.equal(host.setModels.length, 1);
-    assert.ok(host.notified.some(([msg, type]) => type === "error" && msg.includes("other/model")));
+    assert.ok(
+      host.notified.some(
+        ([msg, type]) => type === "error" && msg.includes("session still reports other/model"),
+      ),
+    );
     assert.ok(!host.notified.some(([msg]) => msg.includes("switched to")));
   });
 
@@ -300,6 +304,40 @@ describe("/model-pool edit", () => {
     assert.equal(mod.getConfigSource().writable, false);
     assert.ok(host.notified.some(([msg]) => msg.includes("runtime-only")));
     assert.deepEqual(counters(), {});
+  });
+
+  it("shows the configured order, availability and counter policy before editing", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/missing"] } });
+    host.pushSelect("Back");
+    const beforeCounters = counters();
+
+    await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
+
+    const summary = host.notified.map(([msg]) => msg).find((msg) => msg.includes("order:"));
+    assert.ok(summary, "the editor announces the role before offering actions");
+    assert.ok(summary.includes("1. p/a (available)"));
+    assert.ok(summary.includes("2. p/missing (unavailable: unresolved)"));
+    assert.ok(summary.includes("counters are process-local"));
+    assert.ok(summary.includes("editing never moves the cursor"));
+    // Reading the summary must not draw from the rotation.
+    assert.deepEqual(counters(), beforeCounters);
+    assert.deepEqual(pools(), { slow: ["p/a", "p/missing"] });
+  });
+
+  it("explains that a new role pool does not create an OMP core role", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: {} });
+    host.pushSelect("New role…");
+    host.pushInput("slow");
+    host.pushSelect("Back");
+
+    await runCommand(host, "edit", host.mainCtx(host.models(["p/a"])));
+
+    assert.ok(
+      host.notified.some(([msg]) => msg.includes("does not create or assign an OMP core role")),
+    );
+    assert.deepEqual(pools(), {}, "entering a new role name must not create a pool by itself");
   });
 
   it("adds a model to an existing pool", async () => {

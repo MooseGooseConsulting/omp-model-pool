@@ -199,3 +199,13 @@ Kilo Code Review's two suggestions were considered and declined, with reasons: t
 - CI: `build-test (ubuntu-latest, 24)` pass, `build-test (windows-latest, 24)` pass; Graphite mergeability pass; Kilo Code Review pass; CodeAnt review completed; CodeRabbit still in progress.
 - Review request: `@codeant-ai: review` comment posted (https://github.com/MooseGooseConsulting/omp-model-pool/pull/11#issuecomment-6370831867). The repository has exactly one collaborator (the author), so no human reviewer could be requested without fabricating an identity.
 - Residual gap: interactive real-host verification and `npm run test:live` were not performed (the configured provider reports exhausted quota); no provider turn was spent and none is claimed.
+
+### Follow-up hardening (same branch)
+
+The two interaction-contract items that the first pass left unsurfaced are now implemented, together with the follow-up hardening that landed in the same working tree:
+
+- The role menu announces the configured order with per-entry membership, the counter policy, and the "editing never moves the cursor" guarantee once per role entry, instead of showing only an entry count. Entering a new role name explains that a pool routes only spawns asking for that role and does not create or assign an OMP core role. Two tests added.
+- A fingerprint conflict now refreshes the active configuration and its source signature, so a deliberate retry after an external change works without reopening the editor; an unrelated read failure still refuses without reloading. `C18` gained revision assertions plus a new test.
+- The picker names both models when the host keeps a different one: `requested X, but the session still reports Y`.
+- CI pins `actions/checkout` and `actions/setup-node` to commit SHAs and sets `persist-credentials: false`.
+- Gate after this batch: `npm test` **112/112**.

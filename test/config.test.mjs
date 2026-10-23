@@ -421,9 +421,37 @@ describe("automatic save transactions", () => {
 
     const external = { pools: { slow: ["p/a", "p/external"] } };
     writeJson(file, external);
+    const initialRevision = mod.getConfigRevision();
     const outcome = await mod.savePoolEdit("slow", ["p/b"]);
     assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /changed on disk/);
     assert.deepEqual(readJson(file), external, "the external change must survive");
+    assert.deepEqual(mod.getPools().slow, ["p/a", "p/external"]);
+    const revision = mod.getConfigRevision();
+    assert.equal(revision, initialRevision + 1, "the refreshed configuration advances the revision");
+
+    mod.default(pi);
+    assert.equal(mod.getConfigRevision(), revision, "the refreshed source signature avoids a redundant reload");
+
+    const retry = await mod.savePoolEdit("slow", ["p/a", "p/external", "p/retry"], revision);
+    assert.equal(retry.ok, true, "the refreshed fingerprint allows a deliberate retry");
+    assert.deepEqual(readJson(file).pools.slow, ["p/a", "p/external", "p/retry"]);
+  });
+
+  it("does not reload the source for an unrelated file read error", async () => {
+    const file = path.join(freshDir(), "invalid-after-load.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    writeText(file, "not json");
+    const revision = mod.getConfigRevision();
+    const outcome = await mod.savePoolEdit("slow", ["p/b"]);
+
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /invalid JSON/);
+    assert.equal(mod.getConfigRevision(), revision);
     assert.deepEqual(mod.getPools().slow, ["p/a"]);
   });
 

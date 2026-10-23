@@ -1083,12 +1083,14 @@ export async function savePoolEdit(
   // A brand-new default file has no fingerprint yet; anything already on disk
   // must match the fingerprint captured when the source was loaded.
   const expectedFingerprint = configSource.kind === "none" ? undefined : configFingerprint;
+  let fingerprintConflict = false;
   try {
     await withFileLock(file, () => {
       const current = readJsonFileWithReason(file);
       if (!current.ok && !current.missing) throw new Error(current.reason);
       const currentFingerprint = current.ok ? current.fingerprint : undefined;
       if (currentFingerprint !== expectedFingerprint) {
+        fingerprintConflict = true;
         throw new Error("the configuration file changed on disk since it was loaded; reopen the editor");
       }
       const doc = buildDocument(roleKey, next, configShape, current.ok ? current.value : undefined);
@@ -1100,6 +1102,11 @@ export async function savePoolEdit(
       }
     });
   } catch (err) {
+    if (fingerprintConflict) {
+      const loaded = loadConfigWithSource();
+      configureLoaded(loaded);
+      loadedSignature = sourceSignature(loaded);
+    }
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
   applyPoolChange(roleKey, next);
@@ -1809,6 +1816,32 @@ function describeSource(): string {
   return `source: ${configSource.label} (${configSource.kind}, ${label})${note}`;
 }
 
+/**
+ * One-line pre-edit summary of the role about to be edited: configured order
+ * with authenticated membership, counter policy, and the cursor guarantee.
+ * Read-only, so merely entering the editor still changes nothing.
+ */
+function describeRoleForEditing(role: string, pool: string[], models: ModelsQuery | undefined): string {
+  if (pool.length === 0) {
+    return `model-pool: @${role} has no pool yet — adding a model creates it, and the order decides the rotation sequence`;
+  }
+  const report = diagnosePools(models);
+  const entries = report.roles.find((r) => r.role === role)?.entries ?? [];
+  const order = report.registryReadable
+    ? pool
+        .map((selector, i) => {
+          const entry = entries[i];
+          const state = entry === undefined || entry.eligible ? "available" : `unavailable: ${entry.reason}`;
+          return `${i + 1}. ${selector} (${state})`;
+        })
+        .join(", ")
+    : `${pool.map((selector, i) => `${i + 1}. ${selector}`).join(", ")} (availability unknown: model registry unavailable)`;
+  const policy = activeConfig.persistCounters
+    ? `counters persist across processes (${activeConfig.stateFile})`
+    : "counters are process-local";
+  return `model-pool: @${role} order: ${order} — ${policy}; editing never moves the cursor`;
+}
+
 /** Report the outcome of a save attempt; returns whether it succeeded. */
 function reportEditOutcome(ctx: ExtensionContextLike, outcome: PoolEditOutcome, successMessage: string): boolean {
   if (!outcome.ok) {
@@ -1866,7 +1899,11 @@ async function runModelPicker(pi: ExtensionApiLike, ctx: ExtensionContextLike): 
   try {
     const result = await applyModelToSession(pi, ctx, chosen);
     if (!result.ok) {
-      notifyUser(ctx, `model-pool: ${result.detail}`, "error");
+      const message =
+        result.code === "mismatch"
+          ? `model-pool: requested ${chosen}, but the session still reports ${result.detail}`
+          : `model-pool: ${result.detail}`;
+      notifyUser(ctx, message, "error");
       return;
     }
     if (result.confirmed) {
@@ -1902,6 +1939,7 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
     return;
   }
   let role = normalizeRoleKey(initialRole ?? "");
+  let announcedRole = "";
 
   for (;;) {
     if (role.length === 0) {
@@ -1922,6 +1960,13 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
           notifyUser(ctx, "model-pool: a role name is required", "warning");
           continue;
         }
+        if (getPools()[key] === undefined) {
+          notifyUser(
+            ctx,
+            `model-pool: @${key} has no pool yet; a pool routes only spawns that ask for @${key} — it does not create or assign an OMP core role`,
+            "info",
+          );
+        }
         role = key;
         continue;
       }
@@ -1934,6 +1979,12 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
     // by another command makes this editor's next write stale, and it refreshes
     // instead of overwriting.
     const revision = configRevision;
+    // Announce once per role entry, not after every action, so order and
+    // availability are shown before editing without becoming noise.
+    if (announcedRole !== role) {
+      announcedRole = role;
+      notifyUser(ctx, describeRoleForEditing(role, pool, ctx.models), "info");
+    }
     const items: { label: string; description?: string; value: string }[] = [
       { label: "Add model…", description: "append a model to this pool", value: "add" },
     ];
