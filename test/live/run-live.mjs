@@ -206,6 +206,49 @@ async function main() {
       record("resuming does not re-rotate the main model", "skip", `exit ${second.code}`);
     }
 
+    // --- role rotation: one real subagent bound to an unpinned role --------
+    // The bundled `reviewer` agent declares `model: ["@slow"]`, so spawning it
+    // routes the `slow` pool. The trigger is model-driven — OMP exposes no
+    // "spawn agent X" command — so a parent that declines to delegate reports
+    // skip, never pass. The assertion is not model-dependent: the child's own
+    // transcript records the model that actually ran.
+    const delegate = await runOmp(
+      [
+        ...isolated.ompArgs,
+        "--model",
+        routeA,
+        "-p",
+        'Call the task tool exactly once, with agent "reviewer" and prompt "Reply with exactly: OK". Then stop.',
+      ],
+      { cwd: isolated.workDir, env: isolated.env, timeoutMs: 240_000 },
+    );
+    const childSessions = findSessionFiles(isolated.sessionDir)
+      .map((s) => readTranscript(s.file))
+      .filter((t) => t.header !== undefined && t.header.parentSession !== undefined);
+    if (delegate.code !== 0 || childSessions.length === 0) {
+      record(
+        "subagent on an unpinned role rotates",
+        "skip",
+        delegate.code !== 0
+          ? `parent exited ${delegate.code}; no delegation observed`
+          : "the parent model did not delegate; nothing to assert",
+      );
+    } else {
+      const childModels = childSessions
+        .flatMap((t) => t.assistantModels)
+        .filter((m) => m.startsWith("kilo/"));
+      const hit = childModels.find((m) => m === routeB || m === routeA);
+      record(
+        "subagent on an unpinned role rotates",
+        hit === routeB ? "pass" : "fail",
+        hit === undefined
+          ? `no free-route subagent turn found (saw: ${childModels.join(", ") || "none"})`
+          : hit === routeB
+            ? `subagent ran on the role pool's first entry ${routeB}`
+            : `subagent ran on ${hit}, a rotation would have applied ${routeB}`,
+      );
+    }
+
     // --- state file advanced -------------------------------------------------
     const state = existsSync(isolated.stateFile) ? readFileSync(isolated.stateFile, "utf8") : "";
     record(

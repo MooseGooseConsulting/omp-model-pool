@@ -244,7 +244,14 @@ Safety properties, since it spends real turns:
   else runs and no paid role is reachable.
 - anything unproven reports `skip` with the reason rather than passing.
 
-Role (subagent) rotation is **not** covered yet — see the note below.
+It also proves role rotation: the bundled `reviewer` agent declares
+`model: ["@slow"]`, an unpinned role alias, so spawning it exercises the same
+`before_subagent_spawn` path a normal delegation does. The trigger is
+model-driven — OMP exposes no "spawn agent X" command — so a run where the
+parent declines to delegate reports `skip` with that reason rather than passing.
+The assertion is still not model-dependent: it reads the model on the child's
+own assistant turn. At the end both counters are checked independently, so a
+main rotation cannot be mistaken for a role rotation.
 
 ## API (tests / hosts)
 
