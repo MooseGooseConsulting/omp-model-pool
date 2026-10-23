@@ -209,3 +209,4 @@ The two interaction-contract items that the first pass left unsurfaced are now i
 - The picker names both models when the host keeps a different one: `requested X, but the session still reports Y`.
 - CI pins `actions/checkout` and `actions/setup-node` to commit SHAs and sets `persist-credentials: false`.
 - Gate after this batch: `npm test` **112/112**.
+- Cross-repo install wiring (adjacent request): `coldaine-configurations` PR #138 adds `omp-plugins:apply` and `omp-plugins:check`, so an enrolled host installs this extension from a pinned revision instead of a developer checkout. The pin currently names this branch's head and moves to merged `main` after this PR lands.
