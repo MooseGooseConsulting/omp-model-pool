@@ -1,7 +1,8 @@
-// Spawns exactly one subagent dispatch through the built extension and prints
-// the picked model. Run as its own OS process to prove cross-process rotation.
+// Drives the built extension through <iterations> subagent dispatches in its
+// own OS process and prints every pick. Run several of these concurrently
+// against one state file to exercise the cross-process lock for real.
 //
-// argv: <stateFile> <role> <comma-separated models> [persist=on|off]
+// argv: <stateFile> <role> <comma-separated models> [persist=on|off] [iterations]
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -9,6 +10,7 @@ const stateFile = process.argv[2];
 const role = process.argv[3] ?? "slow";
 const models = (process.argv[4] ?? "").split(",").filter(Boolean);
 const persist = (process.argv[5] ?? "on") !== "off";
+const iterations = Number.parseInt(process.argv[6] ?? "1", 10) || 1;
 
 const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "dist", "index.js");
 const mod = await import(pathToFileURL(dist).href);
@@ -40,9 +42,12 @@ const ctx = {
   },
   ui: { notify: () => {} },
 };
+const event = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: `@${role}`, patterns: [`@${role}`] };
 
-const result = await handler(
-  { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: `@${role}`, patterns: [`@${role}`] },
-  ctx,
-);
-process.stdout.write(`${JSON.stringify({ pid: process.pid, model: result?.model ?? null, note: result?.note ?? null })}\n`);
+const picks = [];
+for (let i = 0; i < iterations; i++) {
+  const result = await handler(event, ctx);
+  picks.push(result?.model ?? null);
+}
+
+process.stdout.write(`${JSON.stringify({ pid: process.pid, model: picks[0] ?? null, picks })}\n`);

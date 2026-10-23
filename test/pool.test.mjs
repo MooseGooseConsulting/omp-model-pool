@@ -259,7 +259,7 @@ describe("cross-process counter persistence (opt-in)", () => {
     }
   });
 
-  it("serializes parallel picks through the lock (no duplicate slot)", async () => {    const { dir, file } = tmpStateFile();
+  it("keeps in-process picks distinct (real cross-process contention is covered in cross-process.test.mjs)", async () => {    const { dir, file } = tmpStateFile();
     try {
       const { pi, handlers } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
@@ -303,6 +303,62 @@ describe("cross-process counter persistence (opt-in)", () => {
       assert.equal(r.model, "p/a"); // falls back to in-memory, ignores the foreign cursor
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2); // not overwritten
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects the whole state when a single counter entry is invalid", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: "4" } }));
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, "4"); // untouched
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a state file with no declared version", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ counters: { slow: 4 } }));
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { counters: { slow: 4 } });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honors persistCounters from a flat JSON config", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      process.env.OMP_MODEL_POOLS_JSON = JSON.stringify({ slow: ["p/a", "p/b"], persistCounters: true, stateFile: file });
+      const { pi, handlers } = makeHarness();
+      mod.default(pi); // no options: config comes from the environment
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not enable persistence for a non-boolean persistCounters", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: "false", stateFile: file });
+      const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.equal(fs.existsSync(file), false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

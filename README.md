@@ -58,9 +58,10 @@ order:
 3. `OMP_MODEL_POOL_CONFIG` — path to a JSON file as above.
 
 `stateFile` also honors `OMP_MODEL_POOL_STATE` when the option is unset.
-Relative paths — and a leading `~` — resolve against the OMP agent dir
-(`PI_CODING_AGENT_DIR` when set, else `~/.omp/agent`), never the process CWD,
-so processes started from different directories still share one cycle.
+Relative paths resolve against the OMP agent dir (`PI_CODING_AGENT_DIR` when
+set, else `~/.omp/agent`), never the process CWD, so processes started from
+different directories still share one cycle. A leading `~` resolves against
+the home directory.
 
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
@@ -114,8 +115,14 @@ omp --extension ./omp-musical-models
   serialized by an atomic-directory lock so parallel processes on the **same
   machine and filesystem** never draw the same slot. The lock is not
   distributed: state is not shared across machines, and a network filesystem
-  with weak attribute caching weakens the stale-lock check. A release never
-  removes a lock it no longer owns, so a reclaimed stale lock cannot cascade.
+  with weak attribute caching weakens the staleness check.
+- The lock is never broken on a timeout. It records its owner's pid, and is
+  reclaimed only when that process is provably gone (or when an ownerless lock
+  — a crash between `mkdir` and the ownership stamp — is older than two
+  minutes). Reclaiming claims the lock by atomic rename and re-verifies the
+  owner, so a live-but-slow holder cannot lose its lock; release is
+  token-guarded, so a holder whose lock was reclaimed never deletes its
+  successor's.
 - Every failure is fail-open: a bad read/write logs and falls back to the
   in-memory counter, and a state file that is malformed or carries an unknown
   `version` is left untouched for the operator to repair or delete rather than

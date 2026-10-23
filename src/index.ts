@@ -21,6 +21,7 @@
 // keeping role identity, so core `retry.fallbackChains` / prewalk / advisor
 // semantics are preserved, not replaced.
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -213,7 +214,12 @@ export function resolveStateFilePath(explicit?: string): string {
   return path.join(base, DEFAULT_STATE_FILE);
 }
 
-/** Parse `{ version: 1, counters: { role: int } }`; undefined when malformed. */
+/**
+ * Parse `{ version: 1, counters: { role: int } }`.
+ * Returns undefined when the file is malformed in any way — including a single
+ * bad counter entry — so the caller fails open and the file is left untouched
+ * rather than being rewritten from a partial read.
+ */
 function parseState(raw: string): Record<string, number> | undefined {
   let obj: unknown;
   try {
@@ -223,15 +229,14 @@ function parseState(raw: string): Record<string, number> | undefined {
   }
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
   const record = obj as Record<string, unknown>;
-  // Read-side schema guard: a state file written by a future/foreign schema is
-  // refused rather than half-read (the caller then fails open).
-  const version = record["version"];
-  if (version !== undefined && version !== 1) return undefined;
+  // Read-side schema guard: only a schema we understand may be used.
+  if (record["version"] !== 1) return undefined;
   const rawCounters = record["counters"];
   if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) return undefined;
   const out: Record<string, number> = Object.create(null);
   for (const [key, value] of Object.entries(rawCounters as Record<string, unknown>)) {
-    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) out[key] = value;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return undefined;
+    out[key] = value;
   }
   return out;
 }
@@ -253,7 +258,7 @@ function readPersistedCounters(file: string): Record<string, number> {
 /** Write the state via a unique temp file + atomic rename (mode 0600). */
 function writeStateAtomic(file: string, next: Record<string, number>): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, counters: next }, null, 2)}\n`, {
       mode: 0o600,
@@ -269,15 +274,81 @@ function writeStateAtomic(file: string, next: Record<string, number>): void {
   }
 }
 
+/** Sleep helper used only for lock-contention backoff. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Run `fn` while holding an atomic-directory lock; stale locks are reclaimed. */
+/**
+ * Is the lock's recorded owner still running?
+ * `true` alive, `false` provably gone (ESRCH), `undefined` unknown/unreadable.
+ * Only a provably-gone owner makes a lock reclaimable, so a live-but-slow
+ * holder can never lose its lock to a timeout.
+ */
+function lockOwnerAlive(lock: string): boolean | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(lock, "owner"), "utf8");
+  } catch {
+    return undefined;
+  }
+  const pid = Number.parseInt(raw.trim().split(".")[0] ?? "", 10);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return undefined;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? false : true;
+  }
+}
+
+/**
+ * Take an abandoned lock before deleting it.
+ *
+ * The lock directory is renamed to a unique tombstone — an atomic claim, so
+ * only one contender can win — and the owner is re-verified on the artifact we
+ * now hold. A live holder is never deleted: at worst its lock is renamed and
+ * restored. An ownerless lock (a crash between `mkdir` and the ownership
+ * stamp) is reclaimable only once it is older than `STALE_LOCK_MS`.
+ */
+function reclaimAbandonedLock(lock: string): boolean {
+  const ownerState = lockOwnerAlive(lock);
+  if (ownerState !== false) {
+    if (ownerState === true) return false; // live holder
+    try {
+      if (Date.now() - fs.statSync(lock).mtimeMs <= STALE_LOCK_MS) return false;
+    } catch {
+      return false; // vanished or unreadable: let the next loop iteration retry
+    }
+  }
+  const tomb = `${lock}.abandoned.${process.pid}.${randomUUID()}`;
+  try {
+    fs.renameSync(lock, tomb);
+  } catch {
+    return false; // another contender claimed it first
+  }
+  if (lockOwnerAlive(tomb) === true) {
+    // A live holder slipped in between the check and the rename: put it back.
+    try {
+      fs.renameSync(tomb, lock);
+    } catch {
+      // Canonical path stays free; the holder's own release is token-guarded.
+    }
+    return false;
+  }
+  try {
+    fs.rmSync(tomb, { recursive: true, force: true });
+  } catch {
+    // Best-effort: an undeletable tombstone is inert.
+  }
+  return true;
+}
+
+/** Run `fn` while holding an atomic-directory lock; abandoned locks are reclaimed. */
 async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
   const lock = `${file}.lock`;
   const owner = path.join(lock, "owner");
-  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  const token = `${process.pid}.${Date.now()}.${randomUUID()}`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
@@ -286,42 +357,32 @@ async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > STALE_LOCK_MS) {
-          fs.rmSync(lock, { recursive: true, force: true });
-          continue;
-        }
-      } catch (statErr) {
-        if ((statErr as NodeJS.ErrnoException).code !== "ENOENT") throw statErr;
-      }
+      if (reclaimAbandonedLock(lock)) continue;
       if (Date.now() >= deadline) throw new Error(`timed out waiting for model-pool lock ${lock}`);
       await sleep(20);
     }
   }
-  let tokenWritten = false;
+  // Stamping ownership is part of acquiring: without it we did not acquire, so
+  // an ownerless lock directory always means a crashed acquisition.
   try {
     fs.writeFileSync(owner, token, { mode: 0o600 });
-    tokenWritten = true;
-  } catch {
-    // Best-effort: without a token, release falls back to unconditional removal.
+  } catch (err) {
+    try {
+      fs.rmSync(lock, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of our own unclaimed lock.
+    }
+    throw err;
   }
   try {
     return fn();
   } finally {
-    if (tokenWritten) {
-      // Release only a lock we still own. If ours was reclaimed as stale and a
-      // new holder took it, deleting that lock would admit a third writer.
-      try {
-        if (fs.readFileSync(owner, "utf8").trim() === token) fs.rmSync(lock, { recursive: true, force: true });
-      } catch {
-        // Unverifiable: leave it for the stale reclaimer rather than break a live lock.
-      }
-    } else {
-      try {
-        fs.rmSync(lock, { recursive: true, force: true });
-      } catch {
-        // Lock release is best-effort.
-      }
+    // Release only a lock we still own. If ours was reclaimed as abandoned and
+    // a new holder took it, deleting that lock would admit a third writer.
+    try {
+      if (fs.readFileSync(owner, "utf8").trim() === token) fs.rmSync(lock, { recursive: true, force: true });
+    } catch {
+      // Unverifiable: leave it for the abandoned-lock reclaimer.
     }
   }
 }
@@ -350,6 +411,7 @@ export function normalizeRoleKey(raw: unknown): string {
   return trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
 }
 
+/** Coerce a config value to a list of non-empty trimmed selector strings. */
 function normalizeStringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const out: string[] = [];
@@ -361,6 +423,7 @@ function normalizeStringList(value: unknown): string[] {
   return out;
 }
 
+/** Normalize any accepted config shape (nested `pools` or flat map) into the internal form. */
 function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
   pools: Record<string, string[]>;
   mainSessionRole: string;
@@ -396,11 +459,14 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
     mainSessionRole,
     enableMainSessionRotation: raw?.enableMainSessionRotation ?? true,
     strict: raw?.strict ?? false,
-    persistCounters: raw?.persistCounters ?? false,
+    // Opt-in must be exactly boolean true: a stray `"false"` string would be
+    // truthy and would silently start writing a shared state file.
+    persistCounters: raw?.persistCounters === true,
     stateFile: resolveStateFilePath(raw?.stateFile),
   };
 }
 
+/** Read and parse a JSON file; `undefined` on any read or parse failure. */
 function readJsonFileSync(filePath: string): unknown {
   try {
     const raw = fs.readFileSync(filePath, "utf8");
@@ -416,12 +482,11 @@ function loadConfigFromEnv(): ModelPoolConfig {
   if (inline !== undefined && inline.trim().length > 0) {
     try {
       const parsed = JSON.parse(inline) as unknown;
-      if (parsed !== null && typeof parsed === "object") {
-        if (Array.isArray(parsed)) return { pools: Object.create(null) };
-        if ("pools" in (parsed as Record<string, unknown>)) {
-          return parsed as ModelPoolConfig;
-        }
-        return { pools: parsed as Record<string, string[]> };
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        // Pass through unchanged: a flat map keeps its option keys
+        // (persistCounters, stateFile, …) at the top level, where
+        // normalizeConfig reads them. Wrapping it as `pools` would hide them.
+        return parsed as ModelPoolConfig;
       }
     } catch {
       // Fall through to file / empty on invalid JSON; never throw at load.
@@ -432,8 +497,7 @@ function loadConfigFromEnv(): ModelPoolConfig {
     const resolved = path.resolve(filePath.trim());
     const parsed = readJsonFileSync(resolved);
     if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      if ("pools" in (parsed as Record<string, unknown>)) return parsed as ModelPoolConfig;
-      return { pools: parsed as Record<string, string[]> };
+      return parsed as ModelPoolConfig;
     }
   }
   return { pools: Object.create(null) };
@@ -443,6 +507,7 @@ function loadConfigFromEnv(): ModelPoolConfig {
 // Core helpers.
 // ---------------------------------------------------------------------------
 
+/** Log through `pi.logger`, swallowing any logger failure: logging must never break a spawn. */
 function safeLog(
   pi: ExtensionApiLike,
   level: "info" | "warn" | "error" | "debug",
@@ -455,6 +520,7 @@ function safeLog(
   }
 }
 
+/** Does the configured `strict` policy cover this role? */
 function isStrictForRole(roleKey: string): boolean {
   const { strict } = activeConfig;
   if (strict === true) return true;
@@ -462,6 +528,7 @@ function isStrictForRole(roleKey: string): boolean {
   return false;
 }
 
+/** `provider/id` identity for a resolved model; `""` when it carries no id. */
 function modelIdentity(m: ModelLike): string {
   const provider = typeof m.provider === "string" && m.provider.length > 0 ? `${m.provider}/` : "";
   return typeof m.id === "string" && m.id.length > 0 ? `${provider}${m.id}` : "";
@@ -547,6 +614,7 @@ async function pickForRole(
   }
 }
 
+/** Human-readable routing note surfaced in the task UI. */
 function describePick(roleKey: string, picked: string, index: number, total: number): string {
   return `pool ${roleKey}[${index + 1}/${total}]: ${picked}`;
 }
@@ -555,6 +623,7 @@ function describePick(roleKey: string, picked: string, index: number, total: num
 // Event handlers.
 // ---------------------------------------------------------------------------
 
+/** `before_subagent_spawn` handler: rotate the model for a role-keyed pool. */
 function handleBeforeSubagentSpawn(
   pi: ExtensionApiLike,
   event: BeforeSubagentSpawnEvent,
@@ -606,6 +675,7 @@ function handleBeforeSubagentSpawn(
   }
 }
 
+/** `session_start` handler: rotate the main session's model, main agent only. */
 async function handleSessionStart(
   pi: ExtensionApiLike,
   _event: SessionStartEvent,
@@ -647,6 +717,7 @@ async function handleSessionStart(
 // Extension factory (default export; OMP calls it with the ExtensionAPI).
 // ---------------------------------------------------------------------------
 
+/** Extension factory: load configuration and register both event handlers. */
 export default function modelPoolExtension(pi: ExtensionApiLike, options?: ModelPoolConfig): void {
   if (options !== undefined) {
     configurePools(options);
