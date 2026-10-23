@@ -176,9 +176,16 @@ Delivered on branch `feat/model-picker-qol`:
 
 Four read-only subagents ran concurrently. Config/state-safety and host/UI-contract reviews returned **no confirmed defects**; the one plan-conformance gap above and the duplicate-label risk were the only actionable items. Reviewer notes that were deliberately not actioned, with reasons: extending the state/config collision check to whole-directory containment would reject the legitimate default case (both files live in the agent dir); and treating an absent `isIdle` as busy would break hosts that omit it, whereas the host contract guarantees it.
 
-### Real-host verification: BLOCKED
+### Real-host verification (corrected)
 
-`omp v18.12.6` is installed, but a print-mode run against it failed immediately with `Devin stream error failed_precondition: Your weekly usage quota has been exhausted`, so no provider turn can succeed and interactive TUI verification cannot be performed headlessly. No headless subcommand exposes command registration (there is no `extensions` command), so a no-provider-turn registration probe is not feasible with this CLI. Weak positive evidence only: the host started, initialized, and reached a provider call with `-e src/index.ts` without any extension-load error. Interactive picker/editor verification and `npm run test:live` were therefore **not** performed and are not claimed.
+An earlier pass reported this as blocked: a print-mode run in an isolated root had failed with `Devin stream error failed_precondition: Your weekly usage quota has been exhausted`. Generalising that single Devin-backed invocation into "no provider turn can succeed", and reporting the suite as blocked without running the suite that exists for exactly this purpose, was wrong.
+
+Corrected evidence, run 2026-10-23 against the installed `omp v18.12.6`:
+
+- The configured roles and pools use free routes only: `modelRoles.default` is `kilo/nvidia/nemotron-3.5-lightning:free:high`, and `<agent dir>/model-pool.json` rotates `kilo/nvidia/nemotron-3.5-lightning:free` and `kilo/xingchen-agi/xing4.0-29b-a4b:free` for `default`, `slow` and `task`.
+- A direct check of the suite's free-route contract found **13** routes that are `isFree`, end in `:free`, price at zero and exist in OMP's registry at the time of the run.
+- `npm run test:live` **passed**: free-route discovery (pinned start `kilo/liquid/lfm-2.5-2.6b:free`, pool rotating `kilo/xingchen-agi/xing4.0-29b-a4b:free` and `kilo/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`); a first main run on `kilo/xingchen-agi/xing4.0-29b-a4b:free`; a second fresh OMP process on `kilo/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` over the same state file, which is the rotation claim; and a resumed session keeping its restored model.
+- Not performed: the interactive TUI smoke, and the suite's model-driven role-delegation check, which is its documented skip-prone case.
 
 ### Review findings integrated
 
@@ -198,7 +205,7 @@ Kilo Code Review's two suggestions were considered and declined, with reasons: t
 - PR: https://github.com/MooseGooseConsulting/omp-model-pool/pull/11
 - CI: `build-test (ubuntu-latest, 24)` pass, `build-test (windows-latest, 24)` pass; Graphite mergeability pass; Kilo Code Review pass; CodeAnt review completed; CodeRabbit still in progress.
 - Review request: `@codeant-ai: review` comment posted (https://github.com/MooseGooseConsulting/omp-model-pool/pull/11#issuecomment-6370831867). The repository has exactly one collaborator (the author), so no human reviewer could be requested without fabricating an identity.
-- Residual gap: interactive real-host verification and `npm run test:live` were not performed (the configured provider reports exhausted quota); no provider turn was spent and none is claimed.
+- Real-host evidence: `npm run test:live` passed on free routes alone (see the corrected section above). Residual gap: the interactive TUI smoke and the suite's skip-prone model-driven role-delegation check.
 
 ### Follow-up hardening (same branch)
 
