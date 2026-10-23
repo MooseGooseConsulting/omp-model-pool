@@ -14,7 +14,7 @@
 //   * `--config` overlay plus `--no-prewalk/--no-skills/--no-rules/--no-title`
 //     disable hidden work that could spend a paid model or run arbitrary setup.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -142,4 +142,39 @@ export function writeRunManifest(isolated, data) {
   const file = path.join(isolated.root, "run-manifest.json");
   writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   return file;
+}
+
+/**
+ * Remove roots left by earlier runs that were killed before their cleanup ran.
+ *
+ * A run that times out or is interrupted never reaches its `finally`, and three
+ * such roots were left behind before this existed. Cleanup has to be runnable
+ * after the fact, not only by the run that made the mess.
+ *
+ * Deliberately narrow: only `omp-live-*` directories under the OS temp dir, only
+ * once they are older than an hour, and only when they have the layout this
+ * module creates. Anything else in the temp dir is left alone.
+ */
+export function sweepAbandonedRoots({ olderThanMs = 3_600_000 } = {}) {
+  const removed = [];
+  let entries;
+  try {
+    entries = readdirSync(os.tmpdir(), { withFileTypes: true });
+  } catch {
+    return removed;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("omp-live-")) continue;
+    const full = path.join(os.tmpdir(), entry.name);
+    try {
+      if (now - statSync(full).mtimeMs < olderThanMs) continue; // possibly a run in flight
+      if (!existsSync(path.join(full, "work")) || !existsSync(path.join(full, "sessions"))) continue;
+      rmSync(full, { recursive: true, force: true });
+      removed.push(full);
+    } catch {
+      // Best effort.
+    }
+  }
+  return removed;
 }

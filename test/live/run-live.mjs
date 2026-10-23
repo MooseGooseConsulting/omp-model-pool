@@ -19,6 +19,7 @@ import {
   createIsolatedEnv,
   diffManifests,
   hashOwnerConfig,
+  sweepAbandonedRoots,
   writeRunManifest,
 } from "./isolated-env.mjs";
 import { findSessionFiles, parseJsonOutput, readTranscript, runOmp } from "./omp-runner.mjs";
@@ -126,6 +127,10 @@ async function discoverFreeRoutes(env) {
 
 async function main() {
   const beforeHashes = hashOwnerConfig();
+  const swept = sweepAbandonedRoots();
+  if (swept.length > 0) {
+    console.log(`swept ${swept.length} abandoned run root(s) from earlier interrupted runs`);
+  }
 
   const probe = await discoverFreeRoutes(process.env);
   if (probe.routes.length < 2) {
