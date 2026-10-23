@@ -188,6 +188,17 @@ Corrected evidence, run 2026-10-23 against the installed `omp v18.12.6`:
 - Full suite tally: **8/8 checks passed**, including `owner configuration untouched — all hashes unchanged` and the counter check (`{"default":1,"slow":1}`). Two checks reported `skip`, and neither is a pass: the model-driven role-delegation check (`parent exited null; no delegation observed`, the suite's documented skip-prone case, since a free-tier parent does not reliably delegate), and `run root removed`, which skipped only because a root left behind by the earlier run I killed at its cap was still on disk for the harness's own sweep to collect.
 - Not performed: the interactive TUI smoke — no headless path drives the picker/editor dialogs.
 
+### Interactive flows driven on a real host (RPC + extension UI sub-protocol)
+
+`omp --mode rpc` documents an extension UI sub-protocol (`extension_ui_request` / `extension_ui_response`), so the picker and editor were driven for real rather than left to a human. Results, against the installed host with a pinned free model and an isolated agent dir carrying the owner's provider config:
+
+- the host lists the command as `name=model-pool source=extension`;
+- `status` and `doctor` print real output (`registry readable, 635 authenticated model(s)`), and neither created `model-pool.json`;
+- picker: the filter dialog was answered, a model was chosen from the host's real list, and after the switch the host's `get_state` reported the same provider and id;
+- editor: it created `@slow`, added a model, and the profile file appeared as `{"pools":{"slow":[...]}}` with the write reported as a file write rather than runtime-only; `status` then re-read it as `default-file, writable`, and no state file was created.
+
+Mode-dependent finding, recorded not fixed: in RPC mode `ctx.models.list()` held 635 models, **all Devin** (`DEVIN_API_KEY` is set in this environment, `KILO_API_KEY` is not), with no Kilo entry; `current()` was empty and `resolve()` failed for the configured Kilo free routes. `doctor` therefore reported them `unavailable — unresolved` and the main session did **not** rotate (it stayed on the pinned `kilo/liquid/lfm-2.5-2.6b:free`). Print mode rotates onto those same routes, as the live suite above shows. TUI behaviour is untested: `/model-pool doctor` in a TUI distinguishes the two cases, since a working pool reports the entries as `ok`.
+
 ### Review findings integrated
 
 Automated review ran on PR #11 (CodeAnt, CodeRabbit, Kilo Code Review, Codex). Four Codex findings were confirmed real and fixed in a follow-up commit, each with a regression test:
