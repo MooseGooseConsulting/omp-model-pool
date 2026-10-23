@@ -185,7 +185,8 @@ Corrected evidence, run 2026-10-23 against the installed `omp v18.12.6`:
 - The configured roles and pools use free routes only: `modelRoles.default` is `kilo/nvidia/nemotron-3.5-lightning:free:high`, and `<agent dir>/model-pool.json` rotates `kilo/nvidia/nemotron-3.5-lightning:free` and `kilo/xingchen-agi/xing4.0-29b-a4b:free` for `default`, `slow` and `task`.
 - A direct check of the suite's free-route contract found **13** routes that are `isFree`, end in `:free`, price at zero and exist in OMP's registry at the time of the run.
 - `npm run test:live` **passed**: free-route discovery (pinned start `kilo/liquid/lfm-2.5-2.6b:free`, pool rotating `kilo/xingchen-agi/xing4.0-29b-a4b:free` and `kilo/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`); a first main run on `kilo/xingchen-agi/xing4.0-29b-a4b:free`; a second fresh OMP process on `kilo/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` over the same state file, which is the rotation claim; and a resumed session keeping its restored model.
-- Not performed: the interactive TUI smoke, and the suite's model-driven role-delegation check, which is its documented skip-prone case.
+- Full suite tally: **8/8 checks passed**, including `owner configuration untouched — all hashes unchanged` and the counter check (`{"default":1,"slow":1}`). Two checks reported `skip`, and neither is a pass: the model-driven role-delegation check (`parent exited null; no delegation observed`, the suite's documented skip-prone case, since a free-tier parent does not reliably delegate), and `run root removed`, which skipped only because a root left behind by the earlier run I killed at its cap was still on disk for the harness's own sweep to collect.
+- Not performed: the interactive TUI smoke — no headless path drives the picker/editor dialogs.
 
 ### Review findings integrated
 
@@ -205,7 +206,7 @@ Kilo Code Review's two suggestions were considered and declined, with reasons: t
 - PR: https://github.com/MooseGooseConsulting/omp-model-pool/pull/11
 - CI: `build-test (ubuntu-latest, 24)` pass, `build-test (windows-latest, 24)` pass; Graphite mergeability pass; Kilo Code Review pass; CodeAnt review completed; CodeRabbit still in progress.
 - Review request: `@codeant-ai: review` comment posted (https://github.com/MooseGooseConsulting/omp-model-pool/pull/11#issuecomment-6370831867). The repository has exactly one collaborator (the author), so no human reviewer could be requested without fabricating an identity.
-- Real-host evidence: `npm run test:live` passed on free routes alone (see the corrected section above). Residual gap: the interactive TUI smoke and the suite's skip-prone model-driven role-delegation check.
+- Real-host evidence: `npm run test:live` passed **8/8 on free routes alone** (see the corrected section above). Residual gap: the interactive TUI smoke, plus the suite's two skips — model-driven role delegation and the leftover run-root sweep.
 
 ### Follow-up hardening (same branch)
 
