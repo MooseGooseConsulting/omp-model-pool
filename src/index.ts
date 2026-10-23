@@ -69,6 +69,8 @@ interface ExtensionContextLike {
   agent?: { kind?: unknown; name?: unknown; id?: unknown };
   models?: ModelsQuery;
   ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
+  /** Read-only session manager; `getEntries()` distinguishes a new session from a loaded one. */
+  sessionManager?: { getEntries?: () => unknown };
   cwd?: string;
   [key: string]: unknown;
 }
@@ -387,15 +389,29 @@ async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
   }
 }
 
-/** Atomically select and advance the role cursor in the shared state file. */
-function advancePersisted(roleKey: string, poolLength: number, file: string): Promise<{ slot: number }> {
+/**
+ * Atomically select and advance the role cursor in the shared state file.
+ * The cursor indexes the configured pool and is stored modulo its length, so a
+ * shared file keeps one meaning across processes. Nothing eligible means no
+ * write, so the cursor is not consumed.
+ */
+function advancePersisted(
+  roleKey: string,
+  poolLength: number,
+  eligible: boolean[],
+  file: string,
+): Promise<{ index: number } | undefined> {
   return withStateLock(file, () => {
     const persisted = readPersistedCounters(file);
-    const cursor = persisted[roleKey] ?? 0;
-    const slot = poolLength === 0 ? 0 : cursor % poolLength;
-    persisted[roleKey] = cursor + 1;
-    writeStateAtomic(file, persisted);
-    return { slot };
+    const start = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
+    for (let offset = 0; offset < poolLength; offset++) {
+      const index = (start + offset) % poolLength;
+      if (eligible[index] !== true) continue;
+      persisted[roleKey] = (index + 1) % poolLength;
+      writeStateAtomic(file, persisted);
+      return { index };
+    }
+    return undefined;
   });
 }
 
@@ -534,34 +550,47 @@ function modelIdentity(m: ModelLike): string {
   return typeof m.id === "string" && m.id.length > 0 ? `${provider}${m.id}` : "";
 }
 
+/** Per-entry availability, parallel to the configured pool. */
+interface PoolAvailability {
+  /** `eligible[i]` answers whether configured entry `i` may be used right now. */
+  eligible: boolean[];
+  /** How many entries are eligible. */
+  count: number;
+  /** False when the model registry could not be read at all. */
+  registryReadable: boolean;
+}
+
 /**
- * Keep pool entries that resolve AND are present in the authenticated list.
- * Returns the surviving selectors in pool order (original strings preserved so
- * the child re-resolves exactly what the operator configured).
+ * Decide, per configured pool entry, whether it may be used right now.
+ *
+ * The result is parallel to the configured pool so the round-robin cursor can
+ * stay an index into the *configured* list: an entry that is temporarily
+ * unavailable is skipped without re-phasing the rotation. Modding a filtered
+ * list instead shifts every cycle whenever availability changes, which emits a
+ * duplicate pick at the transition.
  *
  * `registryReadable` distinguishes "the model registry says none of these are
  * authenticated" (a real empty pool) from "we could not read the registry at
  * all" (a transient host/registry failure). Only the former may hard-block
  * under `strict`; the latter always fails open.
  */
-function filterAvailable(
-  selectors: string[],
-  models: ModelsQuery | undefined,
-): { available: string[]; registryReadable: boolean } {
-  if (models === undefined) return { available: [], registryReadable: false };
+function filterAvailable(selectors: string[], models: ModelsQuery | undefined): PoolAvailability {
+  const eligible = selectors.map(() => false);
+  if (models === undefined) return { eligible, count: 0, registryReadable: false };
   let listed: ModelLike[];
   try {
     listed = models.list() ?? [];
   } catch {
-    return { available: [], registryReadable: false };
+    return { eligible, count: 0, registryReadable: false };
   }
   const identities = new Set<string>();
   for (const m of listed) {
     const id = modelIdentity(m);
     if (id.length > 0) identities.add(id);
   }
-  const out: string[] = [];
-  for (const selector of selectors) {
+  let count = 0;
+  for (let i = 0; i < selectors.length; i++) {
+    const selector = selectors[i] as string;
     let resolved: ModelLike | undefined;
     try {
       resolved = models.resolve(selector);
@@ -574,18 +603,31 @@ function filterAvailable(
     // an id still counts if resolve() itself succeeded and the list is empty
     // (hosts that report no authenticated models yet still resolve aliases).
     if (id.length > 0 && !identities.has(id) && listed.length > 0) continue;
-    out.push(selector);
+    eligible[i] = true;
+    count++;
   }
-  return { available: out, registryReadable: true };
+  return { eligible, count, registryReadable: true };
 }
 
-/** Advance the role counter and return the pick plus its pool position. */
-function pickRoundRobin(roleKey: string, available: string[]): { picked: string; index: number } {
-  const cursor = counters[roleKey] ?? 0;
-  const slot = available.length === 0 ? 0 : cursor % available.length;
-  const picked = available[slot] as string;
-  counters[roleKey] = cursor + 1;
-  return { picked, index: slot };
+/**
+ * Advance the role cursor to the next eligible entry of the *configured* pool.
+ * The cursor is an index into that pool, stored modulo its length, so it stays
+ * bounded and an unavailable entry is skipped without re-phasing the rotation.
+ * Returns undefined when nothing is eligible (the cursor is not consumed).
+ */
+function pickRoundRobin(
+  roleKey: string,
+  pool: string[],
+  eligible: boolean[],
+): { picked: string; index: number } | undefined {
+  const start = pool.length === 0 ? 0 : (counters[roleKey] ?? 0) % pool.length;
+  for (let offset = 0; offset < pool.length; offset++) {
+    const index = (start + offset) % pool.length;
+    if (eligible[index] !== true) continue;
+    counters[roleKey] = (index + 1) % pool.length;
+    return { picked: pool[index] as string, index };
+  }
+  return undefined;
 }
 
 /**
@@ -595,28 +637,51 @@ function pickRoundRobin(roleKey: string, available: string[]): { picked: string;
 async function pickForRole(
   pi: ExtensionApiLike,
   roleKey: string,
-  available: string[],
-): Promise<{ picked: string; index: number; persisted: boolean }> {
+  pool: string[],
+  availability: PoolAvailability,
+): Promise<{ picked: string; index: number; persisted: boolean } | undefined> {
   if (!activeConfig.persistCounters) {
-    return { ...pickRoundRobin(roleKey, available), persisted: false };
+    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    return pick === undefined ? undefined : { ...pick, persisted: false };
   }
   try {
-    const { slot } = await advancePersisted(roleKey, available.length, activeConfig.stateFile);
-    counters[roleKey] = (counters[roleKey] ?? 0) + 1; // mirror for diagnostics/tests
-    return { picked: available[slot] as string, index: slot, persisted: true };
+    const picked = await advancePersisted(roleKey, pool.length, availability.eligible, activeConfig.stateFile);
+    if (picked === undefined) return undefined;
+    counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
+    return { picked: pool[picked.index] as string, index: picked.index, persisted: true };
   } catch (err) {
     safeLog(
       pi,
       "warn",
       `[model-pool] persisted counter read/write failed; using in-memory counters: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return { ...pickRoundRobin(roleKey, available), persisted: false };
+    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    return pick === undefined ? undefined : { ...pick, persisted: false };
   }
 }
 
 /** Human-readable routing note surfaced in the task UI. */
 function describePick(roleKey: string, picked: string, index: number, total: number): string {
   return `pool ${roleKey}[${index + 1}/${total}]: ${picked}`;
+}
+
+/**
+ * Is this `session_start` a genuinely new session?
+ * `true` new (no transcript entries yet), `false` a loaded session that already
+ * has entries, `undefined` when the host exposes too little to tell. Only
+ * `true` rotates: an unknown answer must never risk overriding a model that
+ * OMP just restored for a resumed session.
+ */
+function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
+  const manager = ctx.sessionManager;
+  if (manager === undefined || typeof manager.getEntries !== "function") return undefined;
+  try {
+    const entries = manager.getEntries();
+    if (!Array.isArray(entries)) return undefined;
+    return entries.length === 0;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,29 +706,31 @@ function handleBeforeSubagentSpawn(
     const pool = activeConfig.pools[roleKey];
     if (pool === undefined || pool.length === 0) return undefined; // Unconfigured role: core behavior unchanged.
 
-    const { available, registryReadable } = filterAvailable(pool, ctx.models);
-    if (available.length === 0) {
+    const availability = filterAvailable(pool, ctx.models);
+    if (availability.count === 0) {
       // Hard-block only when the registry actually answered "none of these are
       // authenticated"; an unreadable registry is a transient failure, not a
       // reason to refuse the spawn.
-      if (isStrictForRole(roleKey) && registryReadable) {
+      if (isStrictForRole(roleKey) && availability.registryReadable) {
         return { block: true, reason: `model-pool: no authenticated model available for role @${roleKey}` };
       }
-      safeLog(pi, "warn", `[model-pool] empty pool for role=${roleKey} agent=${event.agent} kind=${event.invocationKind} registryReadable=${registryReadable}; leaving spawn unmodified`);
+      safeLog(pi, "warn", `[model-pool] empty pool for role=${roleKey} agent=${event.agent} kind=${event.invocationKind} registryReadable=${availability.registryReadable}; leaving spawn unmodified`);
       return undefined;
     }
 
     if (activeConfig.persistCounters) {
-      return pickForRole(pi, roleKey, available).then(({ picked, index, persisted }) => {
-        const note = describePick(roleKey, picked, index, available.length);
-        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${picked} index=${index} total=${available.length} persisted=${persisted}`);
-        return { model: picked, note };
+      return pickForRole(pi, roleKey, pool, availability).then((pick) => {
+        if (pick === undefined) return undefined;
+        const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
+        return { model: pick.picked, note };
       });
     }
-    const { picked, index } = pickRoundRobin(roleKey, available);
-    const note = describePick(roleKey, picked, index, available.length);
-    safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${picked} index=${index} total=${available.length}`);
-    return { model: picked, note };
+    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    if (pick === undefined) return undefined;
+    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+    safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
+    return { model: pick.picked, note };
   } catch (err) {
     // Fail open: a router error must never break the task call.
     try {
@@ -684,20 +751,31 @@ async function handleSessionStart(
   try {
     if (!activeConfig.enableMainSessionRotation) return;
     if (ctx.agent?.kind !== "main") return; // Main sessions only.
+
+    // `session_start` also fires for a *loaded* session, so a resume must never
+    // re-rotate: OMP restores that session's saved model, and overriding it here
+    // would change the model mid-conversation and invalidate prompt caches.
+    const freshness = sessionFreshness(ctx);
+    if (freshness !== true) {
+      safeLog(pi, "info", `[model-pool] main session not rotated (${freshness === false ? "loaded session already has transcript entries" : "session novelty unknown"})`);
+      return;
+    }
+
     const roleKey = activeConfig.mainSessionRole;
     const pool = activeConfig.pools[roleKey];
     if (pool === undefined || pool.length === 0) return;
 
-    const { available, registryReadable } = filterAvailable(pool, ctx.models);
-    if (available.length === 0) {
-      safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey} registryReadable=${registryReadable}; leaving model unchanged`);
+    const availability = filterAvailable(pool, ctx.models);
+    if (availability.count === 0) {
+      safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey} registryReadable=${availability.registryReadable}; leaving model unchanged`);
       return;
     }
-    const { picked, index, persisted } = await pickForRole(pi, roleKey, available);
-    const note = describePick(roleKey, picked, index, available.length);
-    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${picked} index=${index} total=${available.length} persisted=${persisted}`);
+    const pick = await pickForRole(pi, roleKey, pool, availability);
+    if (pick === undefined) return;
+    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
     if (typeof pi.setModel === "function") {
-      await pi.setModel(picked);
+      await pi.setModel(pick.picked);
     }
     try {
       ctx.ui?.notify?.(`model-pool: ${note}`, "info");

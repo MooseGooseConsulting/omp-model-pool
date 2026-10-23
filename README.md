@@ -86,9 +86,14 @@ omp --extension ./omp-musical-models
 - `session_start` (secondary): `before_subagent_spawn` never fires for the
   main session, so main-session rotation is a `session_start` handler gated on
   `ctx.agent?.kind === "main"` (checked via `kind`, never `depth`: `/tan`
-  clones are subs at depth 0). Same resolve → filter → pick → advance against
-  `mainSessionRole` (default `"default"`), then `pi.setModel(picked)` plus a
-  UI notify. Disabled with `enableMainSessionRotation: false`.
+  clones are subs at depth 0). It rotates a **genuinely new** session only:
+  `session_start` also fires for a loaded session, so a session whose
+  `ctx.sessionManager.getEntries()` is non-empty (a resume) keeps the model OMP
+  restored, and so does an unknown answer — overriding a restored model
+  mid-conversation would invalidate prompt caches. Otherwise: same
+  resolve → pick → advance against `mainSessionRole` (default `"default"`),
+  then `pi.setModel(picked)` plus a UI notify. Disabled with
+  `enableMainSessionRotation: false`.
 - Handler errors fail open (log, return nothing) unless `strict` applies.
 - `strict` hard-blocks only when the model registry actually answered and none
   of the pool's entries are authenticated. An unreadable registry (no
@@ -103,6 +108,11 @@ omp --extension ./omp-musical-models
 ## Counter semantics
 
 - Strict in-order round-robin per role. Random / shuffle-bag is out.
+- The cursor is an index into the **configured** pool, stored modulo its
+  length, so it stays bounded. An entry that is temporarily unauthenticated is
+  skipped without re-phasing the rotation, and a pool with nothing eligible
+  consumes no cursor step. Modding a filtered list instead re-phases the cycle
+  whenever availability changes, which emits a duplicate pick at the swap.
 - Module-level `Record<string, number>`, shared in-process across every
   session this OMP binds. Parallel spawns advance in handler-execution order
   (nondeterministic under concurrency).
@@ -149,13 +159,21 @@ omp --extension ./omp-musical-models
    counters when roles overlap.
 9. With `persistCounters: true`, run two sequential `omp` processes against a
    `slow` pool of 2; the second process continues where the first stopped.
+10. Resume a session (`omp -r`); the restored main-session model is not
+    overridden. Start a brand-new session with the `default` pool configured;
+    it rotates.
+11. Make one entry of a 3-model pool unavailable (logout / remove its key);
+    the cycle skips it without repeating the entry before it.
 
 Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
 `@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
-unauthenticated filtering with fail-open vs `strict` block, restart reset,
-main-session advance with sub exclusion, and opt-in persistence (cross-process
-continuation, disabled-is-in-memory-only, malformed-state fail-open, and
-parallel-pick serialization).
+unauthenticated filtering with fail-open vs `strict` block, stable phase across
+an availability change, restart reset, main-session advance with sub exclusion
+and a resume/no-novelty gate, and opt-in persistence (cross-process
+continuation, abandoned-lock reclaim, a live holder's lock never stolen, a
+4-process × 5-pick contention run, disabled-is-in-memory-only, schema and
+malformed-state fail-open, non-boolean opt-in ignored, flat-config opt-in, and
+in-process serialization).
 
 ## API (tests / hosts)
 
