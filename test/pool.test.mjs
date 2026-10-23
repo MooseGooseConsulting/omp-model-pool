@@ -1,5 +1,8 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const mod = await import("../dist/index.js");
 
@@ -60,6 +63,7 @@ beforeEach(() => {
   mod.resetCounters();
   delete process.env.OMP_MODEL_POOLS_JSON;
   delete process.env.OMP_MODEL_POOL_CONFIG;
+  delete process.env.OMP_MODEL_POOL_STATE;
 });
 
 describe("per-role round robin", () => {
@@ -196,5 +200,218 @@ describe("main-session rotation", () => {
       { agent: { kind: "main", name: "main", id: "Main" }, models: makeModels(["p/a"]), ui: { notify: () => {} } },
     );
     assert.deepEqual(setModels, []);
+  });
+});
+
+describe("cross-process counter persistence (opt-in)", () => {
+  const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+
+  function tmpStateFile() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-"));
+    return { dir, file: path.join(dir, "model-pool-state.json") };
+  }
+
+  it("continues the cycle across simulated restarts when enabled", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, persistCounters: true, stateFile: file });
+      const models = makeModels(["p/a", "p/b", "p/c"]);
+      const seen = [];
+      for (let i = 0; i < 4; i++) {
+        mod.resetCounters(); // each iteration is a fresh OS process: in-memory gone
+        const r = await handlers.before_subagent_spawn(ev, subCtx(models));
+        seen.push(r.model);
+      }
+      assert.deepEqual(seen, ["p/a", "p/b", "p/c", "p/a"]);
+      const state = JSON.parse(fs.readFileSync(file, "utf8"));
+      assert.equal(state.counters.slow, 4);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves no state file and returns synchronously when disabled", () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, stateFile: file });
+      const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a"); // sync result, not a promise
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails open on a malformed state file and does not reset it", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, "{ not json");
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a"); // in-memory fallback still routes
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.equal(fs.readFileSync(file, "utf8"), "{ not json"); // untouched for the operator
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps in-process picks distinct (real cross-process contention is covered in cross-process.test.mjs)", async () => {    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const models = makeModels(["p/a", "p/b"]);
+      const [r1, r2] = await Promise.all([
+        handlers.before_subagent_spawn(ev, subCtx(models)),
+        handlers.before_subagent_spawn(ev, subCtx(models)),
+      ]);
+      assert.deepEqual([r1.model, r2.model].sort(), ["p/a", "p/b"]);
+      const state = JSON.parse(fs.readFileSync(file, "utf8"));
+      assert.equal(state.counters.slow, 2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists main-session rotation on the same shared state file", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers, setModels } = makeHarness();
+      mod.default(pi, { pools: { default: ["p/x", "p/y"] }, persistCounters: true, stateFile: file });
+      const models = makeModels(["p/x", "p/y"]);
+      const main = { agent: { kind: "main", name: "main", id: "Main" }, models, ui: { notify: () => {} } };
+      mod.resetCounters();
+      await handlers.session_start({ type: "session_start" }, main);
+      mod.resetCounters();
+      await handlers.session_start({ type: "session_start" }, main);
+      assert.deepEqual(setModels, ["p/x", "p/y"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a state file from an unknown schema (fail open, file untouched)", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ version: 2, counters: { slow: 5 } }));
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a"); // falls back to in-memory, ignores the foreign cursor
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2); // not overwritten
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects the whole state when a single counter entry is invalid", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: "4" } }));
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, "4"); // untouched
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a state file with no declared version", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      fs.writeFileSync(file, JSON.stringify({ counters: { slow: 4 } }));
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { counters: { slow: 4 } });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honors persistCounters from a flat JSON config", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      process.env.OMP_MODEL_POOLS_JSON = JSON.stringify({ slow: ["p/a", "p/b"], persistCounters: true, stateFile: file });
+      const { pi, handlers } = makeHarness();
+      mod.default(pi); // no options: config comes from the environment
+      const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not enable persistence for a non-boolean persistCounters", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const { pi, handlers } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: "false", stateFile: file });
+      const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
+      assert.equal(r.model, "p/a");
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("state file path resolution", () => {
+  it("expands a leading ~ and never returns a literal ~ path", () => {
+    const p = mod.resolveStateFilePath("~/custom/state.json");
+    assert.ok(path.isAbsolute(p), p);
+    assert.ok(!p.includes("~"), p);
+    assert.equal(p, path.resolve(path.join(os.homedir(), "custom", "state.json")));
+  });
+
+  it("honors PI_CODING_AGENT_DIR as the base for relative and default paths", () => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    const base = path.join(os.tmpdir(), "mmm-agent");
+    process.env.PI_CODING_AGENT_DIR = base;
+    try {
+      assert.equal(mod.resolveStateFilePath("state.json"), path.resolve(base, "state.json"));
+      assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(base), "model-musical-models-state.json"));
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+describe("strict policy boundary", () => {
+  const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+
+  it("does not hard-block when the model registry is unreadable", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
+    const noRegistry = { agent: { kind: "sub" }, models: undefined, ui: { notify: () => {} } };
+    assert.equal(handlers.before_subagent_spawn(ev, noRegistry), undefined);
+  });
+
+  it("does not hard-block when the registry read throws", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
+    const throwing = {
+      agent: { kind: "sub" },
+      models: { list: () => { throw new Error("registry down"); }, current: () => undefined, resolve: () => undefined },
+      ui: { notify: () => {} },
+    };
+    assert.equal(handlers.before_subagent_spawn(ev, throwing), undefined);
+  });
+
+  it("still hard-blocks when the registry answers that nothing is authenticated", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
+    const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
+    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
   });
 });
