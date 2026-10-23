@@ -59,7 +59,8 @@ function subCtx(models, agentKind = "sub") {
   };
 }
 
-// A main session; `entries` non-empty models a loaded/resumed session.
+// A main session. `entries` models what the host reports at `session_start`:
+// only a user/assistant message means the session was loaded from disk.
 function mainCtx(models, entries = []) {
   return {
     agent: { kind: "main", name: "main", id: "Main" },
@@ -232,9 +233,40 @@ describe("main-session rotation", () => {
   it("does not rotate a loaded/resumed main session", async () => {
     const { pi, handlers, setModels } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const resumed = mainCtx(makeModels(["p/x", "p/y"]), [{ id: "entry-1" }]);
+    const resumed = mainCtx(makeModels(["p/x", "p/y"]), [
+      { type: "message", message: { role: "user", content: "an earlier turn" } },
+    ]);
     await handlers.session_start({ type: "session_start" }, resumed);
-    assert.deepEqual(setModels, [], "a session with transcript entries keeps its restored model");
+    assert.deepEqual(setModels, [], "a restored conversation keeps its restored model");
+  });
+
+  it("rotates a new session whose entries are only non-conversational metadata", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    // A preceding `session_start` handler may already have called
+    // `pi.appendEntry(...)`, which writes a `custom` entry; OMP runs lifecycle
+    // handlers sequentially in extension order. Alongside session_init, title,
+    // mode and usage records, none of these are a conversation, so a new
+    // session must still rotate.
+    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [
+      { type: "session_init", id: "e1" },
+      { type: "custom", customType: "another-extension/state", data: { note: "startup" } },
+      { type: "model_usage", purpose: "title", role: "tiny" },
+      { type: "mode_change", id: "e2" },
+      { type: "custom_message", customType: "widget", content: "hi", display: false },
+    ]);
+    await handlers.session_start({ type: "session_start" }, fresh);
+    assert.deepEqual(setModels, ["p/x"], "startup metadata is not a conversation");
+  });
+
+  it("does not treat a tool result as a restored conversation", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [
+      { type: "message", message: { role: "toolResult", content: "output" } },
+    ]);
+    await handlers.session_start({ type: "session_start" }, fresh);
+    assert.deepEqual(setModels, ["p/x"], "only user/assistant turns mark a session as loaded");
   });
 
   it("does not rotate when the host cannot report session novelty", async () => {
@@ -442,6 +474,24 @@ describe("cross-process counter persistence (opt-in)", () => {
 });
 
 describe("state file path resolution", () => {
+  const ENV_KEYS = ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR"];
+
+  // Run `fn` with the OMP directory/profile vars set to exactly `vars`, so a
+  // test is not perturbed by whatever the developer's shell exports.
+  function withEnv(vars, fn) {
+    const saved = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
+    for (const k of ENV_KEYS) delete process.env[k];
+    for (const [k, v] of Object.entries(vars)) process.env[k] = v;
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
   it("expands a leading ~ and never returns a literal ~ path", () => {
     const p = mod.resolveStateFilePath("~/custom/state.json");
     assert.ok(path.isAbsolute(p), p);
@@ -450,16 +500,70 @@ describe("state file path resolution", () => {
   });
 
   it("honors PI_CODING_AGENT_DIR as the base for relative and default paths", () => {
-    const prev = process.env.PI_CODING_AGENT_DIR;
     const base = path.join(os.tmpdir(), "mmm-agent");
-    process.env.PI_CODING_AGENT_DIR = base;
-    try {
+    withEnv({ PI_CODING_AGENT_DIR: base }, () => {
       assert.equal(mod.resolveStateFilePath("state.json"), path.resolve(base, "state.json"));
       assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(base), "model-pool-state.json"));
-    } finally {
-      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = prev;
-    }
+    });
+  });
+
+  it("scopes the default state file to the active profile", () => {
+    withEnv({ OMP_PROFILE: "work" }, () => {
+      // Not ~/.omp/agent: a named profile relocates the agent dir, and sharing
+      // the default profile's file would make two profiles share one cursor.
+      assert.equal(
+        mod.resolveStateFilePath(),
+        path.join(os.homedir(), ".omp", "profiles", "work", "agent", "model-pool-state.json"),
+      );
+      assert.equal(
+        mod.resolveStateFilePath("state.json"),
+        path.join(os.homedir(), ".omp", "profiles", "work", "agent", "state.json"),
+      );
+    });
+  });
+
+  it("ignores PI_CODING_AGENT_DIR for a named profile", () => {
+    withEnv({ OMP_PROFILE: "work", PI_CODING_AGENT_DIR: path.join(os.tmpdir(), "mmm-agent") }, () => {
+      assert.equal(
+        mod.resolveStateFilePath(),
+        path.join(os.homedir(), ".omp", "profiles", "work", "agent", "model-pool-state.json"),
+      );
+    });
+  });
+
+  it("honors PI_CONFIG_DIR as the config root under a profile too", () => {
+    withEnv({ OMP_PROFILE: "work", PI_CONFIG_DIR: "myconf" }, () => {
+      assert.equal(
+        mod.resolveStateFilePath(),
+        path.join(os.homedir(), "myconf", "profiles", "work", "agent", "model-pool-state.json"),
+      );
+    });
+  });
+
+  it("treats an empty or default profile as the default profile", () => {
+    // An explicitly-empty OMP_PROFILE selects the default profile rather than
+    // inheriting the legacy PI_PROFILE.
+    withEnv({ OMP_PROFILE: "", PI_PROFILE: "work" }, () => {
+      const fallback = path.join(os.tmpdir(), "mmm-agent");
+      process.env.PI_CODING_AGENT_DIR = fallback;
+      assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(fallback), "model-pool-state.json"));
+    });
+    withEnv({ OMP_PROFILE: "  default  " }, () => {
+      assert.equal(mod.resolveStateFilePath(), path.join(os.homedir(), ".omp", "agent", "model-pool-state.json"));
+    });
+    withEnv({ PI_PROFILE: "work" }, () => {
+      assert.equal(
+        mod.resolveStateFilePath(),
+        path.join(os.homedir(), ".omp", "profiles", "work", "agent", "model-pool-state.json"),
+      );
+    });
+  });
+
+  it("keeps an explicit stateFile authoritative under a profile", () => {
+    withEnv({ OMP_PROFILE: "work" }, () => {
+      const explicit = path.join(os.tmpdir(), "explicit-state.json");
+      assert.equal(mod.resolveStateFilePath(explicit), path.resolve(explicit));
+    });
   });
 });
 

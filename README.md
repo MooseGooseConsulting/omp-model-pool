@@ -59,10 +59,18 @@ order:
 3. `OMP_MODEL_POOL_CONFIG` — path to a JSON file as above.
 
 `stateFile` also honors `OMP_MODEL_POOL_STATE` when the option is unset.
-Relative paths resolve against the OMP agent dir (`PI_CODING_AGENT_DIR` when
-set, else `~/.omp/agent`), never the process CWD, so processes started from
-different directories still share one cycle. A leading `~` resolves against
-the home directory.
+Relative paths resolve against the OMP agent dir, never the process CWD, so
+processes started from different directories still share one cycle. A leading
+`~` resolves against the home directory.
+
+The agent dir follows OMP's own resolution rather than assuming the default
+profile: the config root is `~/<PI_CONFIG_DIR or .omp>`, a named profile
+(`OMP_PROFILE`, or the legacy `PI_PROFILE`) relocates it to
+`<root>/profiles/<name>/agent`, and `PI_CODING_AGENT_DIR` applies to the
+default profile only — a named profile ignores it. So two profiles never share
+one counter file, and a profile never writes state into another profile's
+directory. XDG relocation is **not** followed; set `stateFile` explicitly on a
+host that moved its agent directory with `omp config init-xdg`.
 
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
@@ -89,9 +97,14 @@ omp --extension ./omp-model-pool
   `ctx.agent?.kind === "main"` (checked via `kind`, never `depth`: `/tan`
   clones are subs at depth 0). It rotates a **genuinely new** session only:
   `session_start` also fires for a loaded session, so a session whose
-  `ctx.sessionManager.getEntries()` is non-empty (a resume) keeps the model OMP
-  restored, and so does an unknown answer — overriding a restored model
-  mid-conversation would invalidate prompt caches. Otherwise: same
+  `ctx.sessionManager.getEntries()` already holds a user or assistant message
+  (a restored conversation) keeps the model OMP restored, and so does an
+  unknown answer — overriding a restored model mid-conversation would
+  invalidate prompt caches. Novelty is decided by whether a conversational turn
+  exists, not by whether the entry list is empty: a new session legitimately
+  carries `session_init`, title/mode/model and usage entries, and another
+  extension's `session_start` handler may already have appended its own state
+  with `pi.appendEntry`. Otherwise: same
   resolve → pick → advance against `mainSessionRole` (default `"default"`),
   then `pi.setModel(picked)` plus a UI notify. Disabled with
   `enableMainSessionRotation: false`.
@@ -175,16 +188,20 @@ omp --extension ./omp-model-pool
     it rotates.
 11. Make one entry of a 3-model pool unavailable (logout / remove its key);
     the cycle skips it without repeating the entry before it.
+12. Run under a named profile (`omp --profile work`) with `persistCounters:
+    true`; state lands under `.omp/profiles/work/agent/`, and a second profile
+    keeps its own cycle rather than sharing the default profile's cursor.
 
 Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
 `@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
 unauthenticated filtering with fail-open vs `strict` block, stable phase across
 an availability change, restart reset, main-session advance with sub exclusion
-and a resume/no-novelty gate, and opt-in persistence (cross-process
+and a conversation-based resume/no-novelty gate, profile- and
+`PI_CONFIG_DIR`-aware state paths, and opt-in persistence (cross-process
 continuation, abandoned-lock reclaim, a live holder's lock never stolen, a
-4-process × 5-pick contention run, disabled-is-in-memory-only, schema and
-malformed-state fail-open, non-boolean opt-in ignored, flat-config opt-in, and
-in-process serialization).
+4-process × 5-pick contention run, disabled-is-in-memory-only, schema- and
+malformed-state fail-open, version-1 replacement, non-boolean opt-in ignored,
+flat-config opt-in, and in-process serialization).
 
 ## API (tests / hosts)
 

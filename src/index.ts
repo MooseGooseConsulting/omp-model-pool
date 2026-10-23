@@ -191,11 +191,52 @@ export function resetCounters(): void {
 // never silently reset (it is left for the operator to repair or delete).
 // ---------------------------------------------------------------------------
 
-/** OMP agent dir. Honors `PI_CODING_AGENT_DIR` (named profiles), else `~/.omp/agent`. */
+/**
+ * The active OMP profile name, or undefined for the default profile.
+ *
+ * Mirrors OMP's own resolution: `OMP_PROFILE` is canonical and wins even when
+ * it is set but empty — an explicitly-empty value selects the default profile
+ * rather than inheriting the legacy `PI_PROFILE` — and `PI_PROFILE` is the
+ * legacy fallback consulted only when `OMP_PROFILE` is undefined. `default`
+ * and whitespace select the default profile too.
+ */
+function activeProfile(): string | undefined {
+  const omp = process.env["OMP_PROFILE"];
+  const raw = omp !== undefined ? omp : process.env["PI_PROFILE"];
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length === 0 || trimmed === "default" ? undefined : trimmed;
+}
+
+/**
+ * OMP's agent dir for the active profile.
+ *
+ * Mirrors OMP's own resolution rather than reconstructing only the default
+ * case. Getting this wrong is not cosmetic: under a named profile a
+ * default-only path makes two profiles silently share one counter file, and
+ * writes state into a profile the operator is not running even though "a
+ * profile sees only its own OMP config".
+ *
+ * - config root is `~/<PI_CONFIG_DIR or .omp>`
+ * - a named profile relocates the agent dir to `<root>/profiles/<name>/agent`
+ * - `PI_CODING_AGENT_DIR` applies to the default profile only; a named profile
+ *   ignores it
+ *
+ * XDG relocation (`$XDG_*_HOME/omp`) is deliberately not followed: OMP applies
+ * it per category and only when that category already contains `omp/`, which
+ * is more surface than this extension should re-derive. Set `stateFile`
+ * explicitly on a host that relocated its agent directory.
+ */
 function agentDir(): string {
+  const configured = process.env["PI_CONFIG_DIR"];
+  const configDirName =
+    typeof configured === "string" && configured.trim().length > 0 ? configured.trim() : ".omp";
+  const root = path.join(os.homedir(), configDirName);
+  const profile = activeProfile();
+  if (profile !== undefined) return path.join(root, "profiles", profile, "agent");
   const fromEnv = process.env["PI_CODING_AGENT_DIR"];
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return path.resolve(expandTilde(fromEnv.trim()));
-  return path.join(os.homedir(), ".omp", "agent");
+  return path.join(root, "agent");
 }
 
 /** Expand a leading `~`. `path.resolve` does not, so a literal `~` directory would be created. */
@@ -726,11 +767,36 @@ function describePick(roleKey: string, picked: string, index: number, total: num
 }
 
 /**
+ * Does this entry set already contain a conversational turn?
+ *
+ * A loaded session always has at least one user or assistant message, while a
+ * genuinely *new* session legitimately holds plenty of non-conversational
+ * entries by the time this handler runs: `session_init`, title/mode/model
+ * changes, usage markers, and — the case that matters — whatever a preceding
+ * `session_start` handler appended via `pi.appendEntry`, which produces a
+ * `custom` entry. OMP runs lifecycle handlers sequentially in extension order,
+ * so counting entries would let an unrelated extension silently suppress
+ * rotation on a new session.
+ */
+function hasConversationTurn(entries: unknown[]): boolean {
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    if (record["type"] !== "message") continue;
+    const message = record["message"];
+    if (message === null || typeof message !== "object") continue;
+    const role = (message as Record<string, unknown>)["role"];
+    if (role === "user" || role === "assistant") return true;
+  }
+  return false;
+}
+
+/**
  * Is this `session_start` a genuinely new session?
- * `true` new (no transcript entries yet), `false` a loaded session that already
- * has entries, `undefined` when the host exposes too little to tell. Only
- * `true` rotates: an unknown answer must never risk overriding a model that
- * OMP just restored for a resumed session.
+ * `true` new (no conversational turn yet), `false` a loaded session whose
+ * transcript was restored, `undefined` when the host exposes too little to
+ * tell. Only `true` rotates: an unknown answer must never risk overriding a
+ * model that OMP just restored for a resumed session.
  */
 function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
   const manager = ctx.sessionManager;
@@ -738,7 +804,7 @@ function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
   try {
     const entries = manager.getEntries();
     if (!Array.isArray(entries)) return undefined;
-    return entries.length === 0;
+    return !hasConversationTurn(entries);
   } catch {
     return undefined;
   }
@@ -817,7 +883,7 @@ async function handleSessionStart(
     // would change the model mid-conversation and invalidate prompt caches.
     const freshness = sessionFreshness(ctx);
     if (freshness !== true) {
-      safeLog(pi, "info", `[model-pool] main session not rotated (${freshness === false ? "loaded session already has transcript entries" : "session novelty unknown"})`);
+      safeLog(pi, "info", `[model-pool] main session not rotated (${freshness === false ? "loaded session already has a conversation" : "session novelty unknown"})`);
       return;
     }
 
