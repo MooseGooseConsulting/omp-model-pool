@@ -136,6 +136,8 @@ const DEFAULT_STATE_FILE = "model-pool-state.json";
  * v1 file is rejected rather than reinterpreted — see `parseState`.
  */
 const SCHEMA_VERSION = 2;
+/** The schema the earlier release wrote; recognized so it can be replaced, not merely rejected. */
+const LEGACY_SCHEMA_VERSION = 1;
 /** Cross-process lock acquisition budget (spawn-critical section is milliseconds). */
 const LOCK_TIMEOUT_MS = 6000;
 /** A lock older than this is assumed abandoned by a crashed process. */
@@ -224,50 +226,85 @@ export function resolveStateFilePath(explicit?: string): string {
 }
 
 /**
- * Parse `{ version: 2, counters: { role: index } }`.
- * Returns undefined when the file is malformed in any way — including a single
- * bad counter entry — so the caller fails open and the file is left untouched
- * rather than being rewritten from a partial read.
- *
- * A version-1 file is *deliberately* rejected: v1 held a count into the
- * filtered eligible list, v2 an index into the configured pool, and a v1 file
- * carries no record of which entries were filtered at write time. Translating
- * it would be a guess that silently misphases the rotation, so the operator
- * gets a fresh start and the old file is preserved for inspection.
+ * Read outcome. `invalid` covers malformed JSON, a wrong-shaped doc and an
+ * unrecognized version: those are preserved untouched, because destroying a
+ * file we do not understand risks losing something we did not anticipate.
+ * `legacy-v1` is different — we know exactly what it is and that its cursor
+ * cannot be translated — so it is replaced instead.
  */
-function parseState(raw: string): Record<string, number> | undefined {
+type StateRead =
+  | { kind: "ok"; counters: Record<string, number> }
+  | { kind: "legacy-v1" }
+  | { kind: "invalid" };
+
+/**
+ * Parse `{ version: 2, counters: { role: index } }`.
+ * A version-1 doc reports `legacy-v1`: v1 held a count into the filtered
+ * eligible list, v2 an index into the configured pool, and a v1 file carries no
+ * record of which entries were filtered at write time. Translating it would be
+ * a guess that silently misphases the rotation, so the cursor restarts — but
+ * the file is *replaced* rather than left in place, or `persistCounters` would
+ * reject the same file on every start and never write v2 state again.
+ */
+function parseState(raw: string): StateRead {
   let obj: unknown;
   try {
     obj = JSON.parse(raw) as unknown;
   } catch {
-    return undefined;
+    return { kind: "invalid" };
   }
-  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return { kind: "invalid" };
   const record = obj as Record<string, unknown>;
+  if (record["version"] === LEGACY_SCHEMA_VERSION) return { kind: "legacy-v1" };
   // Read-side schema guard: only a schema we understand may be used.
-  if (record["version"] !== SCHEMA_VERSION) return undefined;
+  if (record["version"] !== SCHEMA_VERSION) return { kind: "invalid" };
   const rawCounters = record["counters"];
-  if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) return undefined;
+  if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) {
+    return { kind: "invalid" };
+  }
   const out: Record<string, number> = Object.create(null);
   for (const [key, value] of Object.entries(rawCounters as Record<string, unknown>)) {
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return undefined;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return { kind: "invalid" };
     out[key] = value;
   }
-  return out;
+  return { kind: "ok", counters: out };
 }
 
-/** Read counters from disk. Missing file → empty; malformed file → throw (no silent reset). */
-function readPersistedCounters(file: string): Record<string, number> {
+/**
+ * Read counters from disk. A missing file reads as empty. A file we cannot
+ * interpret throws, so the caller fails open and leaves it untouched; a
+ * recognized legacy file is reported so the caller can replace it.
+ */
+function readPersistedCounters(file: string): { counters: Record<string, number>; legacy: boolean } {
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null);
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { counters: Object.create(null), legacy: false };
+    }
     throw err;
   }
   const parsed = parseState(raw);
-  if (parsed === undefined) throw new Error(`invalid model-pool state at ${file}`);
-  return parsed;
+  if (parsed.kind === "invalid") throw new Error(`invalid model-pool state at ${file}`);
+  if (parsed.kind === "legacy-v1") return { counters: Object.create(null), legacy: true };
+  return { counters: parsed.counters, legacy: false };
+}
+
+/**
+ * Move a recognized legacy state file aside before fresh state is written over
+ * it, so the operator's file stays inspectable. Best-effort: if the backup
+ * cannot be made, the fresh write still restores persistence.
+ */
+function quarantineLegacyState(file: string): string {
+  const backup = `${file}.v1.bak`;
+  try {
+    fs.rmSync(backup, { force: true });
+    fs.renameSync(file, backup);
+  } catch {
+    // Best-effort only.
+  }
+  return backup;
 }
 
 /** Write the state via a unique temp file + atomic rename (mode 0600). */
@@ -413,16 +450,18 @@ function advancePersisted(
   poolLength: number,
   eligible: boolean[],
   file: string,
-): Promise<{ index: number } | undefined> {
+): Promise<{ index: number; replacedLegacy: boolean } | undefined> {
   return withStateLock(file, () => {
-    const persisted = readPersistedCounters(file);
+    const read = readPersistedCounters(file);
+    if (read.legacy) quarantineLegacyState(file);
+    const persisted = read.counters;
     const start = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
     for (let offset = 0; offset < poolLength; offset++) {
       const index = (start + offset) % poolLength;
       if (eligible[index] !== true) continue;
       persisted[roleKey] = (index + 1) % poolLength;
       writeStateAtomic(file, persisted);
-      return { index };
+      return { index, replacedLegacy: read.legacy };
     }
     return undefined;
   });
@@ -660,6 +699,14 @@ async function pickForRole(
   try {
     const picked = await advancePersisted(roleKey, pool.length, availability.eligible, activeConfig.stateFile);
     if (picked === undefined) return undefined;
+    if (picked.replacedLegacy) {
+      safeLog(
+        pi,
+        "warn",
+        `[model-pool] replaced a version-1 state file at ${activeConfig.stateFile} (cursor semantics changed); ` +
+          `the old file is kept at ${activeConfig.stateFile}.v1.bak and rotation continued from a fresh cursor`,
+      );
+    }
     counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
     return { picked: pool[picked.index] as string, index: picked.index, persisted: true };
   } catch (err) {

@@ -140,11 +140,14 @@ omp --extension ./omp-model-pool
   silently reset.
 - The state file is written as `version: 2`. A `version: 1` file — written by
   the earlier release, which also used a different extension name — is
-  **ignored, not reinterpreted**: v1
-  stored an unbounded running count that was reduced modulo the *filtered*
-  list of authenticated entries, while v2 stores an index into the *configured*
-  pool, so the same integer means a different slot. A v1 file is left on disk
-  and the cycle restarts from a fresh cursor.
+  **replaced, not reinterpreted**: v1 stored an unbounded running count that
+  was reduced modulo the *filtered* list of authenticated entries, while v2
+  stores an index into the *configured* pool, so the same integer means a
+  different slot and no translation is sound. Rotation restarts from a fresh
+  cursor, the old file moves to `<stateFile>.v1.bak` so nothing is destroyed,
+  and persistence keeps working. Only a schema we positively identified is
+  superseded this way; a file we cannot recognize at all is left alone, as
+  above.
 - Revived / resumed children do not advance (the event fires once per new
   child, never on revive/resume).
 - New main sessions share the same counters when roles overlap;

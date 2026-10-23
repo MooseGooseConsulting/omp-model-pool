@@ -353,25 +353,32 @@ describe("cross-process counter persistence (opt-in)", () => {
     }
   });
 
-  it("rejects a version-1 state file instead of reinterpreting its count as a pool index", async () => {
+  it("replaces a version-1 state file so persistence resumes", async () => {
     const { dir, file } = tmpStateFile();
     try {
       // v1 stored an unbounded running count, later reduced modulo the
       // *filtered* eligible list; v2 stores an index into the *configured*
       // pool. With [p/a, p/b, p/c] configured and p/c unavailable the two
-      // disagree: 4 % 2 (v1, filtered) = 0 -> p/a, but 4 % 3 (v2, configured)
-      // = 1 -> p/b. A fresh start must yield p/a, not p/b, and must not
-      // rewrite the file.
+      // disagree: 4 % 2 (v1, filtered) = 0, but 4 % 3 (v2, configured) = 1.
+      // A fresh start must yield p/a, not p/b.
       fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: 4 } }));
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, persistCounters: true, stateFile: file });
-      const r = await handlers.before_subagent_spawn(
-        ev,
-        subCtx(makeModels(["p/a", "p/b"])) // p/c unavailable
-      );
-      assert.equal(r.model, "p/a"); // fresh start, not index 1 of a reinterpreted count
-      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
-      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, counters: { slow: 4 } }); // untouched
+      const avail = subCtx(makeModels(["p/a", "p/b"])); // p/c unavailable
+
+      const first = await handlers.before_subagent_spawn(ev, avail);
+      assert.equal(first.model, "p/a"); // fresh cursor, not index 1 of a reinterpreted count
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("version-1 state file")));
+      // The old file is preserved for inspection...
+      assert.deepEqual(JSON.parse(fs.readFileSync(`${file}.v1.bak`, "utf8")), { version: 1, counters: { slow: 4 } });
+      // ...and the live file is now v2, so persistence has not been left dead.
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 2, counters: { slow: 1 } });
+
+      // The proof that it resumed: the next pick continues from the replaced
+      // cursor instead of restarting, which a merely-rejected file could not.
+      const second = await handlers.before_subagent_spawn(ev, avail);
+      assert.equal(second.model, "p/b");
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 2, counters: { slow: 2 } });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
