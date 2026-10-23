@@ -100,17 +100,17 @@ omp --extension ./omp-model-pool
   clones are subs at depth 0). It rotates a **genuinely new** session only.
   `session_start` also fires for a loaded session, and overriding a restored
   model mid-conversation would invalidate prompt caches, so two signals both
-  mean "loaded": the transcript already exists on disk
-  (`ctx.sessionManager.getSessionFile()`, which OMP lazily allocates and only
-  writes once the history holds an assistant message or `/new` forces it), or
-  the entries already hold a user or assistant message. The file is the
-  decisive one — `/new` persists an empty session boundary, so resuming a
-  session that has a model picked but no prompt yet sees only
-  `session_init`/`model_change`, no conversation, and a restored model to
-  clobber. Entries alone are not enough either: a new session legitimately
-  carries `session_init`, title/mode/model and usage records, and another
-  extension's `session_start` handler may already have appended its own with
-  `pi.appendEntry`. An unknown answer also skips rather than guessing.
+  mean "loaded": the session header predates this process
+  (`ctx.sessionManager.getHeader().timestamp`), or the entries already hold a
+  user or assistant message. The header is the decisive one because it is the
+  only thing that separates a resume from a new session: `/new` and
+  `omp --session <path>` both materialize a transcript immediately for a session
+  that is genuinely new, so a transcript existing proves nothing, while a path
+  that cannot be statted would look absent and clobber a resume. Entries alone
+  are not enough either: a new session legitimately carries `session_init`,
+  title/mode/model and usage records, and another extension's `session_start`
+  handler may already have appended its own with `pi.appendEntry`. An unknown
+  answer also skips rather than guessing.
   Otherwise: same
   resolve → pick → advance against `mainSessionRole` (default `"default"`),
   then `pi.setModel(picked)` plus a UI notify. Disabled with

@@ -59,16 +59,25 @@ function subCtx(models, agentKind = "sub") {
   };
 }
 
-// A main session. `entries` and `sessionFile` model what the host reports at
-// `session_start`: a user/assistant message, or a transcript already on disk,
-// means the session was loaded rather than created by this process.
-function mainCtx(models, entries = [], sessionFile) {
+// A main session. `entries` and `header` model what the host reports at
+// `session_start`: a header created before this process, or a user/assistant
+// message, means the session was loaded rather than created by this process.
+function mainCtx(models, entries = [], header) {
   return {
     agent: { kind: "main", name: "main", id: "Main" },
     models,
     ui: { notify: () => {} },
-    sessionManager: { getEntries: () => entries, getSessionFile: () => sessionFile },
+    sessionManager: { getEntries: () => entries, getHeader: () => header },
   };
+}
+
+// A session header written well before this process: one that was loaded.
+function loadedHeader() {
+  return { type: "session", id: "s1", timestamp: new Date(Date.now() - 3_600_000).toISOString() };
+}
+// A header this process just wrote: the only proof that a session is new.
+function freshHeader() {
+  return { type: "session", id: "s2", timestamp: new Date().toISOString() };
 }
 
 beforeEach(() => {
@@ -201,7 +210,7 @@ describe("main-session rotation", () => {
     const { pi, handlers, setModels } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a", "p/b"], default: ["p/x", "p/y"] } });
     const models = makeModels(["p/a", "p/b", "p/x", "p/y"]);
-    const main = mainCtx(models);
+    const main = mainCtx(models, [], freshHeader());
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
@@ -255,7 +264,7 @@ describe("main-session rotation", () => {
       { type: "model_usage", purpose: "title", role: "tiny" },
       { type: "mode_change", id: "e2" },
       { type: "custom_message", customType: "widget", content: "hi", display: false },
-    ]);
+    ], freshHeader());
     await handlers.session_start({ type: "session_start" }, fresh);
     assert.deepEqual(setModels, ["p/x"], "startup metadata is not a conversation");
   });
@@ -265,61 +274,75 @@ describe("main-session rotation", () => {
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
     const fresh = mainCtx(makeModels(["p/x", "p/y"]), [
       { type: "message", message: { role: "toolResult", content: "output" } },
-    ]);
+    ], freshHeader());
     await handlers.session_start({ type: "session_start" }, fresh);
     assert.deepEqual(setModels, ["p/x"], "only user/assistant turns mark a session as loaded");
   });
 
   it("does not rotate a resumed session whose saved entries are metadata only", async () => {
     // `/new`, pick a model, exit, resume. OMP calls ensureOnDisk() on an
-    // explicit new session to preserve the boundary, so the transcript exists
-    // while holding only session_init/model_change — no conversation. Rotating
+    // explicit new session to preserve the boundary, so that session holds only
+    // session_init/model_change and no conversation. Its header still carries
+    // the original creation time, which is what marks it as loaded; rotating
     // here would overwrite the model the resume restored.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-session-"));
-    try {
-      const sessionFile = path.join(dir, "session.jsonl");
-      fs.writeFileSync(sessionFile, "");
-      const { pi, handlers, setModels } = makeHarness();
-      mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-      const resumed = mainCtx(
-        makeModels(["p/x", "p/y"]),
-        [{ type: "session_init", id: "e1" }, { type: "model_change", model: "openai/gpt-5.2", id: "e2" }],
-        sessionFile
-      );
-      await handlers.session_start({ type: "session_start" }, resumed);
-      assert.deepEqual(setModels, [], "a saved session boundary keeps its restored model");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("rotates a new session whose transcript does not exist on disk yet", async () => {
-    // Lazy persistence: a fresh session's allocated path leads nowhere, so the
-    // startup metadata it already carries must not read as a load.
-    const missing = path.join(os.tmpdir(), "mmm-session-absent", "session.jsonl");
     const { pi, handlers, setModels } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], missing);
-    await handlers.session_start({ type: "session_start" }, fresh);
-    assert.deepEqual(setModels, ["p/x"], "an unwritten transcript means a new session");
+    const resumed = mainCtx(
+      makeModels(["p/x", "p/y"]),
+      [{ type: "session_init", id: "e1" }, { type: "model_change", model: "openai/gpt-5.2", id: "e2" }],
+      loadedHeader()
+    );
+    await handlers.session_start({ type: "session_start" }, resumed);
+    assert.deepEqual(setModels, [], "a restored model is never overwritten");
   });
 
-  it("does not rotate when a transcript exists even with no readable entries", async () => {
+  it("rotates a session whose header was written by this process", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], freshHeader());
+    await handlers.session_start({ type: "session_start" }, fresh);
+    assert.deepEqual(setModels, ["p/x"], "the startup metadata a new session carries is not a load");
+  });
+
+  it("rotates a new session even when its transcript is already on disk", async () => {
+    // `omp --session <path>` and `/new` both materialize a transcript for a
+    // session that is genuinely new, so a file existing must not read as a
+    // resume. The header timestamp is what decides.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-session-"));
     try {
       const sessionFile = path.join(dir, "session.jsonl");
       fs.writeFileSync(sessionFile, "");
       const { pi, handlers, setModels } = makeHarness();
       mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-      const ctx = mainCtx(makeModels(["p/x", "p/y"]), [], sessionFile);
-      ctx.sessionManager.getEntries = () => {
-        throw new Error("unreadable");
-      };
+      const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], freshHeader());
+      ctx.sessionManager.getSessionFile = () => sessionFile; // present, and deliberately ignored
       await handlers.session_start({ type: "session_start" }, ctx);
-      assert.deepEqual(setModels, [], "the file alone is enough to call it loaded");
+      assert.deepEqual(setModels, ["p/x"], "a materialized transcript is not proof of a resume");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("does not rotate when neither the header nor the entries are readable", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]));
+    ctx.sessionManager.getHeader = () => {
+      throw new Error("unreadable");
+    };
+    ctx.sessionManager.getEntries = () => {
+      throw new Error("unreadable");
+    };
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.deepEqual(setModels, [], "no signal means no guess");
+  });
+
+  it("does not rotate a session whose header timestamp is unusable", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], { timestamp: "not-a-date" });
+    await handlers.session_start({ type: "session_start" }, ctx);
+    assert.deepEqual(setModels, [], "an unparseable header is unknown, not new");
   });
 
   it("does not rotate when the host cannot report session novelty", async () => {
@@ -412,7 +435,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers, setModels } = makeHarness();
       mod.default(pi, { pools: { default: ["p/x", "p/y"] }, persistCounters: true, stateFile: file });
       const models = makeModels(["p/x", "p/y"]);
-      const main = mainCtx(models);
+      const main = mainCtx(models, [], freshHeader());
       mod.resetCounters();
       await handlers.session_start({ type: "session_start" }, main);
       mod.resetCounters();

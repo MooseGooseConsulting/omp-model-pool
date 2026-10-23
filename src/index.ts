@@ -70,11 +70,11 @@ interface ExtensionContextLike {
   models?: ModelsQuery;
   ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
   /**
-   * Read-only session manager. `getSessionFile()` reports the durable
-   * transcript path, which distinguishes a loaded session from a new one;
-   * `getEntries()` is the fallback when no path is exposed.
+   * Read-only session manager. `getHeader()` reports the session's creation
+   * timestamp, which distinguishes a session this process created from one it
+   * loaded; `getEntries()` is the content fallback.
    */
-  sessionManager?: { getEntries?: () => unknown; getSessionFile?: () => unknown };
+  sessionManager?: { getEntries?: () => unknown; getHeader?: () => unknown };
   cwd?: string;
   [key: string]: unknown;
 }
@@ -796,22 +796,44 @@ function hasConversationTurn(entries: unknown[]): boolean {
 }
 
 /**
- * Does the session already have its transcript in durable storage?
- * `true` present, `false` absent, `undefined` when the host exposes no path.
- *
- * This is the load signal, because OMP's session persistence is lazy: the JSONL
- * is written only once the history holds an assistant message, or an explicit
- * `ensureOnDisk()` forces it — which is what `/new` does, precisely to preserve
- * an empty session boundary across terminals. So a *resumed* session's file is
- * already there when this handler runs, while a fresh session's
- * `getSessionFile()` is an allocated path that leads nowhere.
+ * Roughly when this process started. The extension module loads during startup,
+ * before any session event fires, so it is a usable reference point for "was
+ * this session created by me or by an earlier run?".
  */
-function sessionFileExists(manager: { getSessionFile?: () => unknown }): boolean | undefined {
-  if (typeof manager.getSessionFile !== "function") return undefined;
+const PROCESS_STARTED_AT = Date.now();
+/**
+ * A session header written within this window of process start belongs to the
+ * session this process just created. Without the slack, a header written a few
+ * milliseconds before the extension loads would read as a previous process's.
+ */
+const SESSION_OWN_STARTUP_WINDOW_MS = 5000;
+
+/**
+ * Was this session created before this process started?
+ *
+ * This is the new-vs-resumed discriminator, and it deliberately does not consult
+ * the filesystem. `/new` calls `ensureOnDisk()` before returning, and
+ * `omp --session <missing path>` materializes a header immediately, so a
+ * transcript can exist for a session that is genuinely new — reading a path
+ * would suppress rotation for that new session, while a path that cannot be
+ * statted would look absent and clobber a resumed one. The header's creation
+ * timestamp has neither ambiguity: a session this process created carries a
+ * timestamp from the last few seconds, and a resumed one carries the moment it
+ * was first created, possibly days ago.
+ *
+ * `true` older (loaded), `false` created by this process, `undefined` when the
+ * header is unavailable or unusable.
+ */
+function sessionPredatesProcess(manager: { getHeader?: () => unknown }): boolean | undefined {
+  if (typeof manager.getHeader !== "function") return undefined;
   try {
-    const file = manager.getSessionFile();
-    if (typeof file !== "string" || file.length === 0) return undefined;
-    return fs.existsSync(file);
+    const header = manager.getHeader();
+    if (header === null || typeof header !== "object") return undefined;
+    const timestamp = (header as Record<string, unknown>)["timestamp"];
+    if (typeof timestamp !== "string") return undefined;
+    const createdAt = Date.parse(timestamp);
+    if (!Number.isFinite(createdAt)) return undefined;
+    return createdAt < PROCESS_STARTED_AT - SESSION_OWN_STARTUP_WINDOW_MS;
   } catch {
     return undefined;
   }
@@ -831,25 +853,29 @@ function sessionHasConversationTurn(manager: { getEntries?: () => unknown }): bo
 
 /**
  * Is this `session_start` a genuinely new session?
- * `true` new, `false` a loaded session whose transcript was restored,
- * `undefined` when the host exposes too little to tell. Only `true` rotates: an
- * unknown answer must never risk overriding a model that OMP just restored.
+ * `true` new, `false` a loaded session whose transcript and model were
+ * restored, `undefined` when the host exposes too little to tell. Only `true`
+ * rotates: an unknown answer must never risk overriding a model that OMP just
+ * restored.
  *
- * Two signals both mean "loaded": the transcript already exists on disk, or the
- * entries already hold a conversational turn. The file is the decisive one — a
- * session saved by `/new` with a model picked but no prompt yet holds only
- * `session_init`/`model_change` metadata and no turn, and resuming it restores
- * that model, so keying on turns alone would clobber it. Neither signal firing
- * is only "new" when at least one was actually observable.
+ * Two signals both mean "loaded": the header predates this process — the
+ * discriminator that sees through `/new` and `--session <missing>` both
+ * materializing a transcript for a new session — or the entries already hold a
+ * conversational turn, which catches a restored transcript whatever the header
+ * says.
+ *
+ * Only the header can prove the opposite. A session saved with no conversation
+ * looks identical either way, so the entries can establish "loaded" and nothing
+ * more: without a usable header timestamp this returns `undefined` and no
+ * rotation happens, rather than assuming a resume is new.
  */
 function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
   const manager = ctx.sessionManager;
   if (manager === undefined) return undefined;
-  const hasFile = sessionFileExists(manager);
+  const predates = sessionPredatesProcess(manager);
   const hasTurn = sessionHasConversationTurn(manager);
-  if (hasFile === true || hasTurn === true) return false;
-  if (hasFile === undefined && hasTurn === undefined) return undefined;
-  return true;
+  if (predates === true || hasTurn === true) return false;
+  return predates === false ? true : undefined;
 }
 
 // ---------------------------------------------------------------------------
