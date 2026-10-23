@@ -18,9 +18,39 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import os from "node:os";
 import path from "node:path";
 
+/**
+ * The agent directory OMP is actually using.
+ *
+ * Not a hardcoded `~/.omp/agent`: `OMP_PROFILE`/`PI_PROFILE` relocate it under
+ * `profiles/<name>/agent`, `PI_CONFIG_DIR` moves the root, and
+ * `PI_CODING_AGENT_DIR` applies to the default profile only. Hashing the default
+ * path would let the "owner configuration untouched" check pass while the active
+ * profile's files changed. These are the same rules the extension uses.
+ */
+export function ownerAgentDir() {
+  const omp = process.env.OMP_PROFILE;
+  const rawProfile = omp !== undefined ? omp : process.env.PI_PROFILE;
+  let profile;
+  if (rawProfile !== undefined) {
+    const trimmed = rawProfile.trim();
+    profile = trimmed.length === 0 || trimmed === "default" ? undefined : trimmed;
+  }
+  const configured = process.env.PI_CONFIG_DIR;
+  const configDirName =
+    typeof configured === "string" && configured.trim().length > 0 ? configured.trim() : ".omp";
+  const root = path.join(os.homedir(), configDirName);
+  if (profile !== undefined) return path.join(root, "profiles", profile, "agent");
+  const fromEnv = process.env.PI_CODING_AGENT_DIR;
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
+    const value = fromEnv.trim();
+    return path.isAbsolute(value) ? value : path.resolve(value.replace(/^~/, os.homedir()));
+  }
+  return path.join(root, "agent");
+}
+
 /** Owner configuration files that must not change. Databases are excluded: they are live. */
 export function ownerConfigFiles() {
-  const agentDir = path.join(os.homedir(), ".omp", "agent");
+  const agentDir = ownerAgentDir();
   return ["config.yml", "settings.json", "models.yml", "mcp.json"].map((name) => ({
     name,
     file: path.join(agentDir, name),

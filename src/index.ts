@@ -804,17 +804,14 @@ function hasConversationTurn(entries: unknown[]): boolean {
 }
 
 /**
- * Roughly when this process started. The extension module loads during startup,
- * before any session event fires, so it is a usable reference point for "was
- * this session created by me or by an earlier run?".
+ * When this OS process was born.
+ *
+ * Not module-load time: OMP materializes a fresh session's header during startup
+ * *before* extensions load, so a module-load boundary classifies a brand-new
+ * session as somebody else's and rotation never fires at all. Measured with
+ * `process.uptime()` to recover the actual birth boundary.
  */
-const PROCESS_STARTED_AT = Date.now();
-/**
- * A session header written within this window of process start belongs to the
- * session this process just created. Without the slack, a header written a few
- * milliseconds before the extension loads would read as a previous process's.
- */
-const SESSION_OWN_STARTUP_WINDOW_MS = 5000;
+const PROCESS_BIRTH = Date.now() - Math.round(process.uptime() * 1000);
 
 /**
  * Was this session created before this process started?
@@ -824,10 +821,21 @@ const SESSION_OWN_STARTUP_WINDOW_MS = 5000;
  * `omp --session <missing path>` materializes a header immediately, so a
  * transcript can exist for a session that is genuinely new — reading a path
  * would suppress rotation for that new session, while a path that cannot be
- * statted would look absent and clobber a resumed one. The header's creation
- * timestamp has neither ambiguity: a session this process created carries a
- * timestamp from the last few seconds, and a resumed one carries the moment it
- * was first created, possibly days ago.
+ * statted would look absent and clobber a resumed one.
+ *
+ * The boundary is the process birth, with no tolerance window. Two earlier
+ * attempts failed here and both are instructive:
+ *
+ * - a filesystem check cannot tell the two apart at all;
+ * - module-load time with a five-second margin "worked" only by accident. A
+ *   fresh header is written milliseconds before this module loads, so the margin
+ *   classified it correctly, but the same margin also swallowed a metadata-only
+ *   session closed and resumed moments after it was created — the exact
+ *   `/new` → pick model → exit → resume case — and overwrote its restored model.
+ *
+ * Process birth separates them without a margin: a fresh header is written
+ * after this process was born, and anything created by an earlier run is not,
+ * however recent it was.
  *
  * `true` older (loaded), `false` created by this process, `undefined` when the
  * header is unavailable or unusable.
@@ -841,7 +849,7 @@ function sessionPredatesProcess(manager: { getHeader?: () => unknown }): boolean
     if (typeof timestamp !== "string") return undefined;
     const createdAt = Date.parse(timestamp);
     if (!Number.isFinite(createdAt)) return undefined;
-    return createdAt < PROCESS_STARTED_AT - SESSION_OWN_STARTUP_WINDOW_MS;
+    return createdAt < PROCESS_BIRTH;
   } catch {
     return undefined;
   }
