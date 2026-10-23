@@ -341,13 +341,37 @@ describe("cross-process counter persistence (opt-in)", () => {
   it("refuses a state file from an unknown schema (fail open, file untouched)", async () => {
     const { dir, file } = tmpStateFile();
     try {
-      fs.writeFileSync(file, JSON.stringify({ version: 2, counters: { slow: 5 } }));
+      fs.writeFileSync(file, JSON.stringify({ version: 3, counters: { slow: 5 } }));
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
       assert.equal(r.model, "p/a"); // falls back to in-memory, ignores the foreign cursor
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
-      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2); // not overwritten
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 3); // not overwritten
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a version-1 state file instead of reinterpreting its count as a pool index", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      // v1 stored an unbounded running count, later reduced modulo the
+      // *filtered* eligible list; v2 stores an index into the *configured*
+      // pool. With [p/a, p/b, p/c] configured and p/c unavailable the two
+      // disagree: 4 % 2 (v1, filtered) = 0 -> p/a, but 4 % 3 (v2, configured)
+      // = 1 -> p/b. A fresh start must yield p/a, not p/b, and must not
+      // rewrite the file.
+      fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: 4 } }));
+      const { pi, handlers, logs } = makeHarness();
+      mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, persistCounters: true, stateFile: file });
+      const r = await handlers.before_subagent_spawn(
+        ev,
+        subCtx(makeModels(["p/a", "p/b"])) // p/c unavailable
+      );
+      assert.equal(r.model, "p/a"); // fresh start, not index 1 of a reinterpreted count
+      assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, counters: { slow: 4 } }); // untouched
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -356,7 +380,7 @@ describe("cross-process counter persistence (opt-in)", () => {
   it("rejects the whole state when a single counter entry is invalid", async () => {
     const { dir, file } = tmpStateFile();
     try {
-      fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: "4" } }));
+      fs.writeFileSync(file, JSON.stringify({ version: 2, counters: { slow: "4" } }));
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
@@ -424,7 +448,7 @@ describe("state file path resolution", () => {
     process.env.PI_CODING_AGENT_DIR = base;
     try {
       assert.equal(mod.resolveStateFilePath("state.json"), path.resolve(base, "state.json"));
-      assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(base), "model-musical-models-state.json"));
+      assert.equal(mod.resolveStateFilePath(), path.join(path.resolve(base), "model-pool-state.json"));
     } finally {
       if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prev;

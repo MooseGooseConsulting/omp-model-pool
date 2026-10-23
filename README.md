@@ -1,6 +1,7 @@
-# omp-musical-models
+# omp-model-pool
 
-Musical chairs for models: every subagent spawn picks up the next model.
+Round-robin model rotation: every new subagent spawn takes the next model in
+its role's pool.
 
 Standalone [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that
 cycles the model **by role** on every new subagent spawn. The agent definition
@@ -20,9 +21,9 @@ The `omp.sh` site docs omit this event; the GitHub doc wins on conflict.
 Dev / local link:
 
 ```bash
-omp --extension ./omp-musical-models
+omp --extension ./omp-model-pool
 # or
-omp plugin link ./omp-musical-models
+omp plugin link ./omp-model-pool
 ```
 
 The manifest entry is `omp.extensions: ["./src/index.ts"]` in
@@ -46,7 +47,7 @@ Only roles you configure cycle.
   "enableMainSessionRotation": true, // false keeps subagent cycling only
   "strict": false,                   // true | ["slow"] blocks empty-pool spawns
   "persistCounters": false,          // true shares the cycle across OMP processes
-  "stateFile": "~/.omp/agent/model-musical-models-state.json" // optional; see below
+  "stateFile": "~/.omp/agent/model-pool-state.json" // optional; see below
 }
 ```
 
@@ -66,7 +67,7 @@ the home directory.
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
 export OMP_MODEL_POOLS_JSON='{"slow":["anthropic/claude-haiku-4-5","openai/gpt-5-mini"]}'
-omp --extension ./omp-musical-models
+omp --extension ./omp-model-pool
 ```
 
 ## Behavior
@@ -121,7 +122,7 @@ omp --extension ./omp-musical-models
   continue one cycle across sequential `omp` processes (each launch is a fresh
   OS process), which is the usual case for `omp -p`.
 - With `persistCounters: true` the pick becomes a read-modify-write against
-  `stateFile` (`~/.omp/agent/model-musical-models-state.json` by default),
+  `stateFile` (`~/.omp/agent/model-pool-state.json` by default),
   serialized by an atomic-directory lock so parallel processes on the **same
   machine and filesystem** never draw the same slot. The lock is not
   distributed: state is not shared across machines, and a network filesystem
@@ -137,6 +138,13 @@ omp --extension ./omp-musical-models
   in-memory counter, and a state file that is malformed or carries an unknown
   `version` is left untouched for the operator to repair or delete rather than
   silently reset.
+- The state file is written as `version: 2`. A `version: 1` file — written by
+  the earlier release, which also used a different extension name — is
+  **ignored, not reinterpreted**: v1
+  stored an unbounded running count that was reduced modulo the *filtered*
+  list of authenticated entries, while v2 stores an index into the *configured*
+  pool, so the same integer means a different slot. A v1 file is left on disk
+  and the cycle restarts from a fresh cursor.
 - Revived / resumed children do not advance (the event fires once per new
   child, never on revive/resume).
 - New main sessions share the same counters when roles overlap;
@@ -145,7 +153,7 @@ omp --extension ./omp-musical-models
 
 ## Validate
 
-1. `omp --extension ./omp-musical-models`; check `/extensions`.
+1. `omp --extension ./omp-model-pool`; check `/extensions`.
 2. Pool of 2–3 authenticated models on `slow`; dispatch the same agent
    (`reviewer` → `@slow`) 4+ times; task rows show rotating model + note.
 3. Dispatch different agents sharing `@slow`; the shared counter advances.

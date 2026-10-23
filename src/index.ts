@@ -1,4 +1,4 @@
-// omp-musical-models — per-role round-robin model cycling for oh-my-pi.
+// omp-model-pool — per-role round-robin model cycling for oh-my-pi.
 //
 // Primary hook: `before_subagent_spawn` (parent session, once per new child).
 // Secondary hook: `session_start` for main sessions only (`ctx.agent.kind === "main"`).
@@ -117,7 +117,7 @@ export interface ModelPoolConfig {
    * so sequential `omp` processes (each a fresh OS process) continue the cycle.
    */
   persistCounters?: boolean;
-  /** State file for `persistCounters`. Default: `OMP_MODEL_POOL_STATE` or `~/.omp/agent/model-musical-models-state.json`. */
+  /** State file for `persistCounters`. Default: `OMP_MODEL_POOL_STATE` or `~/.omp/agent/model-pool-state.json`. */
   stateFile?: string;
 }
 
@@ -128,7 +128,14 @@ export interface ModelPoolConfig {
 const counters: Record<string, number> = Object.create(null);
 
 /** State file name under the OMP agent dir when no explicit/env path is given. */
-const DEFAULT_STATE_FILE = "model-musical-models-state.json";
+const DEFAULT_STATE_FILE = "model-pool-state.json";
+/**
+ * Persisted schema version. v1 stored a count into the *filtered* list of
+ * authenticated entries; v2 stores an index into the configured pool. The two
+ * are not translatable (v1 has no record of which entries were filtered), so a
+ * v1 file is rejected rather than reinterpreted — see `parseState`.
+ */
+const SCHEMA_VERSION = 2;
 /** Cross-process lock acquisition budget (spawn-critical section is milliseconds). */
 const LOCK_TIMEOUT_MS = 6000;
 /** A lock older than this is assumed abandoned by a crashed process. */
@@ -217,10 +224,16 @@ export function resolveStateFilePath(explicit?: string): string {
 }
 
 /**
- * Parse `{ version: 1, counters: { role: int } }`.
+ * Parse `{ version: 2, counters: { role: index } }`.
  * Returns undefined when the file is malformed in any way — including a single
  * bad counter entry — so the caller fails open and the file is left untouched
  * rather than being rewritten from a partial read.
+ *
+ * A version-1 file is *deliberately* rejected: v1 held a count into the
+ * filtered eligible list, v2 an index into the configured pool, and a v1 file
+ * carries no record of which entries were filtered at write time. Translating
+ * it would be a guess that silently misphases the rotation, so the operator
+ * gets a fresh start and the old file is preserved for inspection.
  */
 function parseState(raw: string): Record<string, number> | undefined {
   let obj: unknown;
@@ -232,7 +245,7 @@ function parseState(raw: string): Record<string, number> | undefined {
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
   const record = obj as Record<string, unknown>;
   // Read-side schema guard: only a schema we understand may be used.
-  if (record["version"] !== 1) return undefined;
+  if (record["version"] !== SCHEMA_VERSION) return undefined;
   const rawCounters = record["counters"];
   if (rawCounters === null || typeof rawCounters !== "object" || Array.isArray(rawCounters)) return undefined;
   const out: Record<string, number> = Object.create(null);
@@ -262,7 +275,7 @@ function writeStateAtomic(file: string, next: Record<string, number>): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, counters: next }, null, 2)}\n`, {
+    fs.writeFileSync(tmp, `${JSON.stringify({ version: SCHEMA_VERSION, counters: next }, null, 2)}\n`, {
       mode: 0o600,
       flag: "wx",
     });
