@@ -12,7 +12,7 @@
 //     from each other. Pinning also guarantees no unconfigured model is called.
 //
 // Anything unproven is reported as skipped with the reason, never as a pass.
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -110,7 +110,15 @@ async function discoverFreeRoutes(env) {
     if (/mini|small|free/.test(s)) return 1;
     return 2;
   };
+  // A reasoning route will happily emit a long chain of thought for a one-word
+  // prompt, and free tiers queue, so a reasoning model is a poor choice for the
+  // pinned start. Prefer plain chat routes first.
+  const isReasoning = (entry) =>
+    Array.isArray(entry.supported_parameters) && entry.supported_parameters.includes("reasoning");
   const ranked = [...eligible.keys()].sort((a, b) => {
+    const ra = isReasoning(eligible.get(a)) ? 1 : 0;
+    const rb = isReasoning(eligible.get(b)) ? 1 : 0;
+    if (ra !== rb) return ra - rb;
     const sa = speedScore(a);
     const sb = speedScore(b);
     if (sa !== sb) return sa - sb;
@@ -158,7 +166,7 @@ async function main() {
     for (let i = 0; i < expected.length; i += 1) {
       const res = await runOmp(
         [...isolated.ompArgs, "--model", routeA, "--no-tools", "-p", prompt],
-        { cwd: isolated.workDir, env: isolated.env, timeoutMs: 120_000 },
+        { cwd: isolated.workDir, env: isolated.env, timeoutMs: 240_000 },
       );
       if (res.timedOut) {
         const tail = res.stderr.trim().split(/\r?\n/).slice(-2).join(" | ");
@@ -193,7 +201,7 @@ async function main() {
     // session, so absence would be a false signal either way.
     const second = await runOmp(
       [...isolated.ompArgs, "--continue", "--model", routeA, "--no-tools", "-p", prompt],
-      { cwd: isolated.workDir, env: isolated.env, timeoutMs: 120_000 },
+      { cwd: isolated.workDir, env: isolated.env, timeoutMs: 240_000 },
     );
     if (second.code === 0) {
       const sessions = findSessionFiles(isolated.sessionDir);
@@ -254,12 +262,28 @@ async function main() {
       );
     }
 
-    // --- state file advanced -------------------------------------------------
-    const state = existsSync(isolated.stateFile) ? readFileSync(isolated.stateFile, "utf8") : "";
+    // --- every counter asserted, not just the schema marker ----------------
+    // Three fresh main sessions start in this run (run 1, run 2, and the
+    // delegation run, which is itself a new main session) and one subagent
+    // spawns on `slow`. Over a two-entry pool that is 0->1->0->1, so a bare
+    // "version 2 exists" check would miss a role rotation that picked correctly
+    // but never persisted, or a main rotation that silently stopped.
+    const expectedCounters = { default: 1, slow: 1 };
+    let counters;
+    try {
+      counters = JSON.parse(readFileSync(isolated.stateFile, "utf8")).counters;
+    } catch (err) {
+      counters = undefined;
+    }
+    const countersMatch =
+      counters !== undefined &&
+      Object.entries(expectedCounters).every(([role, want]) => counters[role] === want);
     record(
-      "shared state file written",
-      state.includes('"version": 2') ? "pass" : "fail",
-      state.trim().slice(0, 120) || "no state file",
+      "each role counter advanced as expected",
+      countersMatch ? "pass" : "fail",
+      countersMatch
+        ? `counters ${JSON.stringify(counters)}`
+        : `expected ${JSON.stringify(expectedCounters)}, got ${JSON.stringify(counters ?? "unreadable state")}`,
     );
   } finally {
     const afterHashes = hashOwnerConfig();
