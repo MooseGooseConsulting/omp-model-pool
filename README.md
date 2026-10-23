@@ -1,4 +1,6 @@
-# omp-instance-model-pool
+# omp-musical-models
+
+Musical chairs for models: every subagent spawn picks up the next model.
 
 Standalone [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that
 cycles the model **by role** on every new subagent spawn. The agent definition
@@ -18,9 +20,9 @@ The `omp.sh` site docs omit this event; the GitHub doc wins on conflict.
 Dev / local link:
 
 ```bash
-omp --extension ./omp-instance-model-pool
+omp --extension ./omp-musical-models
 # or
-omp plugin link ./omp-instance-model-pool
+omp plugin link ./omp-musical-models
 ```
 
 The manifest entry is `omp.extensions: ["./src/index.ts"]` in
@@ -56,7 +58,7 @@ order:
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
 export OMP_MODEL_POOLS_JSON='{"slow":["anthropic/claude-haiku-4-5","openai/gpt-5-mini"]}'
-omp --extension ./omp-instance-model-pool
+omp --extension ./omp-musical-models
 ```
 
 ## Behavior
@@ -100,7 +102,7 @@ omp --extension ./omp-instance-model-pool
 
 ## Validate
 
-1. `omp --extension ./omp-instance-model-pool`; check `/extensions`.
+1. `omp --extension ./omp-musical-models`; check `/extensions`.
 2. Pool of 2–3 authenticated models on `slow`; dispatch the same agent
    (`reviewer` → `@slow`) 4+ times; task rows show rotating model + note.
 3. Dispatch different agents sharing `@slow`; the shared counter advances.

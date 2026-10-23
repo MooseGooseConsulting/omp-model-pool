@@ -1,4 +1,4 @@
-// omp-instance-model-pool — per-role round-robin model cycling for oh-my-pi.
+// omp-musical-models — per-role round-robin model cycling for oh-my-pi.
 //
 // Primary hook: `before_subagent_spawn` (parent session, once per new child).
 // Secondary hook: `session_start` for main sessions only (`ctx.agent.kind === "main"`).

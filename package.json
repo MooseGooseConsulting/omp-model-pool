@@ -1,5 +1,5 @@
 {
-  "name": "omp-instance-model-pool",
+  "name": "omp-musical-models",
   "version": "0.1.0",
   "description": "Per-role round-robin model cycling for oh-my-pi subagent spawns (and opt-in main-session rotation).",
   "type": "module",
