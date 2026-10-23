@@ -59,6 +59,16 @@ function subCtx(models, agentKind = "sub") {
   };
 }
 
+// A main session; `entries` non-empty models a loaded/resumed session.
+function mainCtx(models, entries = []) {
+  return {
+    agent: { kind: "main", name: "main", id: "Main" },
+    models,
+    ui: { notify: () => {} },
+    sessionManager: { getEntries: () => entries },
+  };
+}
+
 beforeEach(() => {
   mod.resetCounters();
   delete process.env.OMP_MODEL_POOLS_JSON;
@@ -147,6 +157,23 @@ describe("per-role round robin", () => {
     assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("empty pool")));
   });
 
+  it("keeps a stable phase when availability changes mid-cycle", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
+    const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+    let authenticated = ["p/a", "p/b"]; // p/c not authenticated yet
+    const pick = () => handlers.before_subagent_spawn(ev, subCtx(makeModels(authenticated))).model;
+
+    const picks = [pick(), pick(), pick()];
+    authenticated = ["p/a", "p/b", "p/c"]; // p/c authenticates mid-cycle
+    picks.push(pick(), pick(), pick());
+
+    // Modding a filtered list re-phased here and emitted "…, p/a, p/a, p/b, p/c";
+    // indexing the configured pool keeps the phase: no duplicate at the swap.
+    assert.deepEqual(picks, ["p/a", "p/b", "p/a", "p/b", "p/c", "p/a"]);
+    assert.ok(mod.getCounters().slow < 3, "cursor stays an index into the configured pool");
+  });
+
   it("blocks empty pools only under strict policy", () => {
     const { pi, handlers } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
@@ -172,7 +199,7 @@ describe("main-session rotation", () => {
     const { pi, handlers, setModels } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a", "p/b"], default: ["p/x", "p/y"] } });
     const models = makeModels(["p/a", "p/b", "p/x", "p/y"]);
-    const main = { agent: { kind: "main", name: "main", id: "Main" }, models, ui: { notify: () => {} } };
+    const main = mainCtx(models);
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
     await handlers.session_start({ type: "session_start" }, main);
@@ -197,9 +224,27 @@ describe("main-session rotation", () => {
     mod.default(pi, { pools: { slow: ["p/a"] } });
     await handlers.session_start(
       { type: "session_start" },
-      { agent: { kind: "main", name: "main", id: "Main" }, models: makeModels(["p/a"]), ui: { notify: () => {} } },
+      mainCtx(makeModels(["p/a"])),
     );
     assert.deepEqual(setModels, []);
+  });
+
+  it("does not rotate a loaded/resumed main session", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    const resumed = mainCtx(makeModels(["p/x", "p/y"]), [{ id: "entry-1" }]);
+    await handlers.session_start({ type: "session_start" }, resumed);
+    assert.deepEqual(setModels, [], "a session with transcript entries keeps its restored model");
+  });
+
+  it("does not rotate when the host cannot report session novelty", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
+    await handlers.session_start(
+      { type: "session_start" },
+      { agent: { kind: "main", name: "main", id: "Main" }, models: makeModels(["p/x", "p/y"]), ui: { notify: () => {} } },
+    );
+    assert.deepEqual(setModels, [], "unknown novelty must not risk overriding a restored model");
   });
 });
 
@@ -224,8 +269,8 @@ describe("cross-process counter persistence (opt-in)", () => {
         seen.push(r.model);
       }
       assert.deepEqual(seen, ["p/a", "p/b", "p/c", "p/a"]);
-      const state = JSON.parse(fs.readFileSync(file, "utf8"));
-      assert.equal(state.counters.slow, 4);
+      // The cursor is stored modulo the pool length (3), so four picks land on 1.
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -269,8 +314,8 @@ describe("cross-process counter persistence (opt-in)", () => {
         handlers.before_subagent_spawn(ev, subCtx(models)),
       ]);
       assert.deepEqual([r1.model, r2.model].sort(), ["p/a", "p/b"]);
-      const state = JSON.parse(fs.readFileSync(file, "utf8"));
-      assert.equal(state.counters.slow, 2);
+      // Stored modulo the pool length (2): two picks wrap back to 0.
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -282,7 +327,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers, setModels } = makeHarness();
       mod.default(pi, { pools: { default: ["p/x", "p/y"] }, persistCounters: true, stateFile: file });
       const models = makeModels(["p/x", "p/y"]);
-      const main = { agent: { kind: "main", name: "main", id: "Main" }, models, ui: { notify: () => {} } };
+      const main = mainCtx(models);
       mod.resetCounters();
       await handlers.session_start({ type: "session_start" }, main);
       mod.resetCounters();

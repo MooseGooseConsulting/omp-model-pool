@@ -50,7 +50,8 @@ describe("cross-process rotation (separate OS processes)", () => {
       const runs = [0, 1, 2].map(() => runOnce(file, models, true));
       assert.deepEqual(runs.map((r) => r.model), ["p/a", "p/b", "p/a"]);
       assert.equal(new Set(runs.map((r) => r.pid)).size, 3, "each run must be a distinct process");
-      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 3);
+      // Stored modulo the pool length (2): three picks land on 1.
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
     } finally {
       cleanup();
     }
@@ -78,7 +79,8 @@ describe("cross-process rotation (separate OS processes)", () => {
       for (const model of models) {
         assert.equal(picks.filter((p) => p === model).length, 5, `${model} drawn exactly 5 times`);
       }
-      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 20);
+      // Stored modulo the pool length (4): 20 picks wrap back to 0.
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
     } finally {
       cleanup();
     }
