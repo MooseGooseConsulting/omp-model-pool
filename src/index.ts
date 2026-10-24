@@ -2083,12 +2083,26 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
   }
 }
 
+/**
+ * Human-readable editability of the active source, for `status`/`doctor`.
+ *
+ * `configSource.writable` alone conflates two different outcomes: a
+ * runtime-only source (programmatic options, inline JSON) still accepts edits
+ * into memory, whereas a disabled source (an unreadable file, or one shadowed
+ * by a malformed higher-priority source) refuses them. Operators need to see
+ * which one they have.
+ */
+function sourceStatusLabel(): "writable" | "runtime-only" | "editing disabled" {
+  const mode = editMode();
+  return mode === "file" ? "writable" : mode === "runtime-only" ? "runtime-only" : "editing disabled";
+}
+
 /** `/model-pool status`: read-only summary; never writes. */
 function runStatus(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
   const pools = getPools();
   const roles = Object.keys(pools);
   const lines = [
-    `config: ${configSource.label} (${configSource.kind}${configSource.writable ? ", writable" : ", runtime-only"})`,
+    `config: ${configSource.label} (${configSource.kind}, ${sourceStatusLabel()})`,
   ];
   if (configSource.note !== undefined) lines.push(`config note: ${configSource.note}`);
   lines.push(`main role: @${activeConfig.mainSessionRole} (rotation ${activeConfig.enableMainSessionRotation ? "on" : "off"})`);
@@ -2119,7 +2133,7 @@ function runDoctor(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
       lines.push(`  ${entry.eligible ? "ok" : "unavailable"}: ${entry.selector} — ${entry.reason}`);
     }
   }
-  lines.push(`config: ${configSource.label} (${configSource.kind}${configSource.writable ? ", writable" : ", runtime-only"})`);
+  lines.push(`config: ${configSource.label} (${configSource.kind}, ${sourceStatusLabel()})`);
   lines.push(`state: ${activeConfig.persistCounters ? activeConfig.stateFile : "persistence off"}`);
   emit(pi, ctx, lines.join("\n"), "info");
 }

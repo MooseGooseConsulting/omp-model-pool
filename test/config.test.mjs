@@ -239,6 +239,39 @@ describe("configuration precedence and provenance", () => {
     assert.equal(outcome.ok, false);
     assert.match(outcome.error, /disabled/);
   });
+
+  it("A9: diagnostics show 'editing disabled', not the runtime-only label, for a disabled source", async () => {
+    const bad = path.join(freshDir(), "broken.json");
+    writeText(bad, "{ not json");
+    writeJson(mod.resolveDefaultConfigFilePath(), { pools: { slow: ["p/from-default"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = bad;
+    const { pi, commands } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().writable, false);
+
+    const seen = [];
+    const ctx = {
+      agent: { kind: "main", name: "main", id: "Main" },
+      models: modelsFrom({ listed: ["p/from-default"] }),
+      ui: { notify: (message) => seen.push(message) },
+    };
+    await commands["model-pool"].handler("status", ctx);
+    await commands["model-pool"].handler("doctor", ctx);
+
+    const configLines = seen.filter((m) => m.includes("config:"));
+    assert.ok(
+      configLines.length >= 2,
+      `status and doctor both report the config source; got ${JSON.stringify(seen)}`,
+    );
+    assert.ok(
+      configLines.some((m) => m.includes("editing disabled")),
+      "a disabled source is labelled 'editing disabled', not 'runtime-only'",
+    );
+    assert.ok(
+      !configLines.some((m) => m.includes("runtime-only")),
+      "a disabled source is never mislabelled 'runtime-only'",
+    );
+  });
 });
 
 describe("default-file discovery and no-write-on-load", () => {

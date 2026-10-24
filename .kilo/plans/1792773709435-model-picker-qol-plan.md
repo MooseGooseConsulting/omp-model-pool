@@ -241,4 +241,8 @@ A local review of `d154171..HEAD` plus an independent five-pass subagent review 
 3. **Confirmed mechanism — `configurePools` left stale file provenance.** It reset `loadedSignature` only, so after a file source was loaded, `editMode()` still returned `"file"` and a later `savePoolEdit` could merge the programmatic pools into that unrelated document. No in-repo caller; the embedding API was affected. Fixed: `configurePools` now mirrors the factory's options path (`configSource` = runtime-only options, `configShape` = `"none"`, `configFingerprint` = `undefined`). Test `D24`.
 4. **Cleanup — `ctx.mode` was declared and faked but never read.** Interactivity is decided by `hasUI` plus dialog presence. Removed the dead field and the `mode: "tui"` stub.
 
-Gate after this batch: `npm run typecheck` clean, `npm test` **113/113**.
+CodeRabbit additionally requested that `status`/`doctor` distinguish a disabled source from a runtime-only one (both printed `runtime-only`, because they read `configSource.writable` alone). Fixed with a shared `sourceStatusLabel()` helper returning `writable` / `runtime-only` / `editing disabled`; test `A9`.
+
+Gate after this batch: `npm run typecheck` clean, `npm test` **114/114**.
+
+Merge state at the time of this record: PR #11 was `CHANGES_REQUESTED` (CodeRabbit). With the diagnostics fix above applied and pushed, the outstanding request is addressed; the PR clears when CodeRabbit re-reviews the new head.
