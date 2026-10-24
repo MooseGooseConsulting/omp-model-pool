@@ -520,6 +520,34 @@ describe("rebinding and replacement", () => {
     mod.default(pi, { pools: { slow: ["p/d23c"] } });
     assert.deepEqual(mod.getPools().slow, ["p/d23c"]);
   });
+
+  it("D24: configurePools repoints provenance so a later edit cannot write the loaded file", async () => {
+    const file = path.join(freshDir(), "loaded.json");
+    writeJson(file, { pools: { slow: ["p/onfile"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+
+    const { pi } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().kind, "file-env");
+    assert.equal(mod.getConfigSource().writable, true, "a readable explicit file is writable");
+
+    // A programmatic replacement is runtime-only; it must stop pointing at the
+    // file loaded a moment ago, or an accepted edit would merge the programmatic
+    // pools into that unrelated document.
+    mod.configurePools({ pools: { fast: ["p/prog"] } });
+    assert.equal(mod.getConfigSource().kind, "options");
+    assert.equal(mod.getConfigSource().writable, false);
+    assert.equal(mod.getConfigSource().path, undefined, "a programmatic source has no write target");
+
+    const outcome = await mod.savePoolEdit("fast", ["p/prog", "p/prog2"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: true });
+    assert.deepEqual(mod.getPools().fast, ["p/prog", "p/prog2"]);
+    assert.deepEqual(
+      readJson(file),
+      { pools: { slow: ["p/onfile"] } },
+      "the on-disk document is untouched by a runtime-only edit",
+    );
+  });
 });
 
 describe("authenticated membership", () => {

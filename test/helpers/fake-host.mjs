@@ -54,7 +54,6 @@ function makeCtx(host, kind, models, overrides) {
     ui: host.ui,
     hasUI: true,
     isIdle: () => true,
-    mode: "tui",
   };
   return Object.assign(ctx, overrides);
 }

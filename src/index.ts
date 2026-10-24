@@ -100,8 +100,6 @@ interface ExtensionContextLike {
   ui?: ExtensionUIContextLike;
   /** False when the host has no interactive UI (print/RPC mode). */
   hasUI?: boolean;
-  /** Host run mode; `"tui"` is the interactive terminal. */
-  mode?: string;
   /** True while the agent is idle (not streaming). */
   isIdle?: () => boolean;
   /**
@@ -282,6 +280,17 @@ function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
  */
 export function configurePools(next: ModelPoolConfig | undefined | null): void {
   applyNormalized(normalizeConfig(next));
+  // An explicit replacement is runtime-only and points at no file: reset the
+  // provenance so a later edit cannot merge these programmatic pools into the
+  // previously loaded document. Mirrors the factory's options path.
+  configSource = {
+    kind: "options",
+    writable: false,
+    label: "programmatic options",
+    note: "runtime-only: options cannot be rewritten",
+  };
+  configShape = "none";
+  configFingerprint = undefined;
   // An explicit replacement invalidates the source signature, so a later
   // no-options or same-options re-bind re-applies instead of assuming the
   // active configuration still matches the last loaded source.
@@ -1537,17 +1546,18 @@ async function handleSessionStart(
     }
     if (result.confirmed) {
       safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
+      notifyUser(ctx, `model-pool: ${note}`, "info");
     } else {
       safeLog(
         pi,
         "warn",
         `[model-pool] main session: requested ${result.id} but the host did not confirm the active model`,
       );
-    }
-    try {
-      ctx.ui?.notify?.(`model-pool: ${note}`, "info");
-    } catch {
-      // Notification is best-effort.
+      notifyUser(
+        ctx,
+        `model-pool: requested ${result.id}, but the host did not confirm the active model`,
+        "warning",
+      );
     }
   } catch (err) {
     try {

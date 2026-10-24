@@ -231,3 +231,14 @@ The two interaction-contract items that the first pass left unsurfaced are now i
 - CI pins `actions/checkout` and `actions/setup-node` to commit SHAs and sets `persist-credentials: false`.
 - Gate after this batch: `npm test` **112/112**.
 - Cross-repo install wiring (adjacent request): `coldaine-configurations` PR #138 adds `omp-plugins:apply` and `omp-plugins:check`, so an enrolled host installs this extension from a pinned revision instead of a developer checkout. The pin currently names this branch's head and moves to merged `main` after this PR lands.
+
+### Second review round (local diff review + independent pass)
+
+A local review of `d154171..HEAD` plus an independent five-pass subagent review over the committed diff agreed on four residual items; the first three are fixed here, the fourth is a cleanup:
+
+1. **Confirmed — startup rotation emitted a success-styled toast on an unconfirmed apply.** The P2 fix above branched the *log* on `result.confirmed` but left the `ctx.ui.notify` toast unconditional, so a host that never confirmed `current()` still told the user the session rotated, contradicting the picker's warning path. Fixed: the toast is now emitted only when `result.confirmed`; the unconfirmed case sends a `warning`. This was a partial fix of item 4 above, not a new defect.
+2. **Confirmed — the unconfirmed-rotation test pinned log text, not the user-visible claim.** `mainCtx` stubbed `ui.notify` as a no-op, so the toast defect above could not have been caught. Fixed: the harness records notifications, and the unconfirmed, refusal and success cases now assert the toast (or its absence).
+3. **Confirmed mechanism — `configurePools` left stale file provenance.** It reset `loadedSignature` only, so after a file source was loaded, `editMode()` still returned `"file"` and a later `savePoolEdit` could merge the programmatic pools into that unrelated document. No in-repo caller; the embedding API was affected. Fixed: `configurePools` now mirrors the factory's options path (`configSource` = runtime-only options, `configShape` = `"none"`, `configFingerprint` = `undefined`). Test `D24`.
+4. **Cleanup — `ctx.mode` was declared and faked but never read.** Interactivity is decided by `hasUI` plus dialog presence. Removed the dead field and the `mode: "tui"` stub.
+
+Gate after this batch: `npm run typecheck` clean, `npm test` **113/113**.
