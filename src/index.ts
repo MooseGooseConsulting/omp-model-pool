@@ -21,7 +21,7 @@
 // keeping role identity, so core `retry.fallbackChains` / prewalk / advisor
 // semantics are preserved, not replaced.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -42,6 +42,35 @@ interface ModelsQuery {
   current(): ModelLike | undefined;
   resolve(spec: string): ModelLike | undefined;
   family?(model: ModelLike): string;
+}
+
+/** One selectable row for `ui.select`; `ui.select` returns the chosen `label`. */
+interface UISelectItem {
+  label: string;
+  description?: string;
+}
+
+/**
+ * Interactive UI surface used by the `/model-pool` command. Every member is
+ * optional: a host in print/RPC mode exposes a no-op or partial UI, and the
+ * command must detect that rather than assume dialogs are available.
+ */
+interface ExtensionUIContextLike {
+  notify?: (message: string, type?: "info" | "warning" | "error") => void;
+  select?: (
+    title: string,
+    options: (string | UISelectItem)[],
+    dialogOptions?: unknown,
+  ) => Promise<string | undefined>;
+  input?: (title: string, placeholder?: string, dialogOptions?: unknown) => Promise<string | undefined>;
+  confirm?: (title: string, message: string, dialogOptions?: unknown) => Promise<boolean>;
+}
+
+/** Options accepted by `pi.registerCommand`. */
+interface ExtensionCommandOptions {
+  description?: string;
+  getArgumentCompletions?: (prefix: string) => unknown;
+  handler: (args: string, ctx: ExtensionContextLike) => void | Promise<void>;
 }
 
 interface BeforeSubagentSpawnEvent {
@@ -68,7 +97,11 @@ interface SessionStartEvent {
 interface ExtensionContextLike {
   agent?: { kind?: unknown; name?: unknown; id?: unknown };
   models?: ModelsQuery;
-  ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
+  ui?: ExtensionUIContextLike;
+  /** False when the host has no interactive UI (print/RPC mode). */
+  hasUI?: boolean;
+  /** True while the agent is idle (not streaming). */
+  isIdle?: () => boolean;
   /**
    * Read-only session manager. `getHeader()` reports the session's creation
    * timestamp, which distinguishes a session this process created from one it
@@ -92,6 +125,11 @@ interface ExtensionApiLike {
     handler: (event: SessionStartEvent, ctx: ExtensionContextLike) => void | Promise<void>,
   ): void;
   on(event: string, handler: (...args: never[]) => unknown): void;
+  /**
+   * Register a user-initiated slash command. Optional: a host that predates the
+   * command surface, or that refuses registration, must not disable rotation.
+   */
+  registerCommand?(name: string, options: ExtensionCommandOptions): void;
   /**
    * Apply a model to the live session.
    *
@@ -133,6 +171,41 @@ export interface ModelPoolConfig {
   stateFile?: string;
 }
 
+/** Where the active pool configuration came from. */
+export type ConfigSourceKind = "options" | "inline-env" | "file-env" | "default-file" | "none";
+
+/**
+ * Provenance of the active configuration, used by `status`/`doctor` and by the
+ * editor to decide whether an accepted edit can be persisted.
+ */
+export interface ConfigSourceInfo {
+  kind: ConfigSourceKind;
+  /** Resolved file path when a saved edit can be written; absent for runtime-only sources. */
+  path?: string;
+  /** True when accepted pool edits can be persisted to disk. */
+  writable: boolean;
+  /** Short, non-sensitive description safe to show in the UI. */
+  label: string;
+  /** Why edits are runtime-only or disabled, when applicable. */
+  note?: string;
+}
+
+/** Outcome of an attempted pool edit. */
+export type PoolEditOutcome = { ok: true; runtimeOnly: boolean } | { ok: false; error: string };
+
+/** Per-entry diagnosis used by `doctor`; never written anywhere. */
+export interface PoolEntryDiagnosis {
+  selector: string;
+  eligible: boolean;
+  reason: string;
+}
+
+/** Per-role diagnosis used by `doctor`. */
+export interface PoolDiagnosis {
+  role: string;
+  entries: PoolEntryDiagnosis[];
+}
+
 // ---------------------------------------------------------------------------
 // Module-level shared state (in-process round-robin counters).
 // ---------------------------------------------------------------------------
@@ -141,6 +214,8 @@ const counters: Record<string, number> = Object.create(null);
 
 /** State file name under the OMP agent dir when no explicit/env path is given. */
 const DEFAULT_STATE_FILE = "model-pool-state.json";
+/** Pool config file name under the OMP agent dir when no explicit/env path is given. */
+const DEFAULT_CONFIG_FILE = "model-pool.json";
 /**
  * Persisted schema version. v1 stored a count into the *filtered* list of
  * authenticated entries; v2 stores an index into the configured pool. The two
@@ -164,15 +239,63 @@ const activeConfig: Required<Omit<ModelPoolConfig, "strict">> & { strict: boolea
   stateFile: resolveStateFilePath(),
 };
 
-/** Replace the active pool configuration (used by the factory and tests). */
-export function configurePools(next: ModelPoolConfig | undefined | null): void {
-  const normalized = normalizeConfig(next);
+/** Where the active configuration came from; drives the editor's save behaviour. */
+let configSource: ConfigSourceInfo = {
+  kind: "none",
+  writable: true,
+  label: "no configuration",
+};
+
+/** Bumped on every accepted configuration change; used to reject stale edits. */
+let configRevision = 0;
+
+/**
+ * Signature of the last environment/default source applied by the factory.
+ * Re-binding the extension to a child session re-runs the factory with no
+ * options; when the backing source is unchanged we must keep any runtime edits
+ * rather than resetting to the on-disk document.
+ */
+let loadedSignature: string | undefined;
+
+/** Shape of the backing document, so edits write back in the same form. */
+let configShape: "nested" | "flat" | "none" = "none";
+
+/** Content fingerprint of the backing file, re-checked under the edit lock. */
+let configFingerprint: string | undefined;
+
+/** Apply a normalized configuration to the active slots. */
+function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
   activeConfig.pools = normalized.pools;
   activeConfig.mainSessionRole = normalized.mainSessionRole;
   activeConfig.enableMainSessionRotation = normalized.enableMainSessionRotation;
   activeConfig.strict = normalized.strict;
   activeConfig.persistCounters = normalized.persistCounters;
   activeConfig.stateFile = normalized.stateFile;
+}
+
+/**
+ * Replace the active pool configuration (used by the factory and tests). This
+ * is an intentional, unconditional replacement: a caller passing options means
+ * "use these", so it supersedes any runtime edit.
+ */
+export function configurePools(next: ModelPoolConfig | undefined | null): void {
+  applyNormalized(normalizeConfig(next));
+  // An explicit replacement is runtime-only and points at no file: reset the
+  // provenance so a later edit cannot merge these programmatic pools into the
+  // previously loaded document. Mirrors the factory's options path.
+  configSource = {
+    kind: "options",
+    writable: false,
+    label: "programmatic options",
+    note: "runtime-only: options cannot be rewritten",
+  };
+  configShape = "none";
+  configFingerprint = undefined;
+  // An explicit replacement invalidates the source signature, so a later
+  // no-options or same-options re-bind re-applies instead of assuming the
+  // active configuration still matches the last loaded source.
+  loadedSignature = undefined;
+  configRevision += 1;
 }
 
 /** Read-only snapshot of the active pools (tests / diagnostics). */
@@ -190,6 +313,16 @@ export function getCounters(): Record<string, number> {
 /** Reset all round-robin counters (tests; mirrors an OMP restart). */
 export function resetCounters(): void {
   for (const k of Object.keys(counters)) delete counters[k];
+}
+
+/** Read-only snapshot of where the active configuration came from. */
+export function getConfigSource(): ConfigSourceInfo {
+  return { ...configSource };
+}
+
+/** Monotonic revision of the active configuration; used to reject stale edits. */
+export function getConfigRevision(): number {
+  return configRevision;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +412,95 @@ export function resolveStateFilePath(explicit?: string): string {
 }
 
 /**
+ * Resolve the profile-scoped default pool config: `<agent dir>/model-pool.json`.
+ *
+ * Unlike `OMP_MODEL_POOL_CONFIG` (an explicit path resolved against the process
+ * CWD, kept as-is for backwards compatibility), the default file follows OMP's
+ * own agent-dir resolution so each profile keeps its own pools.
+ */
+export function resolveDefaultConfigFilePath(): string {
+  return path.join(agentDir(), DEFAULT_CONFIG_FILE);
+}
+
+/** Compare two paths for identity, case-insensitively on Windows. */
+function samePath(a: string, b: string): boolean {
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  return process.platform === "win32" ? ra.toLowerCase() === rb.toLowerCase() : ra === rb;
+}
+
+/** Short content fingerprint; not a security hash, only a change detector. */
+function fingerprintText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+/** File mode to preserve when rewriting an existing file; 0600 for a new one. */
+function existingMode(file: string): number {
+  try {
+    return fs.statSync(file).mode & 0o777;
+  } catch {
+    return 0o600;
+  }
+}
+
+/** Write `contents` via an exclusive temp file and an atomic rename. */
+function writeFileAtomicSync(file: string, contents: string, mode = 0o600): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, contents, { mode, flag: "wx" });
+    fs.renameSync(tmp, file);
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Temp cleanup is best-effort.
+    }
+  }
+}
+
+/** Read and parse a JSON object file, distinguishing "missing" from "unreadable". */
+type JsonFileRead =
+  | { ok: true; value: unknown; fingerprint: string }
+  | { ok: false; missing: boolean; reason: string };
+
+function readJsonFileWithReason(file: string): JsonFileRead {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, missing: code === "ENOENT", reason: err instanceof Error ? err.message : String(err) };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch (err) {
+    return { ok: false, missing: false, reason: `invalid JSON: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, missing: false, reason: "not a JSON object" };
+  }
+  // A nested document must hold an object under `pools`. Accepting an array,
+  // string, number or null there would let a later edit overwrite it, silently
+  // destroying a document we do not actually understand.
+  const doc = value as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(doc, "pools")) {
+    const pools = doc["pools"];
+    if (pools === null || typeof pools !== "object" || Array.isArray(pools)) {
+      return { ok: false, missing: false, reason: 'the "pools" key must be a JSON object' };
+    }
+  }
+  return { ok: true, value, fingerprint: fingerprintText(raw) };
+}
+
+/** Which accepted document shape a file/inline source uses. */
+function detectShape(doc: unknown): "nested" | "flat" | "none" {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "none";
+  return Object.prototype.hasOwnProperty.call(doc, "pools") ? "nested" : "flat";
+}
+
+/**
  * Read outcome. `invalid` covers malformed JSON, a wrong-shaped doc and an
  * unrecognized version: those are preserved untouched, because destroying a
  * file we do not understand risks losing something we did not anticipate.
@@ -362,21 +584,7 @@ function quarantineLegacyState(file: string): string {
 
 /** Write the state via a unique temp file + atomic rename (mode 0600). */
 function writeStateAtomic(file: string, next: Record<string, number>): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(tmp, `${JSON.stringify({ version: SCHEMA_VERSION, counters: next }, null, 2)}\n`, {
-      mode: 0o600,
-      flag: "wx",
-    });
-    fs.renameSync(tmp, file);
-  } finally {
-    try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      // Temp cleanup is best-effort.
-    }
-  }
+  writeFileAtomicSync(file, `${JSON.stringify({ version: SCHEMA_VERSION, counters: next }, null, 2)}\n`);
 }
 
 /** Sleep helper used only for lock-contention backoff. */
@@ -449,8 +657,12 @@ function reclaimAbandonedLock(lock: string): boolean {
   return true;
 }
 
-/** Run `fn` while holding an atomic-directory lock; abandoned locks are reclaimed. */
-async function withStateLock<T>(file: string, fn: () => T): Promise<T> {
+/**
+ * Run `fn` while holding an atomic-directory lock on `<file>.lock`; abandoned
+ * locks are reclaimed. Shared by the counter state file and the pool config
+ * file, so two writers on the same path never interleave.
+ */
+async function withFileLock<T>(file: string, fn: () => T): Promise<T> {
   const lock = `${file}.lock`;
   const owner = path.join(lock, "owner");
   const token = `${process.pid}.${Date.now()}.${randomUUID()}`;
@@ -504,7 +716,7 @@ function advancePersisted(
   eligible: boolean[],
   file: string,
 ): Promise<{ index: number; replacedLegacy: boolean } | undefined> {
-  return withStateLock(file, () => {
+  return withFileLock(file, () => {
     const read = readPersistedCounters(file);
     if (read.legacy) quarantineLegacyState(file);
     const persisted = read.counters;
@@ -587,41 +799,420 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
   };
 }
 
-/** Read and parse a JSON file; `undefined` on any read or parse failure. */
-function readJsonFileSync(filePath: string): unknown {
-  try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(raw) as unknown;
-  } catch {
-    return undefined;
-  }
+/**
+ * Load the effective configuration and its provenance.
+ *
+ * Precedence: programmatic `options` (handled by the factory) > inline
+ * `OMP_MODEL_POOLS_JSON` > explicit `OMP_MODEL_POOL_CONFIG` file > the
+ * profile-scoped default file > empty. Routing stays fail-open: a malformed
+ * higher-priority source falls through with a warning, while the same source
+ * disables editing so an accepted edit can never land in a surprising file.
+ */
+interface LoadedConfig {
+  config: ModelPoolConfig;
+  source: ConfigSourceInfo;
+  shape: "nested" | "flat" | "none";
+  fingerprint?: string;
+  warnings: string[];
 }
 
-/** Load initial config from env / file. Precedence: inline JSON > file > {}. */
-function loadConfigFromEnv(): ModelPoolConfig {
+function loadConfigWithSource(): LoadedConfig {
+  const warnings: string[] = [];
+  const emptyConfig = (): ModelPoolConfig => ({ pools: Object.create(null) });
+  /**
+   * Set when a higher-priority source was present but unusable. Routing still
+   * falls through (fail open), but editing must be disabled: otherwise an
+   * accepted edit would be written to a lower-priority file the operator did
+   * not intend to be authoritative.
+   */
+  let blockedReason: string | undefined;
+  const blocked = (source: ConfigSourceInfo): ConfigSourceInfo =>
+    blockedReason === undefined
+      ? source
+      : { ...source, writable: false, note: `editing disabled: ${blockedReason}` };
+
   const inline = process.env["OMP_MODEL_POOLS_JSON"];
-  if (inline !== undefined && inline.trim().length > 0) {
+  if (typeof inline === "string" && inline.trim().length > 0) {
     try {
       const parsed = JSON.parse(inline) as unknown;
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
         // Pass through unchanged: a flat map keeps its option keys
         // (persistCounters, stateFile, …) at the top level, where
         // normalizeConfig reads them. Wrapping it as `pools` would hide them.
-        return parsed as ModelPoolConfig;
+        return {
+          config: parsed as ModelPoolConfig,
+          source: {
+            kind: "inline-env",
+            writable: false,
+            label: "OMP_MODEL_POOLS_JSON",
+            note: "runtime-only: inline JSON cannot be rewritten",
+          },
+          shape: detectShape(parsed),
+          fingerprint: fingerprintText(inline),
+          warnings,
+        };
       }
-    } catch {
-      // Fall through to file / empty on invalid JSON; never throw at load.
+      warnings.push("OMP_MODEL_POOLS_JSON is not a JSON object; ignoring it");
+      blockedReason = "OMP_MODEL_POOLS_JSON is set but is not a JSON object";
+    } catch (err) {
+      warnings.push(
+        `OMP_MODEL_POOLS_JSON is not valid JSON (${err instanceof Error ? err.message : String(err)}); ignoring it`,
+      );
+      blockedReason = "OMP_MODEL_POOLS_JSON is set but is not valid JSON";
     }
   }
-  const filePath = process.env["OMP_MODEL_POOL_CONFIG"];
-  if (filePath !== undefined && filePath.trim().length > 0) {
-    const resolved = path.resolve(filePath.trim());
-    const parsed = readJsonFileSync(resolved);
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as ModelPoolConfig;
+
+  const explicit = process.env["OMP_MODEL_POOL_CONFIG"];
+  if (typeof explicit === "string" && explicit.trim().length > 0) {
+    const resolved = path.resolve(explicit.trim());
+    const read = readJsonFileWithReason(resolved);
+    if (read.ok) {
+      return {
+        config: read.value as ModelPoolConfig,
+        source: blocked({ kind: "file-env", path: resolved, writable: true, label: resolved }),
+        shape: detectShape(read.value),
+        fingerprint: read.fingerprint,
+        warnings,
+      };
+    }
+    if (read.missing) {
+      warnings.push(
+        `OMP_MODEL_POOL_CONFIG points at a missing file (${resolved}); it will be created on the first saved edit`,
+      );
+      return {
+        config: emptyConfig(),
+        source: blocked({
+          kind: "file-env",
+          path: resolved,
+          writable: true,
+          label: resolved,
+          note: "missing file will be created on the first saved edit",
+        }),
+        shape: "nested",
+        warnings,
+      };
+    }
+    // Routing falls through to the next source (the profile default file, then
+    // empty), but editing is disabled: writing an edit while a shadowing
+    // higher-priority source is broken would divert it somewhere the operator
+    // did not intend it to be authoritative.
+    warnings.push(
+      `OMP_MODEL_POOL_CONFIG could not be read (${resolved}): ${read.reason}; routing falls through and pool editing is disabled until it is repaired`,
+    );
+    blockedReason = `OMP_MODEL_POOL_CONFIG (${resolved}) could not be read: ${read.reason}`;
+  }
+
+  const fallback = resolveDefaultConfigFilePath();
+  const read = readJsonFileWithReason(fallback);
+  if (read.ok) {
+    return {
+      config: read.value as ModelPoolConfig,
+      source: blocked({ kind: "default-file", path: fallback, writable: true, label: fallback }),
+      shape: detectShape(read.value),
+      fingerprint: read.fingerprint,
+      warnings,
+    };
+  }
+  if (read.missing) {
+    return {
+      config: emptyConfig(),
+      source: blocked({
+        kind: "none",
+        path: fallback,
+        writable: true,
+        label: `no configuration (will create ${fallback})`,
+      }),
+      shape: "none",
+      warnings,
+    };
+  }
+  warnings.push(
+    `default config ${fallback} could not be read: ${read.reason}; pool editing is disabled until it is repaired`,
+  );
+  return {
+    config: emptyConfig(),
+    source: {
+      kind: "default-file",
+      path: fallback,
+      writable: false,
+      label: fallback,
+      note: `unreadable: ${read.reason}`,
+    },
+    shape: "none",
+    warnings,
+  };
+}
+
+/**
+ * Stable signature of a normalized options document.
+ *
+ * Programmatic options are also re-applied on every factory re-bind, so they
+ * need the same "unchanged source" comparison the environment source has;
+ * without it a child-session re-bind would silently discard runtime-only edits.
+ */
+function optionsSignature(normalized: ReturnType<typeof normalizeConfig>): string {
+  const pools = Object.keys(normalized.pools)
+    .sort()
+    .map((role) => `${role}=${(normalized.pools[role] ?? []).join(",")}`)
+    .join(";");
+  const strict = Array.isArray(normalized.strict) ? normalized.strict.join(",") : String(normalized.strict);
+  return `${pools}|${normalized.mainSessionRole}|${normalized.enableMainSessionRotation}|${strict}|${normalized.persistCounters}|${normalized.stateFile}`;
+}
+
+/** Signature that decides whether a re-bind must reload the environment source. */
+function sourceSignature(loaded: LoadedConfig): string {
+  return `${loaded.source.kind}:${loaded.source.path ?? ""}:${loaded.source.writable ? "w" : "r"}:${loaded.fingerprint ?? ""}`;
+}
+
+/** Apply a loaded source to the active configuration and record its provenance. */
+function configureLoaded(loaded: LoadedConfig): void {
+  applyNormalized(normalizeConfig(loaded.config));
+  configSource = loaded.source;
+  configShape = loaded.shape;
+  configFingerprint = loaded.fingerprint;
+  configRevision += 1;
+}
+
+// ---------------------------------------------------------------------------
+// Pool editing (auto-saved when a file is the authoritative source).
+//
+// Each accepted edit is its own transaction. A file-backed edit is written and
+// committed before the in-memory pools change, so a save failure leaves both
+// the file and the active pools exactly as they were. A runtime-only source
+// (programmatic options, inline JSON, or a disabled editor) changes memory only.
+// ---------------------------------------------------------------------------
+
+/** Top-level keys that a flat-config role name would collide with. */
+const RESERVED_FLAT_KEYS = new Set([
+  "pools",
+  "mainSessionRole",
+  "enableMainSessionRotation",
+  "strict",
+  "persistCounters",
+  "stateFile",
+]);
+
+/** Replace or delete one role in the in-memory pools without touching counters. */
+function applyPoolChange(roleKey: string, selectors: string[] | null): void {
+  const pools: Record<string, string[]> = Object.create(null);
+  for (const [k, v] of Object.entries(activeConfig.pools)) pools[k] = [...v];
+  if (selectors === null) delete pools[roleKey];
+  else pools[roleKey] = [...selectors];
+  activeConfig.pools = pools;
+}
+
+/**
+ * Own-property copy onto a null-prototype object, so a role literally named
+ * `__proto__` is stored as data instead of mutating a prototype.
+ */
+function copyOwnProperties(source: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.create(null);
+  if (source !== null && typeof source === "object" && !Array.isArray(source)) {
+    for (const [k, v] of Object.entries(source as Record<string, unknown>)) out[k] = v;
+  }
+  return out;
+}
+
+/** Drop keys that normalize to `roleKey` but are written differently (`"@slow"`, padded). */
+function dropAliasKeys(target: Record<string, unknown>, roleKey: string): void {
+  for (const key of Object.keys(target)) {
+    if (key !== roleKey && normalizeRoleKey(key) === roleKey) delete target[key];
+  }
+}
+
+/** Build the document to write, preserving unrelated keys and the source shape. */
+function buildDocument(
+  roleKey: string,
+  selectors: string[] | null,
+  shape: "nested" | "flat" | "none",
+  rawDoc: unknown,
+): Record<string, unknown> {
+  const base = copyOwnProperties(rawDoc);
+  if (shape === "flat") {
+    dropAliasKeys(base, roleKey);
+    if (selectors === null) delete base[roleKey];
+    else base[roleKey] = selectors;
+    return base;
+  }
+  const pools = copyOwnProperties(base["pools"]);
+  // Match the role as the active config knows it, so deleting `@slow` removes the
+  // document's `"@slow"` key rather than leaving it to reappear on the next load.
+  dropAliasKeys(pools, roleKey);
+  if (selectors === null) delete pools[roleKey];
+  else pools[roleKey] = selectors;
+  // Keep the `pools` key even when it is empty. Dropping it would make the next
+  // `detectShape()` read the document as flat, so a later role addition would be
+  // written at the top level and silently change the file's established shape.
+  base["pools"] = pools;
+  return base;
+}
+
+/** How an accepted pool edit is applied for the active source. */
+type EditMode = "file" | "runtime-only" | "disabled";
+
+/**
+ * Classify the active source for editing.
+ *
+ * `runtime-only` sources (programmatic options, inline JSON) accept edits into
+ * memory. A `disabled` source is an authoritative file that could not be read,
+ * or one shadowed by a malformed higher-priority source: edits must be refused
+ * there rather than silently diverted into memory or into another file.
+ */
+function editMode(): EditMode {
+  if (configSource.kind === "options" || configSource.kind === "inline-env") return "runtime-only";
+  if (!configSource.writable || configSource.path === undefined) return "disabled";
+  return "file";
+}
+
+/**
+ * Save one role's pool, or delete the role with `selectors === null`.
+ *
+ * `expectedRevision` guards against a stale editor: when the configuration
+ * changed since the editor captured it, the edit is rejected instead of
+ * overwriting a newer change. File-backed saves re-read and fingerprint-check
+ * the file under an atomic-directory lock before writing, so a cooperating
+ * writer is never silently overwritten.
+ */
+export async function savePoolEdit(
+  role: string,
+  selectors: string[] | null,
+  expectedRevision?: number,
+): Promise<PoolEditOutcome> {
+  const roleKey = normalizeRoleKey(role);
+  if (roleKey.length === 0) return { ok: false, error: "a role name is required" };
+  if (expectedRevision !== undefined && expectedRevision !== configRevision) {
+    return { ok: false, error: "the configuration changed since this edit started; reopen the editor" };
+  }
+  const next = selectors === null ? null : normalizeStringList(selectors);
+  if (next !== null && next.length === 0) {
+    return { ok: false, error: "refusing to save an empty pool; delete the role instead" };
+  }
+  if (configShape === "flat" && RESERVED_FLAT_KEYS.has(roleKey)) {
+    return {
+      ok: false,
+      error: `a flat config cannot hold a role named "${roleKey}" (it collides with a top-level option key)`,
+    };
+  }
+
+  const mode = editMode();
+  if (mode === "disabled") {
+    return {
+      ok: false,
+      error: `pool editing is disabled: ${configSource.note ?? "the configuration source is not writable"}`,
+    };
+  }
+  if (mode === "runtime-only") {
+    applyPoolChange(roleKey, next);
+    configRevision += 1;
+    return { ok: true, runtimeOnly: true };
+  }
+  const file = configSource.path;
+  if (file === undefined) {
+    return { ok: false, error: "pool editing is disabled: the configuration source has no writable path" };
+  }
+
+  if (
+    samePath(file, activeConfig.stateFile) ||
+    samePath(file, `${activeConfig.stateFile}.lock`) ||
+    // The reverse alias: a state file set to `<config>.lock` would make this
+    // save treat the state path as its lock directory.
+    samePath(activeConfig.stateFile, `${file}.lock`)
+  ) {
+    return { ok: false, error: `refusing to write pool config over the counter state file (${file})` };
+  }
+
+  // A brand-new default file has no fingerprint yet; anything already on disk
+  // must match the fingerprint captured when the source was loaded.
+  const expectedFingerprint = configSource.kind === "none" ? undefined : configFingerprint;
+  const revisionAtStart = configRevision;
+  let fingerprintConflict = false;
+  try {
+    await withFileLock(file, () => {
+      // Re-check under the lock: a concurrent edit (or `configurePools`) that
+      // committed while this call waited must not be overwritten by a stale one.
+      if (configRevision !== revisionAtStart) {
+        throw new Error("the configuration changed while this edit waited for the file lock; reopen the editor");
+      }
+      const current = readJsonFileWithReason(file);
+      if (!current.ok && !current.missing) throw new Error(current.reason);
+      const currentFingerprint = current.ok ? current.fingerprint : undefined;
+      if (currentFingerprint !== expectedFingerprint) {
+        fingerprintConflict = true;
+        throw new Error("the configuration file changed on disk since it was loaded; reopen the editor");
+      }
+      const doc = buildDocument(roleKey, next, configShape, current.ok ? current.value : undefined);
+      const text = `${JSON.stringify(doc, null, 2)}\n`;
+      writeFileAtomicSync(file, text, existingMode(file));
+      configFingerprint = fingerprintText(text);
+      if (configSource.kind === "none") {
+        configSource = { kind: "default-file", path: file, writable: true, label: file };
+      }
+      // Commit the in-memory change inside the lock, so a second save that
+      // passed the pre-lock revision check sees the bumped revision and refuses
+      // instead of overwriting this write.
+      applyPoolChange(roleKey, next);
+      configRevision += 1;
+    });
+  } catch (err) {
+    if (fingerprintConflict) {
+      const loaded = loadConfigWithSource();
+      configureLoaded(loaded);
+      loadedSignature = sourceSignature(loaded);
+    }
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  return { ok: true, runtimeOnly: false };
+}
+
+/**
+ * Diagnose every configured pool entry against the live registry. Read-only:
+ * it never writes, never advances a counter and never acquires a lock. It is
+ * the same membership rule the router uses, so `doctor` cannot disagree with a
+ * spawn about whether an entry is usable.
+ */
+export function diagnosePools(models: ModelsQuery | undefined): {
+  registryReadable: boolean;
+  registryNote: string;
+  roles: PoolDiagnosis[];
+} {
+  let registryReadable = false;
+  let registryNote = "model registry unavailable";
+  if (models !== undefined) {
+    try {
+      const listed = models.list() ?? [];
+      registryReadable = true;
+      registryNote =
+        listed.length === 0
+          ? "registry readable, no authenticated models"
+          : `registry readable, ${listed.length} authenticated model(s)`;
+    } catch (err) {
+      registryNote = `registry read failed: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
-  return { pools: Object.create(null) };
+
+  const roles: PoolDiagnosis[] = [];
+  for (const [role, pool] of Object.entries(activeConfig.pools)) {
+    const entries: PoolEntryDiagnosis[] = pool.map((selector) => {
+      if (models === undefined) return { selector, eligible: false, reason: "registry unavailable" };
+      let resolved: ModelLike | undefined;
+      try {
+        resolved = models.resolve(selector);
+      } catch {
+        resolved = undefined;
+      }
+      if (resolved === undefined || resolved === null) {
+        return { selector, eligible: false, reason: "unresolved" };
+      }
+      const id = modelIdentity(resolved);
+      if (id.length === 0) return { selector, eligible: false, reason: "resolved without an identity" };
+      const availability = filterAvailable([selector], models);
+      return availability.eligible[0] === true
+        ? { selector, eligible: true, reason: `authenticated as ${id}` }
+        : { selector, eligible: false, reason: `not authenticated (${id} is not in the registry list)` };
+    });
+    roles.push({ role, entries });
+  }
+  return { registryReadable, registryNote, roles };
 }
 
 // ---------------------------------------------------------------------------
@@ -704,10 +1295,11 @@ function filterAvailable(selectors: string[], models: ModelsQuery | undefined): 
     }
     if (resolved === undefined || resolved === null) continue;
     const id = modelIdentity(resolved);
-    // Membership is by canonical identity when known; a resolved model without
-    // an id still counts if resolve() itself succeeded and the list is empty
-    // (hosts that report no authenticated models yet still resolve aliases).
-    if (id.length > 0 && !identities.has(id) && listed.length > 0) continue;
+    // Authentication is proven only by membership in the registry's own
+    // authenticated list. A selector that resolves but is not listed is not
+    // authenticated, and a readable-but-empty list authenticates nothing; an
+    // unreadable registry is the separate, fail-open case handled above.
+    if (id.length === 0 || !identities.has(id)) continue;
     eligible[i] = true;
     count++;
   }
@@ -984,36 +1576,29 @@ async function handleSessionStart(
     if (pick === undefined) return;
     const note = describePick(roleKey, pick.picked, pick.index, pool.length);
     safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-    // Applying the pick is a separate step from choosing it. The host wants a
-    // resolved `Model` and reports `false` when it cannot apply one, so neither
-    // failure may be logged as a successful rotation.
-    const resolved = ctx.models?.resolve?.(pick.picked);
-    if (resolved === undefined || resolved === null || modelIdentity(resolved).length === 0) {
-      safeLog(pi, "warn", `[model-pool] main session: host could not resolve ${pick.picked}; leaving model unchanged`);
+    // Applying the pick is a separate step from choosing it, and shares the
+    // same host boundary the manual picker uses. A refusal, an unresolvable
+    // selector, or a host that keeps a different model is never reported as a
+    // successful rotation.
+    const result = await applyModelToSession(pi, ctx, pick.picked);
+    if (!result.ok) {
+      safeLog(pi, "warn", describeApplyFailure("main session", pick.picked, result));
       return;
     }
-    if (typeof pi.setModel !== "function") {
-      safeLog(pi, "warn", "[model-pool] main session: host exposes no setModel; leaving model unchanged");
-      return;
-    }
-    const applied = await pi.setModel(resolved);
-    if (applied === false) {
-      safeLog(pi, "warn", `[model-pool] main session: host refused ${pick.picked}; leaving model unchanged`);
-      return;
-    }
-    // Confirm rather than trust: a host that accepted the call but kept another
-    // model would otherwise be reported as a rotation that never happened.
-    const current = ctx.models?.current?.();
-    const currentId = current === undefined || current === null ? "" : modelIdentity(current);
-    if (currentId.length > 0 && currentId !== modelIdentity(resolved)) {
-      safeLog(pi, "warn", `[model-pool] main session: asked for ${pick.picked} but the session reports ${currentId}`);
-      return;
-    }
-    safeLog(pi, "info", `[model-pool] main session applied ${modelIdentity(resolved)}`);
-    try {
-      ctx.ui?.notify?.(`model-pool: ${note}`, "info");
-    } catch {
-      // Notification is best-effort.
+    if (result.confirmed) {
+      safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
+      notifyUser(ctx, `model-pool: ${note}`, "info");
+    } else {
+      safeLog(
+        pi,
+        "warn",
+        `[model-pool] main session: requested ${result.id} but the host did not confirm the active model`,
+      );
+      notifyUser(
+        ctx,
+        `model-pool: requested ${result.id}, but the host did not confirm the active model`,
+        "warning",
+      );
     }
   } catch (err) {
     try {
@@ -1025,28 +1610,730 @@ async function handleSessionStart(
 }
 
 // ---------------------------------------------------------------------------
+// Applying a model to the live session (shared by startup rotation and picker).
+// ---------------------------------------------------------------------------
+
+/** Why applying a model failed; the caller decides how to phrase the log. */
+type ApplyModelResult =
+  | {
+      ok: true;
+      id: string;
+      /**
+       * True only when the host reported the active model back and it matched.
+       * A host that cannot report its active model is not evidence of failure,
+       * but it is not evidence of success either, so callers must not present
+       * an unconfirmed apply as a completed rotation.
+       */
+      confirmed: boolean;
+    }
+  | {
+      ok: false;
+      code: "unresolved" | "unauthenticated" | "registry-unreadable" | "no-set-model" | "refused" | "mismatch";
+      detail: string;
+    };
+
+/**
+ * Resolve, authenticate, apply and confirm one model on the live session.
+ *
+ * The host takes a resolved `Model`, not a selector string, and reports `false`
+ * when it cannot apply one (no credential for that model). Confirmation via
+ * `current()` is used when available but is not required: a host that cannot
+ * report its active model must not turn a successful apply into a reported
+ * failure, and must not turn a wrong model into a reported success either.
+ *
+ * A `setModel` that throws is deliberately not caught here — the caller's own
+ * error handling decides what a thrown apply means.
+ */
+async function applyModelToSession(
+  pi: ExtensionApiLike,
+  ctx: ExtensionContextLike,
+  selector: string,
+): Promise<ApplyModelResult> {
+  const models = ctx.models;
+  if (models === undefined) return { ok: false, code: "registry-unreadable", detail: "no model registry" };
+
+  let resolved: ModelLike | undefined;
+  try {
+    resolved = models.resolve(selector);
+  } catch {
+    resolved = undefined;
+  }
+  if (resolved === undefined || resolved === null || modelIdentity(resolved).length === 0) {
+    return { ok: false, code: "unresolved", detail: `could not resolve ${selector}` };
+  }
+
+  let listed: ModelLike[];
+  try {
+    listed = models.list() ?? [];
+  } catch {
+    return { ok: false, code: "registry-unreadable", detail: "the model registry could not be read" };
+  }
+  const id = modelIdentity(resolved);
+  const authenticated = new Set(listed.map(modelIdentity).filter((value) => value.length > 0));
+  if (!authenticated.has(id)) {
+    return { ok: false, code: "unauthenticated", detail: `${selector} is not authenticated` };
+  }
+
+  const setModel = pi.setModel;
+  if (typeof setModel !== "function") {
+    return { ok: false, code: "no-set-model", detail: "the host exposes no setModel" };
+  }
+  const applied = await setModel(resolved);
+  if (applied === false) return { ok: false, code: "refused", detail: `the host refused ${selector}` };
+
+  let currentId = "";
+  try {
+    const current = models.current?.();
+    currentId = current === undefined || current === null ? "" : modelIdentity(current);
+  } catch {
+    currentId = "";
+  }
+  if (currentId.length > 0 && currentId !== id) {
+    return { ok: false, code: "mismatch", detail: currentId };
+  }
+  return { ok: true, id, confirmed: currentId.length > 0 };
+}
+
+/** Phrase an apply failure for the log, keeping the established wording. */
+function describeApplyFailure(context: string, selector: string, result: ApplyModelResult): string {
+  if (result.ok) return "";
+  switch (result.code) {
+    case "unresolved":
+      return `[model-pool] ${context}: host could not resolve ${selector}; leaving model unchanged`;
+    case "no-set-model":
+      return `[model-pool] ${context}: host exposes no setModel; leaving model unchanged`;
+    case "refused":
+      return `[model-pool] ${context}: host refused ${selector}; leaving model unchanged`;
+    case "mismatch":
+      return `[model-pool] ${context}: asked for ${selector} but the session reports ${result.detail}`;
+    default:
+      return `[model-pool] ${context}: could not apply ${selector} (${result.detail}); leaving model unchanged`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive command surface (`/model-pool`).
+//
+// The command is a convenience layer over the same engine the hooks use: it
+// never changes the round-robin policy, never advances a counter, and never
+// edits OMP's own role or settings files. All dialogs are optional members of
+// the host's UI surface, so every entry point degrades to a notification rather
+// than assuming a dialog is available.
+// ---------------------------------------------------------------------------
+
+const COMMAND_NAME = "model-pool";
+/** Sentinel option values; not valid role names (they contain no word characters). */
+const NEW_ROLE_VALUE = "::new-role::";
+const BACK_VALUE = "::back::";
+/** Above this many models, ask for a substring before showing the list. */
+const MODEL_FILTER_THRESHOLD = 12;
+
+/** Best-effort notification: a broken UI must never break a command or a spawn. */
+function notifyUser(ctx: ExtensionContextLike, message: string, type?: "info" | "warning" | "error"): void {
+  try {
+    ctx.ui?.notify?.(message, type);
+  } catch {
+    // Notification is best-effort.
+  }
+}
+
+/** Log through the host and surface the same text to the user. */
+function emit(pi: ExtensionApiLike, ctx: ExtensionContextLike, text: string, type: "info" | "warning" | "error" = "info"): void {
+  safeLog(pi, type === "error" ? "error" : type === "warning" ? "warn" : "info", `[model-pool] ${text}`);
+  notifyUser(ctx, text, type);
+}
+
+/** Is this the top-level session? Commands that mutate require it. */
+function isMainAgent(ctx: ExtensionContextLike): boolean {
+  return ctx.agent?.kind === "main";
+}
+
+/** Does the host expose the interactive dialogs the commands need? */
+function hasInteractiveUI(ctx: ExtensionContextLike): boolean {
+  return ctx.hasUI !== false && typeof ctx.ui?.select === "function" && typeof ctx.ui?.input === "function";
+}
+
+/** Is the session currently streaming? An unknown answer counts as not busy. */
+function sessionBusy(ctx: ExtensionContextLike): boolean {
+  try {
+    return typeof ctx.isIdle === "function" && ctx.isIdle() === false;
+  } catch {
+    return false;
+  }
+}
+
+/** Show a selector and map the returned label back to a value. */
+async function pickLabeled<T>(
+  ctx: ExtensionContextLike,
+  title: string,
+  items: { label: string; description?: string; value: T }[],
+): Promise<T | undefined> {
+  const ui = ctx.ui;
+  if (ui === undefined || typeof ui.select !== "function") return undefined;
+  const options: (string | UISelectItem)[] = items.map((item) =>
+    item.description === undefined ? item.label : { label: item.label, description: item.description },
+  );
+  const chosen = await ui.select(title, options);
+  if (chosen === undefined) return undefined;
+  const found = items.find((item) => item.label === chosen);
+  return found?.value;
+}
+
+/** Ask for a yes/no confirmation; a missing dialog counts as "no". */
+async function confirmDialog(ctx: ExtensionContextLike, title: string, message: string): Promise<boolean> {
+  const ui = ctx.ui;
+  if (ui === undefined || typeof ui.confirm !== "function") return false;
+  const answer = await ui.confirm(title, message);
+  return answer === true;
+}
+
+/** Ask for one line of text; a missing dialog counts as cancelled. */
+async function inputDialog(ctx: ExtensionContextLike, title: string, placeholder: string): Promise<string | undefined> {
+  const ui = ctx.ui;
+  if (ui === undefined || typeof ui.input !== "function") return undefined;
+  return ui.input(title, placeholder);
+}
+
+/**
+ * Authenticated models with a usable identity, or `undefined` when unreadable.
+ *
+ * De-duplicated by canonical identity: the picker selects by the *label* the
+ * host returns, so two rows with the same identity would be ambiguous and the
+ * first would silently win.
+ */
+function readAuthenticatedModels(ctx: ExtensionContextLike): ModelLike[] | undefined {
+  const models = ctx.models;
+  if (models === undefined) return undefined;
+  try {
+    const listed = models.list() ?? [];
+    const seen = new Set<string>();
+    const out: ModelLike[] = [];
+    for (const model of listed) {
+      const id = modelIdentity(model);
+      if (id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      out.push(model);
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Canonical identity of the session's current model; `""` when unknown. */
+function currentModelIdentity(ctx: ExtensionContextLike): string {
+  try {
+    const current = ctx.models?.current?.();
+    return current === undefined || current === null ? "" : modelIdentity(current);
+  } catch {
+    return "";
+  }
+}
+
+/** Pick one model from the authenticated list, with an optional substring filter. */
+async function chooseModel(ctx: ExtensionContextLike, models: ModelLike[], title: string): Promise<string | undefined> {
+  let candidates = models;
+  if (candidates.length > MODEL_FILTER_THRESHOLD) {
+    const filter = await inputDialog(ctx, "Filter models", "substring, empty for all");
+    if (filter === undefined) return undefined;
+    const needle = filter.trim().toLowerCase();
+    if (needle.length > 0) {
+      candidates = candidates.filter((m) => modelIdentity(m).toLowerCase().includes(needle));
+      if (candidates.length === 0) {
+        notifyUser(ctx, `model-pool: no model matches "${filter.trim()}"`, "warning");
+        return undefined;
+      }
+    }
+  }
+  const currentId = currentModelIdentity(ctx);
+  const items = candidates.map((m) => {
+    const id = modelIdentity(m);
+    return id === currentId ? { label: id, description: "current", value: id } : { label: id, value: id };
+  });
+  return pickLabeled(ctx, title, items);
+}
+
+/** Ask which configured slot to act on; returns the zero-based index. */
+async function pickSlot(ctx: ExtensionContextLike, title: string, pool: string[]): Promise<number | undefined> {
+  const items = pool.map((selector, index) => ({ label: `${index + 1}. ${selector}`, value: index }));
+  return pickLabeled(ctx, title, items);
+}
+
+/** One-line description of the active configuration source, safe to display. */
+function describeSource(): string {
+  const mode = editMode();
+  const label = mode === "file" ? "saved to file" : mode === "runtime-only" ? "runtime-only" : "editing disabled";
+  const note = configSource.note === undefined ? "" : `; ${configSource.note}`;
+  return `source: ${configSource.label} (${configSource.kind}, ${label})${note}`;
+}
+
+/**
+ * One-line pre-edit summary of the role about to be edited: configured order
+ * with authenticated membership, counter policy, and the cursor guarantee.
+ * Read-only, so merely entering the editor still changes nothing.
+ */
+function describeRoleForEditing(role: string, pool: string[], models: ModelsQuery | undefined): string {
+  if (pool.length === 0) {
+    return `model-pool: @${role} has no pool yet — adding a model creates it, and the order decides the rotation sequence`;
+  }
+  const report = diagnosePools(models);
+  const entries = report.roles.find((r) => r.role === role)?.entries ?? [];
+  const order = report.registryReadable
+    ? pool
+        .map((selector, i) => {
+          const entry = entries[i];
+          const state = entry === undefined || entry.eligible ? "available" : `unavailable: ${entry.reason}`;
+          return `${i + 1}. ${selector} (${state})`;
+        })
+        .join(", ")
+    : `${pool.map((selector, i) => `${i + 1}. ${selector}`).join(", ")} (availability unknown: model registry unavailable)`;
+  const policy = activeConfig.persistCounters
+    ? `counters persist across processes (${activeConfig.stateFile})`
+    : "counters are process-local";
+  return `model-pool: @${role} order: ${order} — ${policy}; editing never moves the cursor`;
+}
+
+/** Report the outcome of a save attempt; returns whether it succeeded. */
+function reportEditOutcome(ctx: ExtensionContextLike, outcome: PoolEditOutcome, successMessage: string): boolean {
+  if (!outcome.ok) {
+    notifyUser(ctx, `model-pool: ${outcome.error}`, "error");
+    return false;
+  }
+  const suffix = outcome.runtimeOnly ? " (runtime-only; not written to disk)" : "";
+  notifyUser(ctx, `model-pool: ${successMessage}${suffix}`, "info");
+  return true;
+}
+
+/** `/model-pool pick`: switch the current main-session model. */
+async function runModelPicker(pi: ExtensionApiLike, ctx: ExtensionContextLike): Promise<void> {
+  if (!isMainAgent(ctx)) {
+    notifyUser(ctx, "model-pool: switching the model is available in the main session only", "warning");
+    return;
+  }
+  if (!hasInteractiveUI(ctx)) {
+    notifyUser(ctx, "model-pool: switching the model needs an interactive session", "warning");
+    return;
+  }
+  if (sessionBusy(ctx)) {
+    notifyUser(ctx, "model-pool: the session is busy; try again when it is idle", "warning");
+    return;
+  }
+  const models = readAuthenticatedModels(ctx);
+  if (models === undefined) {
+    notifyUser(ctx, "model-pool: the model registry is unavailable", "error");
+    return;
+  }
+  if (models.length === 0) {
+    notifyUser(ctx, "model-pool: no authenticated models are available", "warning");
+    return;
+  }
+  const currentId = currentModelIdentity(ctx);
+  const chosen = await chooseModel(
+    ctx,
+    models,
+    "Switch current model (changes this conversation; may affect prompt caching)",
+  );
+  if (chosen === undefined) {
+    notifyUser(ctx, "model-pool: cancelled", "info");
+    return;
+  }
+  if (chosen === currentId) {
+    notifyUser(ctx, `model-pool: already using ${chosen}`, "info");
+    return;
+  }
+  // Re-check after the dialog: the session may have started streaming while the
+  // user was choosing, and switching mid-turn is not safe.
+  if (sessionBusy(ctx)) {
+    notifyUser(ctx, "model-pool: the session became busy; not switching", "warning");
+    return;
+  }
+  try {
+    const result = await applyModelToSession(pi, ctx, chosen);
+    if (!result.ok) {
+      const message =
+        result.code === "mismatch"
+          ? `model-pool: requested ${chosen}, but the session still reports ${result.detail}`
+          : `model-pool: ${result.detail}`;
+      notifyUser(ctx, message, "error");
+      return;
+    }
+    if (result.confirmed) {
+      notifyUser(ctx, `model-pool: switched to ${result.id}`, "info");
+    } else {
+      notifyUser(
+        ctx,
+        `model-pool: requested ${result.id}, but the host did not confirm the active model`,
+        "warning",
+      );
+    }
+  } catch (err) {
+    notifyUser(ctx, `model-pool: switch failed (${err instanceof Error ? err.message : String(err)})`, "error");
+  }
+}
+
+/** `/model-pool edit [role]`: add, remove, reorder or delete role pools. */
+async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): Promise<void> {
+  if (!isMainAgent(ctx)) {
+    notifyUser(ctx, "model-pool: editing pools is available in the main session only", "warning");
+    return;
+  }
+  if (!hasInteractiveUI(ctx)) {
+    notifyUser(ctx, "model-pool: editing pools needs an interactive session", "warning");
+    return;
+  }
+  if (editMode() === "disabled") {
+    notifyUser(
+      ctx,
+      `model-pool: pool editing is disabled until the configuration source is repaired — ${describeSource()}`,
+      "warning",
+    );
+    return;
+  }
+  let role = normalizeRoleKey(initialRole ?? "");
+  let announcedRole = "";
+
+  for (;;) {
+    if (role.length === 0) {
+      const pools = getPools();
+      const items: { label: string; description?: string; value: string }[] = Object.keys(pools).map((name) => {
+        const count = pools[name]?.length ?? 0;
+        return { label: `@${name}`, description: `${count} ${count === 1 ? "entry" : "entries"}`, value: name };
+      });
+      items.push({ label: "New role…", description: "create a role pool", value: NEW_ROLE_VALUE });
+      items.push({ label: "Back", description: "close the editor", value: BACK_VALUE });
+      const picked = await pickLabeled(ctx, `Role pools — ${describeSource()}`, items);
+      if (picked === undefined || picked === BACK_VALUE) return;
+      if (picked === NEW_ROLE_VALUE) {
+        const name = await inputDialog(ctx, "New role name", "for example: slow (a leading @ is optional)");
+        if (name === undefined) continue;
+        const key = normalizeRoleKey(name);
+        if (key.length === 0) {
+          notifyUser(ctx, "model-pool: a role name is required", "warning");
+          continue;
+        }
+        if (getPools()[key] === undefined) {
+          notifyUser(
+            ctx,
+            `model-pool: @${key} has no pool yet; a pool routes only spawns that ask for @${key} — it does not create or assign an OMP core role`,
+            "info",
+          );
+        }
+        role = key;
+        continue;
+      }
+      role = picked;
+      continue;
+    }
+
+    const pool = getPools()[role] ?? [];
+    // Capture the revision before any await: an edit committed after this point
+    // by another command makes this editor's next write stale, and it refreshes
+    // instead of overwriting.
+    const revision = configRevision;
+    // Announce once per role entry, not after every action, so order and
+    // availability are shown before editing without becoming noise.
+    if (announcedRole !== role) {
+      announcedRole = role;
+      notifyUser(ctx, describeRoleForEditing(role, pool, ctx.models), "info");
+    }
+    const items: { label: string; description?: string; value: string }[] = [
+      { label: "Add model…", description: "append a model to this pool", value: "add" },
+    ];
+    if (pool.length > 0) {
+      items.push({ label: "Remove entry…", value: "remove" });
+      items.push({ label: "Move earlier…", value: "earlier" });
+      items.push({ label: "Move later…", value: "later" });
+      items.push({ label: "Delete pool", description: "remove the role entirely", value: "delete" });
+    }
+    items.push({ label: "Back", description: "choose another role", value: "back" });
+
+    const heading = `@${role} (${pool.length} ${pool.length === 1 ? "entry" : "entries"}) — ${describeSource()}`;
+    const action = await pickLabeled(ctx, heading, items);
+    if (action === undefined || action === "back") {
+      role = "";
+      continue;
+    }
+
+    if (action === "add") {
+      const models = readAuthenticatedModels(ctx);
+      if (models === undefined) {
+        notifyUser(ctx, "model-pool: the model registry is unavailable", "error");
+        continue;
+      }
+      if (models.length === 0) {
+        notifyUser(ctx, "model-pool: no authenticated models are available", "warning");
+        continue;
+      }
+      const chosen = await chooseModel(ctx, models, `Add a model to @${role}`);
+      if (chosen === undefined) continue;
+      // The dialog may outlive the snapshot: re-resolve against the live registry
+      // so a model that lost authentication while the picker was open is not
+      // saved and then reported as added.
+      if (filterAvailable([chosen], ctx.models).eligible[0] !== true) {
+        notifyUser(ctx, `model-pool: ${chosen} is no longer authenticated; not added to @${role}`, "warning");
+        continue;
+      }
+      const outcome = await savePoolEdit(role, [...pool, chosen], revision);
+      reportEditOutcome(ctx, outcome, `added ${chosen} to @${role} (slot ${pool.length + 1})`);
+      continue;
+    }
+
+    if (action === "remove") {
+      const index = await pickSlot(ctx, `Remove an entry from @${role}`, pool);
+      if (index === undefined) continue;
+      const remaining = pool.filter((_, i) => i !== index);
+      if (remaining.length === 0) {
+        const ok = await confirmDialog(
+          ctx,
+          `Delete @${role}?`,
+          "This is the last entry, so the role pool is removed and its spawns fall back to core behavior.",
+        );
+        if (!ok) continue;
+      }
+      const outcome = await savePoolEdit(role, remaining.length === 0 ? null : remaining, revision);
+      reportEditOutcome(
+        ctx,
+        outcome,
+        remaining.length === 0 ? `deleted @${role}` : `removed slot ${index + 1} from @${role}`,
+      );
+      continue;
+    }
+
+    if (action === "earlier" || action === "later") {
+      const index = await pickSlot(ctx, `Move which entry of @${role}?`, pool);
+      if (index === undefined) continue;
+      const target = action === "earlier" ? index - 1 : index + 1;
+      if (target < 0 || target >= pool.length) {
+        notifyUser(ctx, "model-pool: that entry is already at the end of the pool", "warning");
+        continue;
+      }
+      const next = [...pool];
+      const moved = next[index] as string;
+      next[index] = next[target] as string;
+      next[target] = moved;
+      const outcome = await savePoolEdit(role, next, revision);
+      reportEditOutcome(ctx, outcome, `moved ${moved} to slot ${target + 1}`);
+      continue;
+    }
+
+    if (action === "delete") {
+      const ok = await confirmDialog(
+        ctx,
+        `Delete @${role}?`,
+        `The @${role} pool is removed, and its spawns fall back to core behavior.`,
+      );
+      if (!ok) continue;
+      const outcome = await savePoolEdit(role, null, revision);
+      reportEditOutcome(ctx, outcome, `deleted @${role}`);
+      role = "";
+      continue;
+    }
+  }
+}
+
+/**
+ * Human-readable editability of the active source, for `status`/`doctor`.
+ *
+ * `configSource.writable` alone conflates two different outcomes: a
+ * runtime-only source (programmatic options, inline JSON) still accepts edits
+ * into memory, whereas a disabled source (an unreadable file, or one shadowed
+ * by a malformed higher-priority source) refuses them. Operators need to see
+ * which one they have.
+ */
+function sourceStatusLabel(): "writable" | "runtime-only" | "editing disabled" {
+  const mode = editMode();
+  return mode === "file" ? "writable" : mode === "runtime-only" ? "runtime-only" : "editing disabled";
+}
+
+/** `/model-pool status`: read-only summary; never writes. */
+function runStatus(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  const pools = getPools();
+  const roles = Object.keys(pools);
+  const lines = [
+    `config: ${configSource.label} (${configSource.kind}, ${sourceStatusLabel()})`,
+  ];
+  if (configSource.note !== undefined) lines.push(`config note: ${configSource.note}`);
+  lines.push(`main role: @${activeConfig.mainSessionRole} (rotation ${activeConfig.enableMainSessionRotation ? "on" : "off"})`);
+  lines.push(
+    `strict: ${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(", ") || "none" : String(activeConfig.strict)}`,
+  );
+  lines.push(`persistence: ${activeConfig.persistCounters ? activeConfig.stateFile : "off (in-memory counters only)"}`);
+  lines.push(
+    `pools: ${roles.length === 0 ? "none configured" : roles.map((r) => `@${r}[${pools[r]?.length ?? 0}]`).join(", ")}`,
+  );
+  lines.push(`current model: ${currentModelIdentity(ctx) || "unknown"}`);
+  for (const name of roles) {
+    const entries = (pools[name] ?? []).map((selector, index) => `${index + 1}. ${selector}`).join("  ");
+    lines.push(`  @${name}: ${entries}`);
+  }
+  lines.push(`counters (process-local): ${JSON.stringify(getCounters())}`);
+  emit(pi, ctx, lines.join("\n"), "info");
+}
+
+/** `/model-pool doctor`: per-entry diagnosis; read-only. */
+function runDoctor(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  const report = diagnosePools(ctx.models);
+  const lines = [`registry: ${report.registryNote}`];
+  if (report.roles.length === 0) lines.push("no pools configured");
+  for (const role of report.roles) {
+    lines.push(`@${role.role}:`);
+    for (const entry of role.entries) {
+      lines.push(`  ${entry.eligible ? "ok" : "unavailable"}: ${entry.selector} — ${entry.reason}`);
+    }
+  }
+  lines.push(`config: ${configSource.label} (${configSource.kind}, ${sourceStatusLabel()})`);
+  lines.push(`state: ${activeConfig.persistCounters ? activeConfig.stateFile : "persistence off"}`);
+  emit(pi, ctx, lines.join("\n"), "info");
+}
+
+/** `/model-pool help`. */
+function runHelp(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  emit(
+    pi,
+    ctx,
+    [
+      "/model-pool — round-robin model pool",
+      "  (no argument)  open the menu",
+      "  pick           switch the current main-session model",
+      "  edit [role]    add, remove, reorder or delete role pools (auto-saved)",
+      "  status         show the active configuration and pools",
+      "  doctor         per-entry authentication diagnosis (read-only)",
+      "  help           show this help",
+    ].join("\n"),
+    "info",
+  );
+}
+
+/** The no-argument menu. */
+async function runMenu(pi: ExtensionApiLike, ctx: ExtensionContextLike): Promise<void> {
+  if (!hasInteractiveUI(ctx)) {
+    runHelp(pi, ctx);
+    return;
+  }
+  const picked = await pickLabeled(ctx, "Model pool", [
+    { label: "Switch Current Model", description: "change this session's model", value: "pick" },
+    { label: "Edit Role Pools", description: "add, remove, reorder or delete pools", value: "edit" },
+    { label: "Status", description: "show configuration and pools", value: "status" },
+    { label: "Doctor", description: "diagnose model availability", value: "doctor" },
+    { label: "Help", description: "show command usage", value: "help" },
+  ]);
+  if (picked === undefined) return;
+  await dispatchCommand(pi, ctx, picked);
+}
+
+/** Route `/model-pool` arguments. */
+async function dispatchCommand(pi: ExtensionApiLike, ctx: ExtensionContextLike, rawArgs: string): Promise<void> {
+  const args = rawArgs.trim();
+  if (args.length === 0) {
+    await runMenu(pi, ctx);
+    return;
+  }
+  const [head, ...rest] = args.split(/\s+/);
+  const command = (head ?? "").toLowerCase();
+  const tail = rest.join(" ");
+  switch (command) {
+    case "pick":
+      await runModelPicker(pi, ctx);
+      return;
+    case "edit":
+      await runPoolEditor(ctx, tail);
+      return;
+    case "status":
+      runStatus(pi, ctx);
+      return;
+    case "doctor":
+      runDoctor(pi, ctx);
+      return;
+    case "help":
+      runHelp(pi, ctx);
+      return;
+    default:
+      emit(pi, ctx, `unknown argument "${command}"; use /model-pool help`, "warning");
+  }
+}
+
+/** Register `/model-pool` if the host supports commands; never fatal. */
+function registerCommandSurface(pi: ExtensionApiLike): void {
+  if (typeof pi.registerCommand !== "function") {
+    safeLog(
+      pi,
+      "warn",
+      "[model-pool] host exposes no registerCommand; /model-pool is unavailable (pool rotation is unaffected)",
+    );
+    return;
+  }
+  try {
+    pi.registerCommand(COMMAND_NAME, {
+      description: "Round-robin model pool: switch the current model or edit role pools",
+      handler: (args, ctx) => dispatchCommand(pi, ctx, args),
+    });
+    safeLog(pi, "info", `[model-pool] registered /${COMMAND_NAME}`);
+  } catch (err) {
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] could not register /${COMMAND_NAME}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extension factory (default export; OMP calls it with the ExtensionAPI).
 // ---------------------------------------------------------------------------
 
-/** Extension factory: load configuration and register both event handlers. */
+/**
+ * Extension factory: load configuration, register both event handlers, then
+ * register the optional command surface.
+ *
+ * Programmatic `options` are an unconditional replacement and are runtime-only.
+ * Without options the environment/default source is loaded; when the factory is
+ * re-bound to a child session with the *same* source it deliberately keeps any
+ * runtime edits instead of resetting to the on-disk document.
+ */
 export default function modelPoolExtension(pi: ExtensionApiLike, options?: ModelPoolConfig): void {
   if (options !== undefined) {
-    configurePools(options);
+    const normalized = normalizeConfig(options);
+    const signature = `options:${optionsSignature(normalized)}`;
+    // Same guard as the environment source: a re-bind for a child session with
+    // identical options must not discard runtime-only edits made since.
+    if (signature !== loadedSignature) {
+      applyNormalized(normalized);
+      configSource = {
+        kind: "options",
+        writable: false,
+        label: "programmatic options",
+        note: "runtime-only: options cannot be rewritten",
+      };
+      configShape = "none";
+      configFingerprint = undefined;
+      configRevision += 1;
+      loadedSignature = signature;
+    }
   } else {
-    configurePools(loadConfigFromEnv());
+    const loaded = loadConfigWithSource();
+    const signature = sourceSignature(loaded);
+    if (signature !== loadedSignature) {
+      configureLoaded(loaded);
+      loadedSignature = signature;
+      for (const warning of loaded.warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
+    }
   }
 
   const roles = Object.keys(activeConfig.pools);
   safeLog(
     pi,
     "info",
-    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"}`,
+    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"} source=${configSource.kind}`,
   );
 
+  // Routing hooks are registered first and independently of the command
+  // surface: a host that cannot register commands must still rotate pools.
   pi.on("before_subagent_spawn", (event, ctx) =>
     handleBeforeSubagentSpawn(pi, event as BeforeSubagentSpawnEvent, ctx as ExtensionContextLike),
   );
   pi.on("session_start", (event, ctx) =>
     handleSessionStart(pi, event as SessionStartEvent, ctx as ExtensionContextLike),
   );
+
+  registerCommandSurface(pi);
 }
