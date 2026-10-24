@@ -272,6 +272,21 @@ describe("configuration precedence and provenance", () => {
       "a disabled source is never mislabelled 'runtime-only'",
     );
   });
+
+  it("A10: a nested document whose pools value is not an object disables editing", async () => {
+    const file = path.join(freshDir(), "badpools.json");
+    writeText(file, '{ "pools": [] }\n');
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi, logs } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().writable, false);
+    assert.ok(warns(logs).some((m) => m.includes('"pools" key must be a JSON object')));
+
+    const before = fs.readFileSync(file, "utf8");
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.equal(outcome.ok, false, "a document we cannot understand must not be edited");
+    assert.equal(fs.readFileSync(file, "utf8"), before, "the malformed document is left untouched");
+  });
 });
 
 describe("default-file discovery and no-write-on-load", () => {
@@ -511,6 +526,70 @@ describe("automatic save transactions", () => {
     assert.deepEqual(outcome, { ok: true, runtimeOnly: true });
     assert.deepEqual(mod.getPools().slow, ["p/a", "p/b"]);
     assert.equal(fs.existsSync(mod.resolveDefaultConfigFilePath()), false);
+  });
+
+  it("C19b: a state file aliasing the config lock path is refused", async () => {
+    const file = path.join(freshDir(), "lockalias.json");
+    const doc = { pools: { slow: ["p/a"] }, stateFile: `${file}.lock`, persistCounters: true };
+    writeJson(file, doc);
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /state file/);
+    assert.deepEqual(readJson(file), doc, "the config file is left untouched");
+  });
+
+  it("C21: deleting a role removes an alias key written as '@role'", async () => {
+    const file = path.join(freshDir(), "alias.json");
+    writeJson(file, { pools: { "@slow": ["p/a"], fast: ["p/b"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+    // The engine reads '@slow' and 'slow' as the same role.
+    assert.deepEqual(mod.getPools()["slow"], ["p/a"]);
+
+    const outcome = await mod.savePoolEdit("slow", null);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    assert.deepEqual(
+      readJson(file).pools,
+      { fast: ["p/b"] },
+      "the '@slow' key is removed, not left behind to reappear on reload",
+    );
+  });
+
+  it("C22: a role literally named __proto__ is saved as a JSON property", async () => {
+    const file = path.join(freshDir(), "proto.json");
+    process.env.OMP_MODEL_POOL_CONFIG = file; // missing: created on the first save
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("__proto__", ["p/a"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    const doc = readJson(file);
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(doc.pools, "__proto__"),
+      "the role is stored as an own data property, not routed to the prototype",
+    );
+    assert.deepEqual(doc.pools["__proto__"], ["p/a"]);
+  });
+
+  it("C23: concurrent edits from the same revision cannot both commit", async () => {
+    const file = path.join(freshDir(), "concurrent.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+    const revision = mod.getConfigRevision();
+
+    const [first, second] = await Promise.all([
+      mod.savePoolEdit("slow", ["p/a", "p/b"], revision),
+      mod.savePoolEdit("fast", ["p/c"], revision),
+    ]);
+    const committed = [first, second].filter((r) => r.ok).length;
+    assert.equal(committed, 1, `exactly one concurrent edit may commit; got ${JSON.stringify([first, second])}`);
   });
 });
 

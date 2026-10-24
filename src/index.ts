@@ -481,6 +481,16 @@ function readJsonFileWithReason(file: string): JsonFileRead {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, missing: false, reason: "not a JSON object" };
   }
+  // A nested document must hold an object under `pools`. Accepting an array,
+  // string, number or null there would let a later edit overwrite it, silently
+  // destroying a document we do not actually understand.
+  const doc = value as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(doc, "pools")) {
+    const pools = doc["pools"];
+    if (pools === null || typeof pools !== "object" || Array.isArray(pools)) {
+      return { ok: false, missing: false, reason: 'the "pools" key must be a JSON object' };
+    }
+  }
   return { ok: true, value, fingerprint: fingerprintText(raw) };
 }
 
@@ -991,6 +1001,25 @@ function applyPoolChange(roleKey: string, selectors: string[] | null): void {
   activeConfig.pools = pools;
 }
 
+/**
+ * Own-property copy onto a null-prototype object, so a role literally named
+ * `__proto__` is stored as data instead of mutating a prototype.
+ */
+function copyOwnProperties(source: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.create(null);
+  if (source !== null && typeof source === "object" && !Array.isArray(source)) {
+    for (const [k, v] of Object.entries(source as Record<string, unknown>)) out[k] = v;
+  }
+  return out;
+}
+
+/** Drop keys that normalize to `roleKey` but are written differently (`"@slow"`, padded). */
+function dropAliasKeys(target: Record<string, unknown>, roleKey: string): void {
+  for (const key of Object.keys(target)) {
+    if (key !== roleKey && normalizeRoleKey(key) === roleKey) delete target[key];
+  }
+}
+
 /** Build the document to write, preserving unrelated keys and the source shape. */
 function buildDocument(
   roleKey: string,
@@ -998,20 +1027,17 @@ function buildDocument(
   shape: "nested" | "flat" | "none",
   rawDoc: unknown,
 ): Record<string, unknown> {
-  const base: Record<string, unknown> =
-    rawDoc !== null && typeof rawDoc === "object" && !Array.isArray(rawDoc)
-      ? { ...(rawDoc as Record<string, unknown>) }
-      : {};
+  const base = copyOwnProperties(rawDoc);
   if (shape === "flat") {
+    dropAliasKeys(base, roleKey);
     if (selectors === null) delete base[roleKey];
     else base[roleKey] = selectors;
     return base;
   }
-  const rawPools = base["pools"];
-  const pools: Record<string, unknown> =
-    rawPools !== null && typeof rawPools === "object" && !Array.isArray(rawPools)
-      ? { ...(rawPools as Record<string, unknown>) }
-      : {};
+  const pools = copyOwnProperties(base["pools"]);
+  // Match the role as the active config knows it, so deleting `@slow` removes the
+  // document's `"@slow"` key rather than leaving it to reappear on the next load.
+  dropAliasKeys(pools, roleKey);
   if (selectors === null) delete pools[roleKey];
   else pools[roleKey] = selectors;
   // Keep the `pools` key even when it is empty. Dropping it would make the next
@@ -1085,16 +1111,28 @@ export async function savePoolEdit(
     return { ok: false, error: "pool editing is disabled: the configuration source has no writable path" };
   }
 
-  if (samePath(file, activeConfig.stateFile) || samePath(file, `${activeConfig.stateFile}.lock`)) {
+  if (
+    samePath(file, activeConfig.stateFile) ||
+    samePath(file, `${activeConfig.stateFile}.lock`) ||
+    // The reverse alias: a state file set to `<config>.lock` would make this
+    // save treat the state path as its lock directory.
+    samePath(activeConfig.stateFile, `${file}.lock`)
+  ) {
     return { ok: false, error: `refusing to write pool config over the counter state file (${file})` };
   }
 
   // A brand-new default file has no fingerprint yet; anything already on disk
   // must match the fingerprint captured when the source was loaded.
   const expectedFingerprint = configSource.kind === "none" ? undefined : configFingerprint;
+  const revisionAtStart = configRevision;
   let fingerprintConflict = false;
   try {
     await withFileLock(file, () => {
+      // Re-check under the lock: a concurrent edit (or `configurePools`) that
+      // committed while this call waited must not be overwritten by a stale one.
+      if (configRevision !== revisionAtStart) {
+        throw new Error("the configuration changed while this edit waited for the file lock; reopen the editor");
+      }
       const current = readJsonFileWithReason(file);
       if (!current.ok && !current.missing) throw new Error(current.reason);
       const currentFingerprint = current.ok ? current.fingerprint : undefined;
@@ -1109,6 +1147,11 @@ export async function savePoolEdit(
       if (configSource.kind === "none") {
         configSource = { kind: "default-file", path: file, writable: true, label: file };
       }
+      // Commit the in-memory change inside the lock, so a second save that
+      // passed the pre-lock revision check sees the bumped revision and refuses
+      // instead of overwriting this write.
+      applyPoolChange(roleKey, next);
+      configRevision += 1;
     });
   } catch (err) {
     if (fingerprintConflict) {
@@ -1118,8 +1161,6 @@ export async function savePoolEdit(
     }
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
-  applyPoolChange(roleKey, next);
-  configRevision += 1;
   return { ok: true, runtimeOnly: false };
 }
 
@@ -2025,6 +2066,13 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
       }
       const chosen = await chooseModel(ctx, models, `Add a model to @${role}`);
       if (chosen === undefined) continue;
+      // The dialog may outlive the snapshot: re-resolve against the live registry
+      // so a model that lost authentication while the picker was open is not
+      // saved and then reported as added.
+      if (filterAvailable([chosen], ctx.models).eligible[0] !== true) {
+        notifyUser(ctx, `model-pool: ${chosen} is no longer authenticated; not added to @${role}`, "warning");
+        continue;
+      }
       const outcome = await savePoolEdit(role, [...pool, chosen], revision);
       reportEditOutcome(ctx, outcome, `added ${chosen} to @${role} (slot ${pool.length + 1})`);
       continue;

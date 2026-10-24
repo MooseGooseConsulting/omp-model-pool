@@ -351,6 +351,24 @@ describe("/model-pool edit", () => {
     assert.deepEqual(counters(), {});
   });
 
+  it("re-checks membership before saving a newly chosen model", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const models = host.models(["p/a", "p/b"]);
+    // Still listed (so the dialog offers it), but the registry no longer resolves
+    // it: the model lost authentication while the picker was open.
+    models.resolve = () => undefined;
+    host.pushSelect("Add model…");
+    host.pushSelect("p/b");
+    await runCommand(host, "edit slow", host.mainCtx(models));
+
+    assert.deepEqual(pools(), { slow: ["p/a"] }, "a model that lost authentication is not saved");
+    assert.ok(
+      host.notified.some(([msg, type]) => type === "warning" && msg.includes("no longer authenticated")),
+      "the stale selection is reported, not silently added",
+    );
+  });
+
   it("removes a slot", async () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } });

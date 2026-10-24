@@ -199,7 +199,7 @@ Corrected evidence, run 2026-10-23 against the installed `omp v18.12.6`:
 
 Headless-spawn finding, superseded by the owner's interactive session on the same day: that spawn authenticated only Devin (`DEVIN_API_KEY` set, `KILO_API_KEY` unset), so `ctx.models.list()` held 635 models with no Kilo entry, `current()` was empty, `resolve()` failed for the configured Kilo free routes, and `doctor` reported them `unavailable — unresolved` while the main session stayed on the pinned model. It was the **spawn environment, not the mode**, that was unauthenticated.
 
-The owner's real session reports `registry readable, 1429 authenticated model(s)` and every entry in `@default`, `@slow` and `@task` as `ok ... authenticated as kilo/...:free`, with `config: C:\Users\pmacl\.omp\model-pool.json (file-env, writable)` and `state: ...\agent\model-pool-state.json`. The pool is live and eligible there, automatic saves target that file, and counters persist across processes. Print mode rotates the same routes (the live suite above); the earlier RPC observation should be read as headless-spawn isolation, not as a defect.
+The owner's real session reports `registry readable, 1429 authenticated model(s)` and every entry in `@default`, `@slow` and `@task` as `ok ... authenticated as kilo/...:free`, with `config: <OMP agent dir>/model-pool.json (file-env, writable)` and `state: <OMP agent dir>/model-pool-state.json`. The pool is live and eligible there, automatic saves target that file, and counters persist across processes. Print mode rotates the same routes (the live suite above); the earlier RPC observation should be read as headless-spawn isolation, not as a defect.
 
 ### Review findings integrated
 
@@ -246,3 +246,18 @@ CodeRabbit additionally requested that `status`/`doctor` distinguish a disabled 
 Gate after this batch: `npm run typecheck` clean, `npm test` **114/114**.
 
 Merge state at the time of this record: PR #11 was `CHANGES_REQUESTED` (CodeRabbit). With the diagnostics fix above applied and pushed, the outstanding request is addressed; the PR clears when CodeRabbit re-reviews the new head.
+
+### Third review round (rereview findings on the new head)
+
+After the fixes above were pushed, CodeRabbit approved the PR (`reviewDecision` cleared). The PR remained blocked by the organization ruleset, which requires every review thread resolved; Codex and CodeAnt had left open threads, several still valid. Those were remediated:
+
+1. **Nested document with a non-object `pools` value** (`{ "pools": [] }`, `"x"`, `null`). `readJsonFileWithReason` accepted any JSON object, so an edit replaced the value and silently destroyed it. Now rejected as an unusable source (editing disabled, document untouched). Test `A10`.
+2. **Role-key aliases** (`"@slow"`, padded keys). Deleting `slow` left `"@slow"` on disk, which reappeared on the next load; memory and disk disagreed. `buildDocument` now matches keys by `normalizeRoleKey`. Test `C21`.
+3. **`__proto__` as a role name.** Assignment on a normal object changed the prototype instead of storing a property. `buildDocument` now copies onto null-prototype objects. Test `C22`.
+4. **Concurrent same-revision saves.** The revision was checked before the lock but committed after it, so two overlapping edits could both succeed and the second overwrote the first. `savePoolEdit` now re-checks the revision under the lock and commits the in-memory change and revision bump inside the locked transaction. Test `C23`.
+5. **State file aliasing the config lock path** (`stateFile === <config>.lock`). The collision guard missed the reverse alias. Now rejected. Test `C19b`.
+6. **Stale model selection.** The Add-model dialog could outlive the registry snapshot; a model that lost authentication was saved and reported as added. The editor now re-resolves the chosen model before saving. Test in `commands.test.mjs`.
+
+Also genericized the owner-specific paths in the verification record above.
+
+Gate after this batch: `npm run typecheck` clean, `npm test` **120/120**. All open review threads on these findings were resolved with a summary comment.
