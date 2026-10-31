@@ -12,7 +12,7 @@
 //     from each other. Pinning also guarantees no unconfigured model is called.
 //
 // Anything unproven is reported as skipped with the reason, never as a pass.
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -159,20 +159,24 @@ async function main() {
   );
 
   const poolConfig = {
-    pools: { default: [routeB, routeA], slow: [routeB, routeA] },
+    pools: { main: [routeB, routeA], review: [routeB, routeA] },
     persistCounters: true,
-    enableMainSessionRotation: true,
-    mainSessionRole: "default",
   };
-  const isolated = createIsolatedEnv({ poolConfig, repoRoot, label: "main-rotation" });
+  const isolated = createIsolatedEnv({ poolConfig, repoRoot, label: "pool-models" });
+  // Opt the `slow` role into a pool the way an operator does: by selecting the
+  // pool's model. The bundled `reviewer` declares `model: ["@slow"]`.
+  appendFileSync(isolated.overlayFile, ["modelRoles:", "  slow: pool/review", ""].join("\n"), "utf8");
   const prompt = "Reply with exactly: OK";
 
   try {
-    // --- main-session rotation across two fresh processes -------------------
+    // --- a fresh main session on pool/main, across two fresh processes ------
+    // Each run starts on `pool/main`, which is not a real model, so a pass
+    // requires the extension to switch the session to a member before its
+    // first turn, and the two runs must land on different members.
     const expected = [routeB, routeA];
     for (let i = 0; i < expected.length; i += 1) {
       const res = await runOmp(
-        [...isolated.ompArgs, "--model", pin, "--no-tools", "-p", prompt],
+        [...isolated.ompArgs, "--model", "pool/main", "--no-tools", "-p", prompt],
         { cwd: isolated.workDir, env: isolated.env, timeoutMs: 240_000 },
       );
       if (res.timedOut) {
@@ -239,12 +243,12 @@ async function main() {
       record("resuming does not re-rotate the main model", "skip", `exit ${second.code}`);
     }
 
-    // --- role rotation: one real subagent bound to an unpinned role --------
-    // The bundled `reviewer` agent declares `model: ["@slow"]`, so spawning it
-    // routes the `slow` pool. The trigger is model-driven — OMP exposes no
-    // "spawn agent X" command — so a parent that declines to delegate reports
-    // skip, never pass. The assertion is not model-dependent: the child's own
-    // transcript records the model that actually ran.
+    // --- a role set to pool/review: one real subagent ---------------------
+    // The bundled `reviewer` agent declares `model: ["@slow"]`, and the overlay
+    // sets `slow: pool/review`, so spawning it routes that pool. The trigger is
+    // model-driven — OMP exposes no "spawn agent X" command — so a parent that
+    // declines to delegate reports skip, never pass. The assertion is not
+    // model-dependent: the child's own transcript records the model that ran.
     const delegate = await runOmp(
       [
         ...isolated.ompArgs,
@@ -261,7 +265,7 @@ async function main() {
     let roleRotated = false;
     if (delegate.code !== 0 || childSessions.length === 0) {
       record(
-        "subagent on an unpinned role runs on the role pool",
+        "subagent on a role set to pool/review runs on the pool",
         "skip",
         delegate.code !== 0
           ? `parent exited ${delegate.code}; no delegation observed`
@@ -280,40 +284,39 @@ async function main() {
       const ok = inPool.length > 0 && outside.length === 0;
       roleRotated = ok;
       record(
-        "subagent on an unpinned role runs on the role pool",
+        "subagent on a role set to pool/review runs on the pool",
         ok ? "pass" : "fail",
         childModels.length === 0
           ? "no free-route subagent turn found"
           : outside.length > 0
-            ? `subagent ran outside the role pool: ${outside.join(", ")}`
-            : `${inPool.length} subagent turn(s), all on the role pool (${[...new Set(inPool)].join(", ")}); the reviewer can nest a scout spawn, so the count is not fixed`,
+            ? `subagent ran outside the pool: ${outside.join(", ")}`
+            : `${inPool.length} subagent turn(s), all on the pool (${[...new Set(inPool)].join(", ")}); the reviewer can nest a scout spawn, so the count is not fixed`,
       );
     }
 
-    // `default` is exact: three fresh main sessions (run 1, run 2, and the
-    // delegation run) over a two-entry pool is 0->1->0->1, and that holds
-    // whether or not the parent delegated.
+    // `main` is exact: two fresh sessions on pool/main over a two-entry pool is
+    // 0->1->0. The delegation run's parent is pinned to a real model, so it
+    // must not have advanced the counter.
     //
-    // `slow` is conditional, not merely presence-only. It proves the role path
-    // persisted, which a schema-marker check could not show - but demanding it
-    // unconditionally failed the run where the parent declined to delegate, and
-    // then no role rotation could have happened. Its value is never asserted:
-    // the reviewer nests a scout spawn, so the count is not fixed.
+    // `review` is conditional, not merely presence-only. It proves the spawn
+    // path persisted, but demanding it unconditionally failed the run where the
+    // parent declined to delegate. Its value is never asserted: the reviewer
+    // nests a scout spawn, so the count is not fixed.
     let counters;
     try {
       counters = JSON.parse(readFileSync(isolated.stateFile, "utf8")).counters;
     } catch {
       counters = undefined;
     }
-    const mainOk = counters !== undefined && counters.default === 1;
-    const roleOk = !roleRotated || (counters !== undefined && counters.slow !== undefined);
+    const mainOk = counters !== undefined && counters.main === 0;
+    const roleOk = !roleRotated || (counters !== undefined && counters.review !== undefined);
     const countersOk = mainOk && roleOk;
     record(
-      "main counter exact, role counter persisted when a role spawn happened",
+      "main counter exact, review counter persisted when a pool spawn happened",
       countersOk ? "pass" : "fail",
       countersOk
-        ? `counters ${JSON.stringify(counters)}${roleRotated ? "" : " (no delegation, so no role key expected)"}`
-        : `expected default=1${roleRotated ? " and a slow key (a role spawn was observed)" : ""}, got ${JSON.stringify(counters ?? "unreadable state")}`,
+        ? `counters ${JSON.stringify(counters)}${roleRotated ? "" : " (no delegation, so no review key expected)"}`
+        : `expected main=0${roleRotated ? " and a review key (a pool spawn was observed)" : ""}, got ${JSON.stringify(counters ?? "unreadable state")}`,
     );
   } finally {
     const afterHashes = hashOwnerConfig();

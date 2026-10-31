@@ -1,16 +1,14 @@
 {
   "pools": {
-    "slow": [
-      "anthropic/claude-haiku-4-5",
-      "openai/gpt-5-mini"
+    "cheap-coders": [
+      "litellm/bloodarrow-deepseek",
+      "isoquant/glm-5.3-flash"
     ],
-    "default": [
+    "reviewers": [
       "anthropic/claude-sonnet-4-6",
       "openai/gpt-5.2"
     ]
   },
-  "mainSessionRole": "default",
   "strict": false,
-  "enableMainSessionRotation": true,
   "persistCounters": false
 }

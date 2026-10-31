@@ -1,7 +1,7 @@
 {
   "name": "omp-model-pool",
   "version": "0.1.0",
-  "description": "Per-role round-robin model cycling for oh-my-pi subagent spawns (and opt-in main-session rotation).",
+  "description": "Round-robin model pools for oh-my-pi, selected like models (pool/<name>) in /model, role settings, or --model.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

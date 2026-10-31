@@ -3,7 +3,7 @@
 // `dist/index.js` is imported as built; `node --test` runs this file in its own
 // process, so the module-level configuration state is per-file. Assertions are
 // about real behaviour (`getPools`, `getCounters`, the object handed to
-// `setModel`), not log text alone.
+// `setModel`, the provider handed to `registerProvider`), not log text alone.
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -41,8 +41,8 @@ let tmpDir;
 beforeEach(() => {
   savedEnv = new Map(ENV_KEYS.map((k) => [k, process.env[k]]));
   for (const k of ENV_KEYS) delete process.env[k];
-  // Nothing in these tests writes config, but isolating the agent dir keeps any
-  // default-file read away from the operator's real ~/.omp.
+  // Nothing in these tests writes config unless it opts in, but isolating the
+  // agent dir keeps any default-file read away from the operator's real ~/.omp.
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cmd-"));
   process.env.PI_CODING_AGENT_DIR = tmpDir;
   mod.resetCounters();
@@ -60,16 +60,16 @@ function runCommand(host, args, ctx) {
   return host.command.options.handler(args, ctx);
 }
 
+// The spawn contract: only `patterns[0]` is inspected, and it must name a pool.
 const SLOW_EVENT = {
   type: "before_subagent_spawn",
   agent: "reviewer",
   invocationKind: "task",
-  modelRole: "@slow",
-  patterns: ["@slow"],
+  patterns: ["pool/slow"],
 };
 
 describe("command registration", () => {
-  it("registers /model-pool and both routing hooks", () => {
+  it("registers /model-pool, both routing hooks, and the pool provider", () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } });
 
@@ -79,9 +79,18 @@ describe("command registration", () => {
     assert.equal(typeof host.command.options.handler, "function");
     assert.equal(typeof host.handlers.before_subagent_spawn, "function");
     assert.equal(typeof host.handlers.session_start, "function");
+
+    // Each pool is published as the model `pool/<name>`.
+    assert.equal(mod.POOL_PROVIDER, "pool");
+    const published = host.providers.filter(([name]) => name === mod.POOL_PROVIDER);
+    assert.equal(published.length, 1, "the pool provider was registered once");
+    assert.deepEqual(
+      published[0][1].models.map((model) => model.id),
+      ["slow"],
+    );
   });
 
-  it("survives a missing registerCommand and still routes a pool pick", () => {
+  it("survives a missing registerCommand and still routes a pool pick", async () => {
     const host = createFakeHost({ registerCommand: false });
     assert.doesNotThrow(() => mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } }));
 
@@ -94,8 +103,10 @@ describe("command registration", () => {
     assert.equal(typeof host.handlers.session_start, "function");
 
     const models = host.models(["p/a", "p/b"]);
-    const result = host.handlers.before_subagent_spawn(SLOW_EVENT, host.subCtx(models));
-    assert.equal(result.model, "p/a");
+    const result = await host.handlers.before_subagent_spawn(SLOW_EVENT, host.subCtx(models));
+    assert.equal(result.model[0], "p/a");
+    assert.deepEqual(result.model, ["p/a", "p/b"], "the rest of the pool becomes the retry chain");
+    assert.match(result.note, /^pool\/slow\[1\/2\]: p\/a$/);
     assert.equal(counters().slow, 1);
   });
 
@@ -110,6 +121,21 @@ describe("command registration", () => {
     );
     assert.equal(typeof host.handlers.before_subagent_spawn, "function");
     assert.equal(typeof host.handlers.session_start, "function");
+  });
+
+  it("still routes pools when the host cannot register providers", async () => {
+    const host = createFakeHost({ registerProvider: false });
+    assert.doesNotThrow(() => mod.default(host.pi, { pools: { slow: ["p/a"] } }));
+    assert.ok(
+      host.logs.some(([level, msg]) => level === "warn" && msg.includes("cannot register providers")),
+      "the missing provider capability is reported once",
+    );
+
+    const result = await host.handlers.before_subagent_spawn(
+      SLOW_EVENT,
+      host.subCtx(host.models(["p/a"])),
+    );
+    assert.deepEqual(result.model, ["p/a"]);
   });
 });
 
@@ -163,6 +189,23 @@ describe("/model-pool pick", () => {
 
     assert.ok(host.notified.some(([msg]) => msg.includes("already using p/a")));
     assert.deepEqual(host.setModels, []);
+  });
+
+  it("offers a pool model as the current one and can switch away from it", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } });
+    // The session is running on the pool's own model; the registry only lists
+    // the real members, so the pool id itself is not a selectable candidate.
+    const models = host.models(["p/a", "p/b"], { provider: "pool", id: "slow" });
+    host.pi.setModel = async (model) => {
+      host.setModels.push(model);
+      models.setCurrent({ provider: model.provider, id: model.id });
+    };
+    host.pushSelect("p/b");
+    await runCommand(host, "pick", host.mainCtx(models));
+
+    assert.deepEqual(host.setModels, [{ provider: "p", id: "b" }]);
+    assert.ok(host.notified.some(([msg]) => msg.includes("switched to p/b")));
   });
 
   it("applies the resolved model on success and mutates nothing else", async () => {
@@ -289,12 +332,12 @@ describe("/model-pool unknown argument", () => {
 });
 
 describe("/model-pool edit", () => {
-  it("creates a role, adds a model, and reports runtime-only without touching counters", async () => {
+  it("creates a pool, adds a model, and reports runtime-only without touching counters", async () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: {} });
     const models = host.models(["p/a", "p/b"]);
 
-    host.pushSelect("New role…");
+    host.pushSelect("New pool…");
     host.pushInput("slow");
     host.pushSelect("Add model…");
     host.pushSelect("p/a");
@@ -306,6 +349,25 @@ describe("/model-pool edit", () => {
     assert.deepEqual(counters(), {});
   });
 
+  it("re-publishes the pool provider after a new pool is created", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: {} });
+    assert.deepEqual(host.registeredModels(mod.POOL_PROVIDER), [], "nothing is published for zero pools");
+
+    host.pushSelect("New pool…");
+    host.pushInput("slow");
+    host.pushSelect("Add model…");
+    host.pushSelect("p/a");
+    await runCommand(host, "edit", host.mainCtx(host.models(["p/a"])));
+
+    const ids = host.registeredModels(mod.POOL_PROVIDER).map((model) => model.id);
+    assert.deepEqual(ids, ["slow"], "the host received a model list containing the new pool");
+    assert.ok(
+      host.providers.some(([name]) => name === mod.POOL_PROVIDER),
+      "registerProvider was called with the pool provider",
+    );
+  });
+
   it("shows the configured order, availability and counter policy before editing", async () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: { slow: ["p/a", "p/missing"] } });
@@ -315,7 +377,8 @@ describe("/model-pool edit", () => {
     await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
 
     const summary = host.notified.map(([msg]) => msg).find((msg) => msg.includes("order:"));
-    assert.ok(summary, "the editor announces the role before offering actions");
+    assert.ok(summary, "the editor announces the pool before offering actions");
+    assert.ok(summary.includes("pool/slow"), "the summary names the pool as a model id");
     assert.ok(summary.includes("1. p/a (available)"));
     assert.ok(summary.includes("2. p/missing (unavailable: unresolved)"));
     assert.ok(summary.includes("counters are process-local"));
@@ -325,19 +388,62 @@ describe("/model-pool edit", () => {
     assert.deepEqual(pools(), { slow: ["p/a", "p/missing"] });
   });
 
-  it("explains that a new role pool does not create an OMP core role", async () => {
+  it("lists configured pools by their pool/<name> model id", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } });
+    host.pushSelect("Back"); // top-level list: cancel
+
+    await runCommand(host, "edit", host.mainCtx(host.models(["p/a"])));
+
+    const [, options] = host.calls.select[0];
+    const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+    assert.ok(labels.includes("pool/slow"), "the pool appears under the id it is selected with");
+    assert.ok(labels.includes("New pool…"));
+  });
+
+  it("explains that a new pool applies only where it is selected", async () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: {} });
-    host.pushSelect("New role…");
+    host.pushSelect("New pool…");
     host.pushInput("slow");
     host.pushSelect("Back");
 
     await runCommand(host, "edit", host.mainCtx(host.models(["p/a"])));
 
     assert.ok(
-      host.notified.some(([msg]) => msg.includes("does not create or assign an OMP core role")),
+      host.notified.some(([msg]) => msg.includes("pool/slow takes effect only where you select it")),
+      "the operator is told the pool is not auto-applied to a role",
     );
-    assert.deepEqual(pools(), {}, "entering a new role name must not create a pool by itself");
+    assert.deepEqual(pools(), {}, "entering a new pool name must not create a pool by itself");
+  });
+
+  it("rejects an invalid pool name and leaves the file untouched", async () => {
+    const configPath = path.join(tmpDir, "model-pools.json");
+    const original = `${JSON.stringify({ pools: { slow: ["p/a"] } }, null, 2)}\n`;
+    fs.writeFileSync(configPath, original);
+    process.env.OMP_MODEL_POOL_CONFIG = configPath;
+
+    const host = createFakeHost();
+    mod.default(host.pi);
+    assert.equal(mod.getConfigSource().writable, true, "the temp config is the writable source");
+
+    // The editor refuses the name up front...
+    host.pushSelect("New pool…");
+    host.pushInput("__proto__");
+    await runCommand(host, "edit", host.mainCtx(host.models(["p/a"])));
+
+    assert.ok(
+      host.notified.some(([msg, type]) => type === "warning" && msg.includes("a pool name needs")),
+      "an invalid name is reported instead of accepted",
+    );
+    assert.deepEqual(pools(), { slow: ["p/a"] });
+
+    // ...and the save path refuses it too, without rewriting the document.
+    const outcome = await mod.savePoolEdit("__proto__", ["p/a"]);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /cannot be a pool name/);
+    assert.equal(fs.readFileSync(configPath, "utf8"), original, "the config file is unchanged");
+    assert.deepEqual(pools(), { slow: ["p/a"] });
   });
 
   it("adds a model to an existing pool", async () => {
@@ -402,6 +508,11 @@ describe("/model-pool edit", () => {
     assert.equal(host.calls.confirm.length, 1);
     assert.ok(host.notified.some(([msg]) => msg.includes("runtime-only")));
     assert.deepEqual(counters(), {});
+    assert.deepEqual(
+      host.registeredModels(mod.POOL_PROVIDER),
+      [],
+      "the deleted pool is not left published as a model",
+    );
   });
 
   it("leaves pools unchanged when the editor is cancelled", async () => {
@@ -410,7 +521,7 @@ describe("/model-pool edit", () => {
     await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
 
     assert.deepEqual(pools(), { slow: ["p/a"] });
-    assert.equal(host.calls.select.length, 2, "the role action and the role list were both cancelled");
+    assert.equal(host.calls.select.length, 2, "the pool action and the pool list were both cancelled");
     assert.equal(host.calls.confirm.length, 0);
   });
 
@@ -451,6 +562,23 @@ describe("/model-pool edit", () => {
   });
 });
 
+describe("/model-pool menu", () => {
+  it("routes the Edit Pools menu item into the pool editor", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    host.pushSelect("Edit Pools");
+    host.pushSelect("Back"); // leave the pool list
+
+    await runCommand(host, "", host.mainCtx(host.models(["p/a"])));
+
+    assert.equal(host.calls.select.length, 2, "the menu then the pool list were shown");
+    const [, options] = host.calls.select[1];
+    const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+    assert.ok(labels.includes("pool/slow"));
+    assert.deepEqual(pools(), { slow: ["p/a"] }, "opening and leaving the editor changes nothing");
+  });
+});
+
 describe("/model-pool status, doctor, help", () => {
   it("emit output through the logger and mutate nothing", async () => {
     const host = createFakeHost();
@@ -465,7 +593,52 @@ describe("/model-pool status, doctor, help", () => {
 
     assert.ok(host.logs.some(([level, msg]) => level === "info" && msg.includes("[model-pool]")));
     assert.ok(host.notified.length >= 3);
+
+    const text = host.notified.map(([msg]) => msg).join("\n");
+    assert.ok(text.includes("pool/slow[2]"), "status names the pool by its model id and size");
+    assert.ok(/\bpool\/slow:/.test(text), "doctor lists the pool");
+    assert.ok(text.includes("unavailable: p/missing — unresolved"), "doctor diagnoses each entry");
+    assert.ok(!/main role/i.test(text), "the retired main-role notion is gone");
+    assert.ok(text.includes("edit [pool]"), "help documents the pool argument");
+
     assert.deepEqual(pools(), beforePools);
     assert.deepEqual(counters(), beforeCounters);
+  });
+
+  it("reports the tiered diagnosis for every pool", () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/missing"], fast: ["p/a"] } });
+
+    const report = mod.diagnosePools(host.models(["p/a"]));
+
+    assert.equal(report.registryReadable, true);
+    assert.match(report.registryNote, /1 authenticated model/);
+    assert.deepEqual(report.pools, [
+      { pool: "slow", entries: [
+        { selector: "p/a", eligible: true, reason: "authenticated as p/a" },
+        { selector: "p/missing", eligible: false, reason: "unresolved" },
+      ] },
+      { pool: "fast", entries: [{ selector: "p/a", eligible: true, reason: "authenticated as p/a" }] },
+    ]);
+  });
+
+  it("diagnoses an unreadable registry without claiming entries", () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const broken = {
+      list: () => {
+        throw new Error("registry down");
+      },
+      current: () => undefined,
+      resolve: () => undefined,
+    };
+
+    const report = mod.diagnosePools(broken);
+
+    assert.equal(report.registryReadable, false);
+    assert.match(report.registryNote, /registry read failed: registry down/);
+    assert.deepEqual(report.pools[0].entries, [
+      { selector: "p/a", eligible: false, reason: "unresolved" },
+    ]);
   });
 });
