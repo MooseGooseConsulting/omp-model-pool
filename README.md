@@ -53,14 +53,27 @@ Only roles you configure cycle.
 Flat shorthand (`{ "slow": [...] }`) is also accepted. Sources, in precedence
 order:
 
-1. Programmatic `options` passed to the factory (tests / hosts).
-2. `OMP_MODEL_POOLS_JSON` — inline JSON (object with `pools` or flat map).
-3. `OMP_MODEL_POOL_CONFIG` — path to a JSON file as above.
+1. Programmatic `options` passed to the factory (tests / hosts) — runtime-only.
+2. `OMP_MODEL_POOLS_JSON` — inline JSON (object with `pools` or flat map) —
+   runtime-only.
+3. `OMP_MODEL_POOL_CONFIG` — path to an explicit JSON file as above.
+4. `<OMP agent dir>/model-pool.json` — the profile-scoped default file.
+5. Empty.
 
-`stateFile` also honors `OMP_MODEL_POOL_STATE` when the option is unset.
-Relative paths resolve against the OMP agent dir, never the process CWD, so
-processes started from different directories still share one cycle. A leading
-`~` resolves against the home directory.
+Sources 1 and 2 are **runtime-only**: they live in memory, are never rewritten,
+and any pool edit made against them is labelled runtime-only and lost when the
+process exits. Sources 3 and 4 are authoritative files, so accepted edits are
+saved back to them automatically (see *Automatic saving*). Because the two
+runtime sources outrank every file, while they are in effect the editor changes
+the in-memory pools only.
+
+`stateFile` also honors `OMP_MODEL_POOL_STATE` when the option is unset. A
+relative `stateFile` path resolves against the OMP agent dir, never the process
+CWD, so processes started from different directories still share one cycle; a
+leading `~` resolves against the home directory. The explicit config file
+(`OMP_MODEL_POOL_CONFIG`) is the exception: a relative path there resolves
+against the process CWD, as before. The profile default file always lives at
+`<OMP agent dir>/model-pool.json`.
 
 The agent dir follows OMP's own resolution rather than assuming the default
 profile: the config root is `~/<PI_CONFIG_DIR or .omp>`, a named profile
@@ -79,6 +92,64 @@ export OMP_MODEL_POOL_CONFIG=./model-pool.json
 export OMP_MODEL_POOLS_JSON='{"slow":["anthropic/claude-haiku-4-5","openai/gpt-5-mini"]}'
 omp --extension ./omp-model-pool
 ```
+
+### First-run setup
+
+With no source configured the extension loads, reads nothing, and rotates
+nothing. To give it a persistent home, either point `OMP_MODEL_POOL_CONFIG` at
+a file, copy `model-pool.example.json` to `<OMP agent dir>/model-pool.json`, or
+just open `/model-pool` and add a model to a role: the first confirmed edit
+creates the profile-scoped default file in the nested shape. Loading the
+extension, running `status`/`doctor`, or opening the editor never creates a
+file on its own.
+
+### Automatic saving
+
+Each accepted pool edit is its own transaction. When a file is authoritative,
+the edit is written immediately: the file's unrelated top-level keys and
+unedited selectors are preserved, an existing file keeps its flat-vs-nested
+shape, and a newly created default file uses the nested shape. Writes are
+serialized with an atomic-directory lock on the config path, re-read and
+fingerprint-checked after the lock is acquired, written through an exclusive
+temp file plus atomic rename, and the in-memory pools are replaced only after
+the file commit succeeds — a failed save leaves both the file and the active
+pools unchanged. A resolved path that collides with the counter state file is
+refused.
+
+If a higher-priority source is set but unusable — for example malformed
+`OMP_MODEL_POOLS_JSON` — routing still fails open and falls through, but pool
+editing is disabled until that source is repaired, so an accepted edit can never
+be written to a lower-priority file the operator did not intend to be
+authoritative.
+
+## Commands
+
+The extension registers one user command, `/model-pool` (registered as
+`model-pool`). With no argument it opens a menu: **Switch Current Model**,
+**Edit Role Pools**, **Status**, **Doctor**, and **Help**. It also accepts the
+arguments `pick`, `edit [role]`, `status`, `doctor`, and `help`; unknown
+arguments print usage and change nothing.
+
+`pick` switches the active model of the **main** session only. It requires an
+interactive session, refuses while the session is busy, lists the authenticated
+models (with a case-insensitive filter once the list is large), re-verifies
+authenticated membership immediately before applying, and reports success only
+after the host confirms the new active model. Selecting the current model is a
+no-op. It never touches pools or counters and never switches a child session's
+model.
+
+`edit` opens the role-pool editor. It accepts an existing role or a new bare
+role name (a single leading `@` is stripped) and offers **Add Model**,
+**Remove Entry**, **Move Earlier**, **Move Later**, **Delete Pool**, and
+**Back**. Each accepted edit is saved as its own transaction when a file is
+authoritative (see *Automatic saving*). Creating a pool for an unknown role
+does not create or assign an OMP core role.
+
+`status` reports the effective configuration source, whether edits are writable
+or runtime-only, the main role and rotation toggle, pool order, the current
+model, the persistence mode, and the resolved state path. `doctor` reports
+per-entry resolve and authenticated-membership results, distinguishes an
+unreadable registry from a readable empty one, and performs no writes.
 
 ## Behavior
 
@@ -124,6 +195,15 @@ omp --extension ./omp-model-pool
   of the pool's entries are authenticated. An unreadable registry (no
   `ctx.models`, or a throwing `list()`) is a transient failure and always fails
   open, never a refusal.
+- Authenticated membership is required, not just resolution: an entry that
+  resolves but is absent from `ctx.models.list()` is unavailable, including
+  when the list is readable but empty. A missing or throwing registry still
+  fails open.
+- Host compatibility: routing hooks are registered before optional command
+  registration, so a host without command registration keeps rotating pools and
+  gets a compatibility warning instead of failing. Commands that mutate state
+  require an interactive main session; non-interactive contexts never open
+  dialogs or mutate configuration.
 - Core fallback is preserved: the returned single `model` keeps role identity
   so `retry.fallbackChains` / prewalk / advisor semantics still apply. If the
   requirement ever becomes "model must never change mid-instance", verify
@@ -177,6 +257,9 @@ omp --extension ./omp-model-pool
 - New main sessions share the same counters when roles overlap;
   e.g. a `@default` subagent pool and main-session `default` rotation draw
   from one counter.
+- Editing a pool never advances or resets a cursor. Duplicate entries are
+  preserved as distinct configured slots, and removing the last entry deletes
+  the role's pool (restoring core passthrough) after confirmation.
 
 ## Validate
 
@@ -202,6 +285,21 @@ omp --extension ./omp-model-pool
 12. Run under a named profile (`omp --profile work`) with `persistCounters:
     true`; state lands under `.omp/profiles/work/agent/`, and a second profile
     keeps its own cycle rather than sharing the default profile's cursor.
+13. Open `/model-pool`; with no argument the menu appears. `help`, `status`,
+    and `doctor` run without changing pools, counters, or files; an unknown
+    argument prints usage and changes nothing.
+14. `pick` on an idle main session: filter and select a listed model and confirm
+    the host reports it as active. Cancelling, selecting the current model, and
+    running `pick` in a busy or non-interactive session change nothing.
+15. `edit`: add, reorder, and remove an entry; each accepted edit is saved
+    immediately when a file is authoritative, the next spawn uses the edited
+    pool, and the cursor did not move. Remove the last entry of a role and
+    confirm the pool is deleted and core passthrough restored.
+16. First-run: with no config file, opening the editor or running `status`
+    creates nothing; the first confirmed edit creates
+    `<OMP agent dir>/model-pool.json` in the nested shape. With
+    `OMP_MODEL_POOLS_JSON` set, edits are labelled runtime-only and the inline
+    source is never rewritten.
 
 Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
 `@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
@@ -264,3 +362,8 @@ import pool, { configurePools, resetCounters, getCounters, getPools, resolveStat
 configurePools({ pools: { slow: ["p/a", "p/b"] }, strict: false, persistCounters: false });
 resetCounters(); // mirrors an OMP restart (in-memory counters only)
 ```
+
+`configurePools` is a deliberate replacement of the active configuration and
+outranks every file source. Options passed to the factory and
+`OMP_MODEL_POOLS_JSON` are runtime-only: they are never written back, and UI
+edits made against them are labelled runtime-only.

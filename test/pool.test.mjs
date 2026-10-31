@@ -70,11 +70,11 @@ function subCtx(models, agentKind = "sub") {
 // A main session. `entries` and `header` model what the host reports at
 // `session_start`: a header created before this process, or a user/assistant
 // message, means the session was loaded rather than created by this process.
-function mainCtx(models, entries = [], header) {
+function mainCtx(models, entries = [], header, notified = []) {
   return {
     agent: { kind: "main", name: "main", id: "Main" },
     models,
-    ui: { notify: () => {} },
+    ui: { notify: (message, type) => notified.push([message, type]) },
     sessionManager: { getEntries: () => entries, getHeader: () => header },
   };
 }
@@ -137,6 +137,13 @@ describe("per-role round robin", () => {
       { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
       subCtx(models));
     assert.equal(r.model, "p/a");
+  });
+
+  it("ignores wrapper option keys in a flat config", () => {
+    const { pi } = makeHarness();
+    // A flat map keeps its option keys at the top level; only real roles become pools.
+    mod.default(pi, { slow: ["p/a"], strict: true, persistCounters: false, mainSessionRole: "default" });
+    assert.deepEqual(Object.keys(mod.getPools()), ["slow"]);
   });
 
   it("leaves unconfigured roles untouched", () => {
@@ -236,6 +243,16 @@ describe("main-session rotation", () => {
       subCtx(models),
     );
     assert.equal(r.model, "p/a");
+  });
+
+  it("does not rotate when main-session rotation is disabled", async () => {
+    const { pi, handlers, setModels } = makeHarness();
+    mod.default(pi, { pools: { default: ["p/x", "p/y"] }, enableMainSessionRotation: false });
+    await handlers.session_start(
+      { type: "session_start" },
+      mainCtx(makeModels(["p/x", "p/y"]), [], freshHeader()),
+    );
+    assert.deepEqual(setModels, [], "enableMainSessionRotation:false keeps subagent cycling only");
   });
 
   it("does nothing when the main role pool is unconfigured", async () => {
@@ -369,9 +386,9 @@ describe("main-session rotation", () => {
   // these cases are what the old mock could not catch.
 
   it("applies the resolved model object and confirms the host took it", async () => {
-    const { pi, handlers, setModels, logs } = makeHarness();
+    const { pi, handlers, setModels, logs, notified } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader(), notified);
     // Model a host that really applies the model rather than one whose
     // `current()` cannot confirm anything, so the confirmation path is exercised
     // positively instead of being skipped.
@@ -389,16 +406,21 @@ describe("main-session rotation", () => {
       logs.some(([l, m]) => l === "info" && m.includes("main session applied")),
       "success is logged once the host confirms the model",
     );
+    assert.ok(
+      notified.some(([m, t]) => t === "info" && m.includes("p/x")),
+      "a confirmed rotation is toasted to the user",
+    );
   });
 
   it("does not claim a rotation when the host refuses the model", async () => {
-    const { pi, handlers, logs } = makeHarness();
+    const { pi, handlers, logs, notified } = makeHarness();
     pi.setModel = async () => false; // the host's "no credential for that model"
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader(), notified);
     await handlers.session_start({ type: "session_start" }, ctx);
     assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("host refused")));
     assert.ok(!logs.some(([, m]) => m.includes("main session applied")), "a refusal is not a rotation");
+    assert.ok(!notified.some(([, t]) => t === "info"), "a refusal is not toasted as a success");
   });
 
   it("does not claim a rotation when the registry stops resolving the pick between choose and apply", async () => {
@@ -420,19 +442,29 @@ describe("main-session rotation", () => {
     assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
   });
 
-  it("tolerates a host that reports null instead of undefined", async () => {
-    const { pi, handlers, logs } = makeHarness();
+  it("tolerates a host that reports null instead of undefined, without claiming success", async () => {
+    const { pi, handlers, logs, notified } = makeHarness();
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
-    // `current()` returning null after a successful apply must not throw: the
-    // host's confirmation is optional, not required.
+    const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader(), notified);
+    // `current()` returning null after a successful apply must not throw, and it
+    // is not evidence of success either: the host never confirmed the model, so
+    // the outcome is reported as unconfirmed rather than as a completed rotation.
     ctx.models.current = () => null;
     pi.setModel = async () => undefined;
     await handlers.session_start({ type: "session_start" }, ctx);
-    assert.ok(logs.some(([l, m]) => l === "info" && m.includes("main session applied")));
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("did not confirm the active model")));
+    assert.ok(!logs.some(([, m]) => m.includes("main session applied")));
     assert.ok(
       !logs.some(([, m]) => m.includes("session_start error")),
       "a null current model is a handled case, not an exception",
+    );
+    assert.ok(
+      notified.some(([m, t]) => t === "warning" && m.includes("did not confirm the active model")),
+      "the unconfirmed outcome reaches the user as a warning",
+    );
+    assert.ok(
+      !notified.some(([, t]) => t === "info"),
+      "an unconfirmed rotation is never toasted as a success",
     );
   });
 
@@ -747,6 +779,13 @@ describe("state file path resolution", () => {
 
 describe("strict policy boundary", () => {
   const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
+
+  it("hard-blocks every role when strict is the boolean true", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: true });
+    const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
+    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
+  });
 
   it("does not hard-block when the model registry is unreadable", () => {
     const { pi, handlers } = makeHarness();
