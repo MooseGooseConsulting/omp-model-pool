@@ -334,12 +334,19 @@ let configShape: "nested" | "flat" | "none" = "none";
 /** Content fingerprint of the backing file, re-checked under the edit lock. */
 let configFingerprint: string | undefined;
 
-/** Apply a normalized configuration to the active slots. */
+/**
+ * Apply a normalized configuration to the active slots.
+ *
+ * Pins are pruned here because this is the one place every full replacement of
+ * the pools goes through: a loaded file, the factory's options, and
+ * `configurePools`. Pruning at those call sites left one of them out.
+ */
 function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
   activeConfig.pools = normalized.pools;
   activeConfig.strict = normalized.strict;
   activeConfig.persistCounters = normalized.persistCounters;
   activeConfig.stateFile = normalized.stateFile;
+  prunePinsForConfiguredPools();
 }
 
 /**
@@ -1100,19 +1107,19 @@ function refreshFromSource(pi: ExtensionApiLike): void {
   if (signature === loadedSignature) return;
   const warnings = configureLoaded(loaded);
   loadedSignature = signature;
-  prunePinsForConfiguredPools();
   for (const warning of warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
 }
 
 /**
- * Drop pins whose pool no longer exists. A pin is only meaningful while its
- * pool does, so removing the pool's members must not leave a stale entry that a
- * later pool of the same name could inherit.
+ * Drop pins that no longer describe the configuration: a pool that vanished,
+ * and a member that left its pool. A pin only means something while both are
+ * still true, so re-creating a pool must not inherit an older edition's member.
  */
 function prunePinsForConfiguredPools(): void {
-  for (const key of sessionPins.keys()) {
+  for (const [key, selector] of sessionPins) {
     const separator = key.lastIndexOf("\u0000");
-    if (separator === -1 || activeConfig.pools[key.slice(separator + 1)] === undefined) sessionPins.delete(key);
+    const members = separator === -1 ? undefined : activeConfig.pools[key.slice(separator + 1)];
+    if (members === undefined || members.includes(selector) !== true) sessionPins.delete(key);
   }
 }
 
