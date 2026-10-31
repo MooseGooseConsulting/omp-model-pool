@@ -1,25 +1,31 @@
-// omp-model-pool — per-role round-robin model cycling for oh-my-pi.
+// omp-model-pool — round-robin model pools, exposed as models you pick.
 //
-// Primary hook: `before_subagent_spawn` (parent session, once per new child).
-// Secondary hook: `session_start` for main sessions only (`ctx.agent.kind === "main"`).
+// Each configured pool registers as a model named `pool/<name>`. It appears in
+// OMP's model picker and role settings like any other model, and choosing it
+// is the only way a pool takes effect: a role set to a real model is never
+// rerouted. Pools never switch a running conversation's model, so prompt caches
+// survive.
 //
-// Keying: bare role name after stripping a single leading "@" from
-// `event.modelRole`. `agent` / `invocationKind` are observed for logging only
-// and never affect the counter key.
+// Three paths resolve a `pool/<name>` selection to a real model:
+//   * `before_subagent_spawn`: a child whose patterns name `pool/<name>` starts
+//     on the next model in rotation; the pool's other eligible members follow
+//     as that child's retry fallbacks.
+//   * `session_start`: a fresh main session whose model is `pool/<name>`
+//     switches to the next model in rotation before its first turn.
+//   * the `pool` provider's `streamSimple`: anything else that calls
+//     `pool/<name>` directly (commit messages, memory, a resumed session) is
+//     forwarded to one member, pinned per session id.
 //
-// Counters are module-level (`Record<string, number>`) so every session bound
-// in this process shares them; separate OMP processes do not share counters.
-// Parallel spawns advance in handler-execution order (nondeterministic under
-// concurrency). Counters are in-memory only and reset on restart.
+// The configuration source is re-checked on every spawn and session start, so
+// an edit to the pool file applies to the next pick without a restart.
+//
+// Counters are module-level, keyed by pool name, and shared by every session
+// bound in this process; `persistCounters` shares them across processes.
 //
 // Model validation reuses core resolution: every pool entry goes through
 // `ctx.models.resolve(spec)` and must also appear in `ctx.models.list()`.
-// Unresolvable / unauthenticated entries are filtered; an emptied pool leaves
-// the spawn unmodified (fail open) unless a strict block policy is configured.
-//
-// Returned single `model` replaces the spawn's attempt-ordered patterns while
-// keeping role identity, so core `retry.fallbackChains` / prewalk / advisor
-// semantics are preserved, not replaced.
+// Unresolvable / unauthenticated entries are skipped without re-phasing the
+// rotation.
 
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -108,8 +114,43 @@ interface ExtensionContextLike {
    * loaded; `getEntries()` is the content fallback.
    */
   sessionManager?: { getEntries?: () => unknown; getHeader?: () => unknown };
+  /** Credential lookup for a resolved model; used to forward direct `pool/<name>` requests. */
+  modelRegistry?: { getApiKey?: (model: ModelLike, sessionId?: string) => Promise<string | undefined> };
   cwd?: string;
   [key: string]: unknown;
+}
+
+/** One model row in a provider registration (same fields as a `models.yml` entry). */
+interface ProviderModelDefinition {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  input: string[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+}
+
+/** Stream options the host passes to a provider's `streamSimple`. */
+interface StreamOptionsLike {
+  sessionId?: string;
+  apiKey?: string;
+  [key: string]: unknown;
+}
+
+/** The host's canonical assistant event stream: async-iterable, fed by `push`/`end`/`fail`. */
+interface EventStreamLike extends AsyncIterable<unknown> {
+  push(event: unknown): void;
+  end(result?: unknown): void;
+  fail(err: unknown): void;
+}
+
+interface ProviderConfigLike {
+  baseUrl: string;
+  apiKey: string;
+  api: string;
+  streamSimple: (model: ModelLike, context: unknown, options?: StreamOptionsLike) => EventStreamLike;
+  models: ProviderModelDefinition[];
 }
 
 interface ExtensionApiLike {
@@ -139,6 +180,13 @@ interface ExtensionApiLike {
    * rather than assumed.
    */
   setModel?(model: ModelLike): void | Promise<unknown>;
+  /**
+   * Register (or replace) a provider and its models in the host registry.
+   * Optional: without it pools cannot appear as models, so nothing routes.
+   */
+  registerProvider?(name: string, config: ProviderConfigLike): void;
+  /** Remove a provider this extension registered. */
+  unregisterProvider?(name: string): void;
   logger?: {
     info?: (...args: unknown[]) => void;
     warn?: (...args: unknown[]) => void;
@@ -149,15 +197,16 @@ interface ExtensionApiLike {
 }
 
 export interface ModelPoolConfig {
-  /** Pools keyed by bare role name (`slow`, `default`, …). Values are selectors in cycle order. */
-  pools: Record<string, string[]>;
-  /** Role used for main-session rotation (bare name, no "@"). Default `"default"`. */
-  mainSessionRole?: string;
-  /** Disable the `session_start` main-session rotation while keeping subagent cycling. */
-  enableMainSessionRotation?: boolean;
   /**
-   * Empty-pool policy. `false` (default) leaves the spawn unmodified and logs;
-   * `true` blocks every empty-pool spawn; an array blocks only the listed roles.
+   * Pools keyed by name. Each one registers as the model `pool/<name>`; values
+   * are real model selectors in cycle order. A pool applies only where that
+   * model is selected (a role, `--model`, `/model`, an agent's `model:`).
+   */
+  pools: Record<string, string[]>;
+  /**
+   * Empty-pool policy. `false` (default) leaves the spawn on `pool/<name>`,
+   * which the provider then forwards; `true` blocks every empty-pool spawn; an
+   * array blocks only the listed pools.
    */
   strict?: boolean | string[];
   /**
@@ -200,9 +249,9 @@ export interface PoolEntryDiagnosis {
   reason: string;
 }
 
-/** Per-role diagnosis used by `doctor`. */
+/** Per-pool diagnosis used by `doctor`. */
 export interface PoolDiagnosis {
-  role: string;
+  pool: string;
   entries: PoolEntryDiagnosis[];
 }
 
@@ -232,12 +281,34 @@ const STALE_LOCK_MS = 120_000;
 
 const activeConfig: Required<Omit<ModelPoolConfig, "strict">> & { strict: boolean | string[] } = {
   pools: Object.create(null),
-  mainSessionRole: "default",
-  enableMainSessionRotation: true,
   strict: false,
   persistCounters: false,
   stateFile: resolveStateFilePath(),
 };
+
+/** Provider name every pool registers under: the pool `task` is the model `pool/task`. */
+export const POOL_PROVIDER = "pool";
+/** Extension-owned API id for the forwarding transport. */
+const POOL_API = "model-pool";
+/** Model metadata used until the real members are known; conservative so compaction never runs late. */
+const FALLBACK_CONTEXT_WINDOW = 128_000;
+const FALLBACK_MAX_TOKENS = 16_384;
+/** Pool names must be valid model ids: they become `pool/<name>`. */
+const POOL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** Thinking suffixes OMP accepts on a chat selector (`pool/task:high`). */
+const THINKING_LEVELS: Record<string, true> = {
+  off: true,
+  minimal: true,
+  low: true,
+  medium: true,
+  high: true,
+  xhigh: true,
+  max: true,
+  auto: true,
+  inherit: true,
+};
+/** Option keys removed in favour of selecting `pool/<name>`; reported once, never treated as pools. */
+const RETIRED_KEYS = ["mainSessionRole", "enableMainSessionRotation"] as const;
 
 /** Where the active configuration came from; drives the editor's save behaviour. */
 let configSource: ConfigSourceInfo = {
@@ -266,8 +337,6 @@ let configFingerprint: string | undefined;
 /** Apply a normalized configuration to the active slots. */
 function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
   activeConfig.pools = normalized.pools;
-  activeConfig.mainSessionRole = normalized.mainSessionRole;
-  activeConfig.enableMainSessionRotation = normalized.enableMainSessionRotation;
   activeConfig.strict = normalized.strict;
   activeConfig.persistCounters = normalized.persistCounters;
   activeConfig.stateFile = normalized.stateFile;
@@ -711,7 +780,7 @@ async function withFileLock<T>(file: string, fn: () => T): Promise<T> {
  * write, so the cursor is not consumed.
  */
 function advancePersisted(
-  roleKey: string,
+  poolName: string,
   poolLength: number,
   eligible: boolean[],
   file: string,
@@ -720,11 +789,11 @@ function advancePersisted(
     const read = readPersistedCounters(file);
     if (read.legacy) quarantineLegacyState(file);
     const persisted = read.counters;
-    const start = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
+    const start = poolLength === 0 ? 0 : (persisted[poolName] ?? 0) % poolLength;
     for (let offset = 0; offset < poolLength; offset++) {
       const index = (start + offset) % poolLength;
       if (eligible[index] !== true) continue;
-      persisted[roleKey] = (index + 1) % poolLength;
+      persisted[poolName] = (index + 1) % poolLength;
       writeStateAtomic(file, persisted);
       return { index, replacedLegacy: read.legacy };
     }
@@ -737,7 +806,7 @@ function advancePersisted(
 // ---------------------------------------------------------------------------
 
 /** Strip one leading "@" and surrounding whitespace; empty string when blank. */
-export function normalizeRoleKey(raw: unknown): string {
+export function normalizePoolName(raw: unknown): string {
   if (typeof raw !== "string") return "";
   const trimmed = raw.trim();
   if (trimmed.length === 0) return "";
@@ -756,47 +825,85 @@ function normalizeStringList(value: unknown): string[] {
   return out;
 }
 
-/** Normalize any accepted config shape (nested `pools` or flat map) into the internal form. */
-function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
+/** The internal form every accepted config shape normalizes to. */
+interface NormalizedConfig {
   pools: Record<string, string[]>;
-  mainSessionRole: string;
-  enableMainSessionRotation: boolean;
   strict: boolean | string[];
   persistCounters: boolean;
   stateFile: string;
-} {
+  /** Problems found while normalizing (skipped names or entries, retired keys); logged, never fatal. */
+  warnings: string[];
+}
+
+/** Normalize any accepted config shape (nested `pools` or flat map) into the internal form. */
+function normalizeConfig(raw: ModelPoolConfig | undefined | null): NormalizedConfig {
+  const warnings: string[] = [];
+  const legacy = raw as Record<string, unknown> | undefined | null;
+  for (const key of RETIRED_KEYS) {
+    if (legacy !== null && legacy !== undefined && Object.prototype.hasOwnProperty.call(legacy, key)) {
+      warnings.push(
+        `"${key}" is no longer used and is ignored: a pool applies wherever you select its model, e.g. set the default role to pool/<name>`,
+      );
+    }
+  }
   const pools: Record<string, string[]> = Object.create(null);
   const rawPools: unknown = raw?.pools ?? raw;
   if (rawPools !== null && typeof rawPools === "object" && !Array.isArray(rawPools)) {
     for (const [k, v] of Object.entries(rawPools as Record<string, unknown>)) {
       // Skip the wrapper-level option keys when a flat config is passed.
-      if (
-        raw?.pools === undefined &&
-        (k === "mainSessionRole" ||
-          k === "enableMainSessionRotation" ||
-          k === "strict" ||
-          k === "persistCounters" ||
-          k === "stateFile")
-      ) {
+      if (raw?.pools === undefined && RESERVED_FLAT_KEYS.has(k)) continue;
+      const key = normalizePoolName(k);
+      if (key.length === 0) continue;
+      if (!POOL_NAME_PATTERN.test(key)) {
+        warnings.push(`pool "${k}" skipped: a pool name becomes the model id pool/<name>, so use letters, digits, ".", "_" or "-"`);
         continue;
       }
-      const key = normalizeRoleKey(k);
-      if (key.length === 0) continue;
-      const list = normalizeStringList(v);
+      const list: string[] = [];
+      for (const selector of normalizeStringList(v)) {
+        if (selector.startsWith(`${POOL_PROVIDER}/`)) {
+          warnings.push(`pool "${key}": entry ${selector} skipped; a pool cannot contain another pool`);
+          continue;
+        }
+        list.push(selector);
+      }
       if (list.length > 0) pools[key] = list;
     }
   }
-  const mainSessionRole = normalizeRoleKey(raw?.mainSessionRole ?? "default") || "default";
   return {
     pools,
-    mainSessionRole,
-    enableMainSessionRotation: raw?.enableMainSessionRotation ?? true,
     strict: raw?.strict ?? false,
     // Opt-in must be exactly boolean true: a stray `"false"` string would be
     // truthy and would silently start writing a shared state file.
     persistCounters: raw?.persistCounters === true,
     stateFile: resolveStateFilePath(raw?.stateFile),
+    warnings,
   };
+}
+
+/** A `pool/<name>` selector, split into the pool name and an optional thinking suffix. */
+interface PoolSelector {
+  name: string;
+  /** `:high` style suffix, including the colon; `""` when absent. */
+  thinking: string;
+}
+
+/**
+ * Parse `pool/<name>` or `pool/<name>:<level>`. Returns undefined for anything
+ * else, including a suffix that is not a thinking level (pool names cannot
+ * contain `:`, so that cannot be a pool).
+ */
+export function parsePoolSelector(selector: unknown): PoolSelector | undefined {
+  if (typeof selector !== "string") return undefined;
+  const prefix = `${POOL_PROVIDER}/`;
+  const trimmed = selector.trim();
+  if (!trimmed.startsWith(prefix)) return undefined;
+  const rest = trimmed.slice(prefix.length);
+  const colon = rest.indexOf(":");
+  const name = colon === -1 ? rest : rest.slice(0, colon);
+  const level = colon === -1 ? "" : rest.slice(colon + 1);
+  if (!POOL_NAME_PATTERN.test(name)) return undefined;
+  if (colon !== -1 && THINKING_LEVELS[level] !== true) return undefined;
+  return { name, thinking: colon === -1 ? "" : `:${level}` };
 }
 
 /**
@@ -950,27 +1057,227 @@ function loadConfigWithSource(): LoadedConfig {
  * need the same "unchanged source" comparison the environment source has;
  * without it a child-session re-bind would silently discard runtime-only edits.
  */
-function optionsSignature(normalized: ReturnType<typeof normalizeConfig>): string {
+function optionsSignature(normalized: NormalizedConfig): string {
   const pools = Object.keys(normalized.pools)
     .sort()
-    .map((role) => `${role}=${(normalized.pools[role] ?? []).join(",")}`)
+    .map((name) => `${name}=${(normalized.pools[name] ?? []).join(",")}`)
     .join(";");
   const strict = Array.isArray(normalized.strict) ? normalized.strict.join(",") : String(normalized.strict);
-  return `${pools}|${normalized.mainSessionRole}|${normalized.enableMainSessionRotation}|${strict}|${normalized.persistCounters}|${normalized.stateFile}`;
+  return `${pools}|${strict}|${normalized.persistCounters}|${normalized.stateFile}`;
 }
 
-/** Signature that decides whether a re-bind must reload the environment source. */
-function sourceSignature(loaded: LoadedConfig): string {
-  return `${loaded.source.kind}:${loaded.source.path ?? ""}:${loaded.source.writable ? "w" : "r"}:${loaded.fingerprint ?? ""}`;
+/** Signature that decides whether a re-bind or refresh must reload the environment source. */
+function sourceSignature(source: ConfigSourceInfo, fingerprint: string | undefined): string {
+  return `${source.kind}:${source.path ?? ""}:${source.writable ? "w" : "r"}:${fingerprint ?? ""}`;
 }
 
-/** Apply a loaded source to the active configuration and record its provenance. */
-function configureLoaded(loaded: LoadedConfig): void {
-  applyNormalized(normalizeConfig(loaded.config));
+/**
+ * Apply a loaded source to the active configuration and record its provenance.
+ * Returns every warning from loading and normalizing, for the caller to log.
+ */
+function configureLoaded(loaded: LoadedConfig): string[] {
+  const normalized = normalizeConfig(loaded.config);
+  applyNormalized(normalized);
   configSource = loaded.source;
   configShape = loaded.shape;
   configFingerprint = loaded.fingerprint;
   configRevision += 1;
+  return [...loaded.warnings, ...normalized.warnings];
+}
+
+/**
+ * Re-read the environment/default source and apply it when it changed.
+ *
+ * Runs at load and again before every pick, so an edit to the pool file takes
+ * effect on the next spawn instead of one spawn late. An unchanged source keeps
+ * runtime-only edits. Programmatic options have no source to re-read.
+ */
+function refreshFromSource(pi: ExtensionApiLike): void {
+  if (configSource.kind === "options") return;
+  const loaded = loadConfigWithSource();
+  const signature = sourceSignature(loaded.source, loaded.fingerprint);
+  if (signature === loadedSignature) return;
+  const warnings = configureLoaded(loaded);
+  loadedSignature = signature;
+  for (const warning of warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
+}
+
+// ---------------------------------------------------------------------------
+// The `pool` provider: one model per pool, so pools are chosen in OMP's own
+// model picker and role settings.
+// ---------------------------------------------------------------------------
+
+/** The two pieces of `@oh-my-pi/pi-ai` the forwarder needs. */
+interface PiAiModule {
+  AssistantMessageEventStream: new () => EventStreamLike;
+  streamSimple: (model: ModelLike, context: unknown, options?: StreamOptionsLike) => AsyncIterable<unknown>;
+}
+
+let piAi: PiAiModule | undefined;
+let piAiLoad: Promise<void> | undefined;
+
+/**
+ * Start loading the host's stream module once; forwarding needs it, routing
+ * does not. The specifier must stay a string literal: OMP finds the host
+ * packages an extension imports by parsing its source, and rewrites only the
+ * specifiers it can see. The package is not a dependency (types live in
+ * `host-modules.d.ts`), so under plain Node the import fails and is logged.
+ */
+function loadPiAi(pi: ExtensionApiLike): void {
+  if (piAiLoad !== undefined) return;
+  piAiLoad = import("@oh-my-pi/pi-ai").then(
+    (mod: unknown) => {
+      const candidate = mod as Partial<PiAiModule> | null;
+      if (typeof candidate?.AssistantMessageEventStream === "function" && typeof candidate.streamSimple === "function") {
+        piAi = candidate as PiAiModule;
+      } else {
+        safeLog(pi, "warn", "[model-pool] host stream module lacks streamSimple; direct pool/<name> requests cannot be forwarded");
+      }
+    },
+    (err: unknown) => {
+      safeLog(pi, "warn", `[model-pool] host stream module unavailable; direct pool/<name> requests cannot be forwarded: ${err instanceof Error ? err.message : String(err)}`);
+    },
+  );
+}
+
+/** Latest host API, model query and credential lookup, captured from a live context for the forwarder. */
+let hostApi: ExtensionApiLike | undefined;
+let hostModels: ModelsQuery | undefined;
+let hostRegistry: ExtensionContextLike["modelRegistry"];
+
+function captureHost(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  hostApi = pi;
+  if (ctx.models !== undefined) hostModels = ctx.models;
+  if (ctx.modelRegistry !== undefined) hostRegistry = ctx.modelRegistry;
+}
+
+/** Read a positive numeric model field, or undefined. */
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * One provider model per pool. Limits are the smallest among the members that
+ * resolve, so a pool never advertises more context than its weakest member can
+ * take; without a registry they fall back to conservative defaults.
+ */
+function poolModelDefinitions(models: ModelsQuery | undefined): ProviderModelDefinition[] {
+  const out: ProviderModelDefinition[] = [];
+  for (const name of Object.keys(activeConfig.pools).sort()) {
+    let contextWindow: number | undefined;
+    let maxTokens: number | undefined;
+    for (const selector of activeConfig.pools[name] ?? []) {
+      let resolved: ModelLike | undefined;
+      try {
+        resolved = models?.resolve(selector);
+      } catch {
+        resolved = undefined;
+      }
+      if (resolved === undefined || resolved === null) continue;
+      const window = positiveNumber(resolved["contextWindow"]);
+      const tokens = positiveNumber(resolved["maxTokens"]);
+      if (window !== undefined) contextWindow = contextWindow === undefined ? window : Math.min(contextWindow, window);
+      if (tokens !== undefined) maxTokens = maxTokens === undefined ? tokens : Math.min(maxTokens, tokens);
+    }
+    out.push({
+      id: name,
+      name: `Pool: ${name} (${(activeConfig.pools[name] ?? []).length} models)`,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: contextWindow ?? FALLBACK_CONTEXT_WINDOW,
+      maxTokens: maxTokens ?? FALLBACK_MAX_TOKENS,
+    });
+  }
+  return out;
+}
+
+/** Last registration per host API object, so an unchanged pool set is not re-registered. */
+const registeredSignatures = new WeakMap<ExtensionApiLike, string>();
+
+/** Register `pool/<name>` for every configured pool, or remove the provider when none remain. */
+function syncPoolProvider(pi: ExtensionApiLike, models: ModelsQuery | undefined): void {
+  if (typeof pi.registerProvider !== "function") {
+    if (!registeredSignatures.has(pi)) {
+      safeLog(pi, "warn", "[model-pool] host cannot register providers; pools cannot appear as models and nothing will route");
+      registeredSignatures.set(pi, "");
+    }
+    return;
+  }
+  const definitions = poolModelDefinitions(models);
+  const signature = JSON.stringify(definitions);
+  const previous = registeredSignatures.get(pi);
+  if (previous === signature) return;
+  try {
+    if (definitions.length === 0) {
+      if (previous !== undefined) pi.unregisterProvider?.(POOL_PROVIDER);
+    } else {
+      pi.registerProvider(POOL_PROVIDER, {
+        baseUrl: "https://model-pool.invalid/",
+        apiKey: "model-pool-forwards-to-member-credentials",
+        api: POOL_API,
+        streamSimple: forwardPoolRequest,
+        models: definitions,
+      });
+    }
+    registeredSignatures.set(pi, signature);
+  } catch (err) {
+    safeLog(pi, "warn", `[model-pool] registering pool models failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Member chosen for a direct `pool/<name>` request, pinned per session so its cache survives. */
+const sessionPins = new Map<string, string>();
+
+/**
+ * Choose the real model for a direct `pool/<name>` request. A session keeps its
+ * first pick while that member stays eligible; a request without a session id
+ * (a one-shot) takes the next model in rotation.
+ */
+async function forwardTarget(poolName: string, sessionId: string | undefined): Promise<{ selector: string; model: ModelLike }> {
+  const pool = activeConfig.pools[poolName];
+  if (pool === undefined || pool.length === 0) throw new Error(`model-pool: pool "${poolName}" is not configured`);
+  const models = hostModels;
+  const api = hostApi;
+  const availability = filterAvailable(pool, models);
+  if (availability.count === 0 || models === undefined || api === undefined) {
+    throw new Error(`model-pool: no authenticated model available in pool "${poolName}"`);
+  }
+  const pinKey = sessionId === undefined ? undefined : `${sessionId}\u0000${poolName}`;
+  const pinned = pinKey === undefined ? undefined : sessionPins.get(pinKey);
+  let selector = pinned !== undefined && availability.eligible[pool.indexOf(pinned)] === true ? pinned : undefined;
+  if (selector === undefined) {
+    const pick = await pickForPool(api, poolName, pool, availability);
+    if (pick === undefined) throw new Error(`model-pool: no authenticated model available in pool "${poolName}"`);
+    selector = pick.picked;
+    if (pinKey !== undefined) sessionPins.set(pinKey, selector);
+    safeLog(api, "info", `[model-pool] forwarding pool/${poolName} → ${selector}${pinKey === undefined ? " (one-shot)" : " (pinned for this session)"}`);
+  }
+  const model = models.resolve(selector);
+  if (model === undefined || model === null) throw new Error(`model-pool: ${selector} no longer resolves`);
+  return { selector, model };
+}
+
+/** The `pool` provider's transport: replay the request on one real member. */
+function forwardPoolRequest(model: ModelLike, context: unknown, options?: StreamOptionsLike): EventStreamLike {
+  const lib = piAi;
+  if (lib === undefined) {
+    throw new Error("model-pool: the host stream module is not available, so pool/<name> cannot be called directly");
+  }
+  const out = new lib.AssistantMessageEventStream();
+  void (async () => {
+    try {
+      const poolName = typeof model.id === "string" ? model.id : "";
+      const target = await forwardTarget(poolName, options?.sessionId);
+      const apiKey = await hostRegistry?.getApiKey?.(target.model, options?.sessionId);
+      if (apiKey === undefined || apiKey.length === 0) throw new Error(`model-pool: no credential for ${target.selector}`);
+      for await (const event of lib.streamSimple(target.model, context, { ...options, apiKey })) out.push(event);
+      out.end();
+    } catch (err) {
+      out.fail(err);
+    }
+  })();
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1289,7 @@ function configureLoaded(loaded: LoadedConfig): void {
 // (programmatic options, inline JSON, or a disabled editor) changes memory only.
 // ---------------------------------------------------------------------------
 
-/** Top-level keys that a flat-config role name would collide with. */
+/** Top-level keys that a flat-config pool name would collide with (retired keys included). */
 const RESERVED_FLAT_KEYS = new Set([
   "pools",
   "mainSessionRole",
@@ -992,12 +1299,12 @@ const RESERVED_FLAT_KEYS = new Set([
   "stateFile",
 ]);
 
-/** Replace or delete one role in the in-memory pools without touching counters. */
-function applyPoolChange(roleKey: string, selectors: string[] | null): void {
+/** Replace or delete one pool in memory without touching counters. */
+function applyPoolChange(name: string, selectors: string[] | null): void {
   const pools: Record<string, string[]> = Object.create(null);
   for (const [k, v] of Object.entries(activeConfig.pools)) pools[k] = [...v];
-  if (selectors === null) delete pools[roleKey];
-  else pools[roleKey] = [...selectors];
+  if (selectors === null) delete pools[name];
+  else pools[name] = [...selectors];
   activeConfig.pools = pools;
 }
 
@@ -1013,35 +1320,35 @@ function copyOwnProperties(source: unknown): Record<string, unknown> {
   return out;
 }
 
-/** Drop keys that normalize to `roleKey` but are written differently (`"@slow"`, padded). */
-function dropAliasKeys(target: Record<string, unknown>, roleKey: string): void {
+/** Drop keys that normalize to `name` but are written differently (`"@slow"`, padded). */
+function dropAliasKeys(target: Record<string, unknown>, name: string): void {
   for (const key of Object.keys(target)) {
-    if (key !== roleKey && normalizeRoleKey(key) === roleKey) delete target[key];
+    if (key !== name && normalizePoolName(key) === name) delete target[key];
   }
 }
 
 /** Build the document to write, preserving unrelated keys and the source shape. */
 function buildDocument(
-  roleKey: string,
+  name: string,
   selectors: string[] | null,
   shape: "nested" | "flat" | "none",
   rawDoc: unknown,
 ): Record<string, unknown> {
   const base = copyOwnProperties(rawDoc);
   if (shape === "flat") {
-    dropAliasKeys(base, roleKey);
-    if (selectors === null) delete base[roleKey];
-    else base[roleKey] = selectors;
+    dropAliasKeys(base, name);
+    if (selectors === null) delete base[name];
+    else base[name] = selectors;
     return base;
   }
   const pools = copyOwnProperties(base["pools"]);
-  // Match the role as the active config knows it, so deleting `@slow` removes the
+  // Match the pool as the active config knows it, so deleting `@slow` removes the
   // document's `"@slow"` key rather than leaving it to reappear on the next load.
-  dropAliasKeys(pools, roleKey);
-  if (selectors === null) delete pools[roleKey];
-  else pools[roleKey] = selectors;
+  dropAliasKeys(pools, name);
+  if (selectors === null) delete pools[name];
+  else pools[name] = selectors;
   // Keep the `pools` key even when it is empty. Dropping it would make the next
-  // `detectShape()` read the document as flat, so a later role addition would be
+  // `detectShape()` read the document as flat, so a later pool addition would be
   // written at the top level and silently change the file's established shape.
   base["pools"] = pools;
   return base;
@@ -1065,7 +1372,7 @@ function editMode(): EditMode {
 }
 
 /**
- * Save one role's pool, or delete the role with `selectors === null`.
+ * Save one pool, or delete it with `selectors === null`.
  *
  * `expectedRevision` guards against a stale editor: when the configuration
  * changed since the editor captured it, the edit is rejected instead of
@@ -1074,23 +1381,28 @@ function editMode(): EditMode {
  * writer is never silently overwritten.
  */
 export async function savePoolEdit(
-  role: string,
+  pool: string,
   selectors: string[] | null,
   expectedRevision?: number,
 ): Promise<PoolEditOutcome> {
-  const roleKey = normalizeRoleKey(role);
-  if (roleKey.length === 0) return { ok: false, error: "a role name is required" };
+  const name = normalizePoolName(pool);
+  if (name.length === 0) return { ok: false, error: "a pool name is required" };
+  if (!POOL_NAME_PATTERN.test(name)) {
+    return { ok: false, error: `"${name}" cannot be a pool name: it becomes pool/<name>, so use letters, digits, ".", "_" or "-"` };
+  }
   if (expectedRevision !== undefined && expectedRevision !== configRevision) {
     return { ok: false, error: "the configuration changed since this edit started; reopen the editor" };
   }
   const next = selectors === null ? null : normalizeStringList(selectors);
   if (next !== null && next.length === 0) {
-    return { ok: false, error: "refusing to save an empty pool; delete the role instead" };
+    return { ok: false, error: "refusing to save an empty pool; delete the pool instead" };
   }
-  if (configShape === "flat" && RESERVED_FLAT_KEYS.has(roleKey)) {
+  const nested = next?.find((selector) => selector.startsWith(`${POOL_PROVIDER}/`));
+  if (nested !== undefined) return { ok: false, error: `a pool cannot contain another pool (${nested})` };
+  if (configShape === "flat" && RESERVED_FLAT_KEYS.has(name)) {
     return {
       ok: false,
-      error: `a flat config cannot hold a role named "${roleKey}" (it collides with a top-level option key)`,
+      error: `a flat config cannot hold a pool named "${name}" (it collides with a top-level option key)`,
     };
   }
 
@@ -1102,7 +1414,7 @@ export async function savePoolEdit(
     };
   }
   if (mode === "runtime-only") {
-    applyPoolChange(roleKey, next);
+    applyPoolChange(name, next);
     configRevision += 1;
     return { ok: true, runtimeOnly: true };
   }
@@ -1140,7 +1452,7 @@ export async function savePoolEdit(
         fingerprintConflict = true;
         throw new Error("the configuration file changed on disk since it was loaded; reopen the editor");
       }
-      const doc = buildDocument(roleKey, next, configShape, current.ok ? current.value : undefined);
+      const doc = buildDocument(name, next, configShape, current.ok ? current.value : undefined);
       const text = `${JSON.stringify(doc, null, 2)}\n`;
       writeFileAtomicSync(file, text, existingMode(file));
       configFingerprint = fingerprintText(text);
@@ -1150,14 +1462,18 @@ export async function savePoolEdit(
       // Commit the in-memory change inside the lock, so a second save that
       // passed the pre-lock revision check sees the bumped revision and refuses
       // instead of overwriting this write.
-      applyPoolChange(roleKey, next);
+      applyPoolChange(name, next);
       configRevision += 1;
+      // The file now holds exactly what memory holds; record that, so the next
+      // refresh does not reload this same write and bump the revision under an
+      // editor that is still open.
+      loadedSignature = sourceSignature(configSource, configFingerprint);
     });
   } catch (err) {
     if (fingerprintConflict) {
       const loaded = loadConfigWithSource();
       configureLoaded(loaded);
-      loadedSignature = sourceSignature(loaded);
+      loadedSignature = sourceSignature(loaded.source, loaded.fingerprint);
     }
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
@@ -1173,7 +1489,7 @@ export async function savePoolEdit(
 export function diagnosePools(models: ModelsQuery | undefined): {
   registryReadable: boolean;
   registryNote: string;
-  roles: PoolDiagnosis[];
+  pools: PoolDiagnosis[];
 } {
   let registryReadable = false;
   let registryNote = "model registry unavailable";
@@ -1190,8 +1506,8 @@ export function diagnosePools(models: ModelsQuery | undefined): {
     }
   }
 
-  const roles: PoolDiagnosis[] = [];
-  for (const [role, pool] of Object.entries(activeConfig.pools)) {
+  const pools: PoolDiagnosis[] = [];
+  for (const [name, pool] of Object.entries(activeConfig.pools)) {
     const entries: PoolEntryDiagnosis[] = pool.map((selector) => {
       if (models === undefined) return { selector, eligible: false, reason: "registry unavailable" };
       let resolved: ModelLike | undefined;
@@ -1210,9 +1526,9 @@ export function diagnosePools(models: ModelsQuery | undefined): {
         ? { selector, eligible: true, reason: `authenticated as ${id}` }
         : { selector, eligible: false, reason: `not authenticated (${id} is not in the registry list)` };
     });
-    roles.push({ role, entries });
+    pools.push({ pool: name, entries });
   }
-  return { registryReadable, registryNote, roles };
+  return { registryReadable, registryNote, pools };
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,11 +1548,11 @@ function safeLog(
   }
 }
 
-/** Does the configured `strict` policy cover this role? */
-function isStrictForRole(roleKey: string): boolean {
+/** Does the configured `strict` policy cover this pool? */
+function isStrictForPool(poolName: string): boolean {
   const { strict } = activeConfig;
   if (strict === true) return true;
-  if (Array.isArray(strict)) return strict.map((r) => normalizeRoleKey(r)).includes(roleKey);
+  if (Array.isArray(strict)) return strict.map((entry) => normalizePoolName(entry)).includes(poolName);
   return false;
 }
 
@@ -1313,36 +1629,36 @@ function filterAvailable(selectors: string[], models: ModelsQuery | undefined): 
  * Returns undefined when nothing is eligible (the cursor is not consumed).
  */
 function pickRoundRobin(
-  roleKey: string,
+  poolName: string,
   pool: string[],
   eligible: boolean[],
 ): { picked: string; index: number } | undefined {
-  const start = pool.length === 0 ? 0 : (counters[roleKey] ?? 0) % pool.length;
+  const start = pool.length === 0 ? 0 : (counters[poolName] ?? 0) % pool.length;
   for (let offset = 0; offset < pool.length; offset++) {
     const index = (start + offset) % pool.length;
     if (eligible[index] !== true) continue;
-    counters[roleKey] = (index + 1) % pool.length;
+    counters[poolName] = (index + 1) % pool.length;
     return { picked: pool[index] as string, index };
   }
   return undefined;
 }
 
 /**
- * Pick for a role, honoring `persistCounters`. A persistence failure logs and
+ * Pick from a pool, honoring `persistCounters`. A persistence failure logs and
  * falls back to the in-memory counter (fail open) rather than aborting a spawn.
  */
-async function pickForRole(
+async function pickForPool(
   pi: ExtensionApiLike,
-  roleKey: string,
+  poolName: string,
   pool: string[],
   availability: PoolAvailability,
 ): Promise<{ picked: string; index: number; persisted: boolean } | undefined> {
   if (!activeConfig.persistCounters) {
-    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    const pick = pickRoundRobin(poolName, pool, availability.eligible);
     return pick === undefined ? undefined : { ...pick, persisted: false };
   }
   try {
-    const picked = await advancePersisted(roleKey, pool.length, availability.eligible, activeConfig.stateFile);
+    const picked = await advancePersisted(poolName, pool.length, availability.eligible, activeConfig.stateFile);
     if (picked === undefined) return undefined;
     if (picked.replacedLegacy) {
       safeLog(
@@ -1352,7 +1668,7 @@ async function pickForRole(
           `the old file is kept at ${activeConfig.stateFile}.v1.bak and rotation continued from a fresh cursor`,
       );
     }
-    counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
+    counters[poolName] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
     return { picked: pool[picked.index] as string, index: picked.index, persisted: true };
   } catch (err) {
     safeLog(
@@ -1360,14 +1676,14 @@ async function pickForRole(
       "warn",
       `[model-pool] persisted counter read/write failed; using in-memory counters: ${err instanceof Error ? err.message : String(err)}`,
     );
-    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    const pick = pickRoundRobin(poolName, pool, availability.eligible);
     return pick === undefined ? undefined : { ...pick, persisted: false };
   }
 }
 
 /** Human-readable routing note surfaced in the task UI. */
-function describePick(roleKey: string, picked: string, index: number, total: number): string {
-  return `pool ${roleKey}[${index + 1}/${total}]: ${picked}`;
+function describePick(poolName: string, picked: string, index: number, total: number): string {
+  return `pool/${poolName}[${index + 1}/${total}]: ${picked}`;
 }
 
 /**
@@ -1490,49 +1806,76 @@ function sessionFreshness(ctx: ExtensionContextLike): boolean | undefined {
 // Event handlers.
 // ---------------------------------------------------------------------------
 
-/** `before_subagent_spawn` handler: rotate the model for a role-keyed pool. */
-function handleBeforeSubagentSpawn(
+/**
+ * Carry a `pool/<name>:<level>` thinking suffix onto a member that has none.
+ * Only a known level counts as a suffix: `kilo/x:free` keeps `:free` as part of
+ * its id and still takes the pool's level (`kilo/x:free:high`).
+ */
+function withThinking(selector: string, thinking: string): string {
+  if (thinking.length === 0) return selector;
+  const colon = selector.lastIndexOf(":");
+  if (colon !== -1 && THINKING_LEVELS[selector.slice(colon + 1)] === true) return selector;
+  return `${selector}${thinking}`;
+}
+
+/** Bring config, provider registration and the forwarder's host handles up to date. */
+function prepare(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  captureHost(pi, ctx);
+  refreshFromSource(pi);
+  syncPoolProvider(pi, ctx.models);
+}
+
+/**
+ * `before_subagent_spawn` handler: a child whose primary model is
+ * `pool/<name>` starts on the next member in rotation, and the pool's other
+ * eligible members become its retry fallbacks. Any other spawn is untouched:
+ * a pool applies only where its model was chosen.
+ */
+async function handleBeforeSubagentSpawn(
   pi: ExtensionApiLike,
   event: BeforeSubagentSpawnEvent,
   ctx: ExtensionContextLike,
-): BeforeSubagentSpawnResult | undefined | Promise<BeforeSubagentSpawnResult | undefined> {
+): Promise<BeforeSubagentSpawnResult | undefined> {
   try {
-    // Explicit per-dispatch pin (no role alias) — preserve the deliberate pin.
-    if (event.modelRole === undefined || event.modelRole === null) {
-      safeLog(pi, "debug", `[model-pool] passthrough: explicit model pin for agent=${event.agent ?? "?"} kind=${event.invocationKind ?? "?"}`);
+    prepare(pi, ctx);
+    const patterns = Array.isArray(event.patterns) ? event.patterns : [];
+    const selected = parsePoolSelector(patterns[0]);
+    if (selected === undefined) return undefined;
+
+    const pool = activeConfig.pools[selected.name];
+    if (pool === undefined || pool.length === 0) {
+      safeLog(pi, "warn", `[model-pool] agent=${event.agent} asked for pool/${selected.name}, which is not configured; leaving spawn unmodified`);
       return undefined;
     }
-    const roleKey = normalizeRoleKey(event.modelRole);
-    if (roleKey.length === 0) return undefined;
-
-    const pool = activeConfig.pools[roleKey];
-    if (pool === undefined || pool.length === 0) return undefined; // Unconfigured role: core behavior unchanged.
 
     const availability = filterAvailable(pool, ctx.models);
     if (availability.count === 0) {
       // Hard-block only when the registry actually answered "none of these are
       // authenticated"; an unreadable registry is a transient failure, not a
       // reason to refuse the spawn.
-      if (isStrictForRole(roleKey) && availability.registryReadable) {
-        return { block: true, reason: `model-pool: no authenticated model available for role @${roleKey}` };
+      if (isStrictForPool(selected.name) && availability.registryReadable) {
+        return { block: true, reason: `model-pool: no authenticated model available in pool/${selected.name}` };
       }
-      safeLog(pi, "warn", `[model-pool] empty pool for role=${roleKey} agent=${event.agent} kind=${event.invocationKind} registryReadable=${availability.registryReadable}; leaving spawn unmodified`);
+      safeLog(pi, "warn", `[model-pool] empty pool/${selected.name} for agent=${event.agent} kind=${event.invocationKind} registryReadable=${availability.registryReadable}; leaving spawn unmodified`);
       return undefined;
     }
 
-    if (activeConfig.persistCounters) {
-      return pickForRole(pi, roleKey, pool, availability).then((pick) => {
-        if (pick === undefined) return undefined;
-        const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-        return { model: pick.picked, note };
-      });
-    }
-    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+    const pick = await pickForPool(pi, selected.name, pool, availability);
     if (pick === undefined) return undefined;
-    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-    safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-    return { model: pick.picked, note };
+    // Picked member first, then the rest of the pool in rotation order, then
+    // whatever fallbacks the spawn already had. Each is a separate model for
+    // the child's retry chain, never a switch inside one conversation.
+    const ordered: string[] = [];
+    for (let offset = 0; offset < pool.length; offset++) {
+      const index = (pick.index + offset) % pool.length;
+      if (availability.eligible[index] === true) ordered.push(withThinking(pool[index] as string, selected.thinking));
+    }
+    for (const fallback of patterns.slice(1)) {
+      if (!ordered.includes(fallback)) ordered.push(fallback);
+    }
+    const note = describePick(selected.name, pick.picked, pick.index, pool.length);
+    safeLog(pi, "info", `[model-pool] pool/${selected.name} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
+    return { model: ordered, note };
   } catch (err) {
     // Fail open: a router error must never break the task call.
     try {
@@ -1544,38 +1887,79 @@ function handleBeforeSubagentSpawn(
   }
 }
 
-/** `session_start` handler: rotate the main session's model, main agent only. */
+/** Set once the role-named-pool notice has been shown in this process. */
+let migrationNoticeShown = false;
+
+/**
+ * Pools used to apply to the role with the same name automatically. Point out
+ * any pool still named after a role that does not select it, once per process.
+ */
+function noticeUnselectedRolePools(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
+  if (migrationNoticeShown || ctx.models === undefined) return;
+  migrationNoticeShown = true;
+  const unused: string[] = [];
+  for (const name of Object.keys(activeConfig.pools)) {
+    let role: ModelLike | undefined;
+    try {
+      role = ctx.models.resolve(`@${name}`);
+    } catch {
+      role = undefined;
+    }
+    if (role === undefined || role === null) continue;
+    if (modelIdentity(role) !== `${POOL_PROVIDER}/${name}`) unused.push(name);
+  }
+  if (unused.length === 0) return;
+  const how = unused.map((name) => `${name} → pool/${name}`).join(", ");
+  emit(
+    pi,
+    ctx,
+    `pools now apply only where you select them; these are named after roles that do not use them: ${unused.join(", ")}. To keep rotating, set the role in /model or settings (${how}).`,
+    "warning",
+  );
+}
+
+/**
+ * `session_start` handler. Every session refreshes the config and the `pool`
+ * provider. A fresh main session whose model is `pool/<name>` switches to the
+ * next member before its first turn; a resumed one keeps its model, and its
+ * direct requests forward to a member pinned for that session.
+ */
 async function handleSessionStart(
   pi: ExtensionApiLike,
   _event: SessionStartEvent,
   ctx: ExtensionContextLike,
 ): Promise<void> {
   try {
-    if (!activeConfig.enableMainSessionRotation) return;
-    if (ctx.agent?.kind !== "main") return; // Main sessions only.
+    prepare(pi, ctx);
+    if (ctx.agent?.kind !== "main") return; // A child's model was settled at spawn.
+    noticeUnselectedRolePools(pi, ctx);
+
+    const selected = parsePoolSelector(currentModelIdentity(ctx));
+    if (selected === undefined) return;
 
     // `session_start` also fires for a *loaded* session, so a resume must never
     // re-rotate: OMP restores that session's saved model, and overriding it here
     // would change the model mid-conversation and invalidate prompt caches.
     const freshness = sessionFreshness(ctx);
     if (freshness !== true) {
-      safeLog(pi, "info", `[model-pool] main session not rotated (${freshness === false ? "loaded session already has a conversation" : "session novelty unknown"})`);
+      safeLog(pi, "info", `[model-pool] main session stays on pool/${selected.name} (${freshness === false ? "loaded session already has a conversation" : "session novelty unknown"}); requests forward to a member pinned for this session`);
       return;
     }
 
-    const roleKey = activeConfig.mainSessionRole;
-    const pool = activeConfig.pools[roleKey];
-    if (pool === undefined || pool.length === 0) return;
-
+    const pool = activeConfig.pools[selected.name];
+    if (pool === undefined || pool.length === 0) {
+      emit(pi, ctx, `pool/${selected.name} is selected but not configured; add it with /model-pool edit`, "warning");
+      return;
+    }
     const availability = filterAvailable(pool, ctx.models);
     if (availability.count === 0) {
-      safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey} registryReadable=${availability.registryReadable}; leaving model unchanged`);
+      safeLog(pi, "warn", `[model-pool] main session: empty pool/${selected.name} registryReadable=${availability.registryReadable}; leaving model unchanged`);
       return;
     }
-    const pick = await pickForRole(pi, roleKey, pool, availability);
+    const pick = await pickForPool(pi, selected.name, pool, availability);
     if (pick === undefined) return;
-    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
+    const note = describePick(selected.name, pick.picked, pick.index, pool.length);
+    safeLog(pi, "info", `[model-pool] main session pool/${selected.name} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
     // Applying the pick is a separate step from choosing it, and shares the
     // same host boundary the manual picker uses. A refusal, an unresolvable
     // selector, or a host that keeps a different model is never reported as a
@@ -1716,14 +2100,15 @@ function describeApplyFailure(context: string, selector: string, result: ApplyMo
 //
 // The command is a convenience layer over the same engine the hooks use: it
 // never changes the round-robin policy, never advances a counter, and never
-// edits OMP's own role or settings files. All dialogs are optional members of
+// edits OMP's own role or settings files: a pool takes effect only where the
+// operator selects `pool/<name>`. All dialogs are optional members of
 // the host's UI surface, so every entry point degrades to a notification rather
 // than assuming a dialog is available.
 // ---------------------------------------------------------------------------
 
 const COMMAND_NAME = "model-pool";
-/** Sentinel option values; not valid role names (they contain no word characters). */
-const NEW_ROLE_VALUE = "::new-role::";
+/** Sentinel option values; not valid pool names (they contain ":"). */
+const NEW_POOL_VALUE = "::new-pool::";
 const BACK_VALUE = "::back::";
 /** Above this many models, ask for a substring before showing the list. */
 const MODEL_FILTER_THRESHOLD = 12;
@@ -1868,16 +2253,16 @@ function describeSource(): string {
 }
 
 /**
- * One-line pre-edit summary of the role about to be edited: configured order
+ * One-line pre-edit summary of the pool about to be edited: configured order
  * with authenticated membership, counter policy, and the cursor guarantee.
  * Read-only, so merely entering the editor still changes nothing.
  */
-function describeRoleForEditing(role: string, pool: string[], models: ModelsQuery | undefined): string {
+function describePoolForEditing(name: string, pool: string[], models: ModelsQuery | undefined): string {
   if (pool.length === 0) {
-    return `model-pool: @${role} has no pool yet — adding a model creates it, and the order decides the rotation sequence`;
+    return `model-pool: pool/${name} has no models yet — adding one creates it, and the order decides the rotation sequence`;
   }
   const report = diagnosePools(models);
-  const entries = report.roles.find((r) => r.role === role)?.entries ?? [];
+  const entries = report.pools.find((diagnosis) => diagnosis.pool === name)?.entries ?? [];
   const order = report.registryReadable
     ? pool
         .map((selector, i) => {
@@ -1890,15 +2275,24 @@ function describeRoleForEditing(role: string, pool: string[], models: ModelsQuer
   const policy = activeConfig.persistCounters
     ? `counters persist across processes (${activeConfig.stateFile})`
     : "counters are process-local";
-  return `model-pool: @${role} order: ${order} — ${policy}; editing never moves the cursor`;
+  return `model-pool: pool/${name} order: ${order} — ${policy}; editing never moves the cursor`;
 }
 
-/** Report the outcome of a save attempt; returns whether it succeeded. */
-function reportEditOutcome(ctx: ExtensionContextLike, outcome: PoolEditOutcome, successMessage: string): boolean {
+/**
+ * Report the outcome of a save attempt and, on success, refresh the `pool`
+ * provider so an added or deleted pool shows up in the model picker at once.
+ */
+function reportEditOutcome(
+  pi: ExtensionApiLike,
+  ctx: ExtensionContextLike,
+  outcome: PoolEditOutcome,
+  successMessage: string,
+): boolean {
   if (!outcome.ok) {
     notifyUser(ctx, `model-pool: ${outcome.error}`, "error");
     return false;
   }
+  syncPoolProvider(pi, ctx.models);
   const suffix = outcome.runtimeOnly ? " (runtime-only; not written to disk)" : "";
   notifyUser(ctx, `model-pool: ${successMessage}${suffix}`, "info");
   return true;
@@ -1971,8 +2365,8 @@ async function runModelPicker(pi: ExtensionApiLike, ctx: ExtensionContextLike): 
   }
 }
 
-/** `/model-pool edit [role]`: add, remove, reorder or delete role pools. */
-async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): Promise<void> {
+/** `/model-pool edit [pool]`: add, remove, reorder or delete pools. */
+async function runPoolEditor(pi: ExtensionApiLike, ctx: ExtensionContextLike, initialPool?: string): Promise<void> {
   if (!isMainAgent(ctx)) {
     notifyUser(ctx, "model-pool: editing pools is available in the main session only", "warning");
     return;
@@ -1989,52 +2383,52 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
     );
     return;
   }
-  let role = normalizeRoleKey(initialRole ?? "");
-  let announcedRole = "";
+  let name = normalizePoolName(initialPool ?? "");
+  let announced = "";
 
   for (;;) {
-    if (role.length === 0) {
+    if (name.length === 0) {
       const pools = getPools();
-      const items: { label: string; description?: string; value: string }[] = Object.keys(pools).map((name) => {
-        const count = pools[name]?.length ?? 0;
-        return { label: `@${name}`, description: `${count} ${count === 1 ? "entry" : "entries"}`, value: name };
+      const items: { label: string; description?: string; value: string }[] = Object.keys(pools).map((key) => {
+        const count = pools[key]?.length ?? 0;
+        return { label: `pool/${key}`, description: `${count} ${count === 1 ? "model" : "models"}`, value: key };
       });
-      items.push({ label: "New role…", description: "create a role pool", value: NEW_ROLE_VALUE });
+      items.push({ label: "New pool…", description: "create a pool you can select as a model", value: NEW_POOL_VALUE });
       items.push({ label: "Back", description: "close the editor", value: BACK_VALUE });
-      const picked = await pickLabeled(ctx, `Role pools — ${describeSource()}`, items);
+      const picked = await pickLabeled(ctx, `Pools — ${describeSource()}`, items);
       if (picked === undefined || picked === BACK_VALUE) return;
-      if (picked === NEW_ROLE_VALUE) {
-        const name = await inputDialog(ctx, "New role name", "for example: slow (a leading @ is optional)");
-        if (name === undefined) continue;
-        const key = normalizeRoleKey(name);
-        if (key.length === 0) {
-          notifyUser(ctx, "model-pool: a role name is required", "warning");
+      if (picked === NEW_POOL_VALUE) {
+        const entered = await inputDialog(ctx, "New pool name", "for example: cheap-coders (becomes pool/cheap-coders)");
+        if (entered === undefined) continue;
+        const key = normalizePoolName(entered);
+        if (key.length === 0 || !POOL_NAME_PATTERN.test(key)) {
+          notifyUser(ctx, 'model-pool: a pool name needs letters, digits, ".", "_" or "-"', "warning");
           continue;
         }
         if (getPools()[key] === undefined) {
           notifyUser(
             ctx,
-            `model-pool: @${key} has no pool yet; a pool routes only spawns that ask for @${key} — it does not create or assign an OMP core role`,
+            `model-pool: pool/${key} takes effect only where you select it: /model, a role in settings, or an agent's model`,
             "info",
           );
         }
-        role = key;
+        name = key;
         continue;
       }
-      role = picked;
+      name = picked;
       continue;
     }
 
-    const pool = getPools()[role] ?? [];
+    const pool = getPools()[name] ?? [];
     // Capture the revision before any await: an edit committed after this point
     // by another command makes this editor's next write stale, and it refreshes
     // instead of overwriting.
     const revision = configRevision;
-    // Announce once per role entry, not after every action, so order and
+    // Announce once per pool entry, not after every action, so order and
     // availability are shown before editing without becoming noise.
-    if (announcedRole !== role) {
-      announcedRole = role;
-      notifyUser(ctx, describeRoleForEditing(role, pool, ctx.models), "info");
+    if (announced !== name) {
+      announced = name;
+      notifyUser(ctx, describePoolForEditing(name, pool, ctx.models), "info");
     }
     const items: { label: string; description?: string; value: string }[] = [
       { label: "Add model…", description: "append a model to this pool", value: "add" },
@@ -2043,19 +2437,19 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
       items.push({ label: "Remove entry…", value: "remove" });
       items.push({ label: "Move earlier…", value: "earlier" });
       items.push({ label: "Move later…", value: "later" });
-      items.push({ label: "Delete pool", description: "remove the role entirely", value: "delete" });
+      items.push({ label: "Delete pool", description: "remove the pool entirely", value: "delete" });
     }
-    items.push({ label: "Back", description: "choose another role", value: "back" });
+    items.push({ label: "Back", description: "choose another pool", value: "back" });
 
-    const heading = `@${role} (${pool.length} ${pool.length === 1 ? "entry" : "entries"}) — ${describeSource()}`;
+    const heading = `pool/${name} (${pool.length} ${pool.length === 1 ? "model" : "models"}) — ${describeSource()}`;
     const action = await pickLabeled(ctx, heading, items);
     if (action === undefined || action === "back") {
-      role = "";
+      name = "";
       continue;
     }
 
     if (action === "add") {
-      const models = readAuthenticatedModels(ctx);
+      const models = readAuthenticatedModels(ctx)?.filter((model) => model.provider !== POOL_PROVIDER);
       if (models === undefined) {
         notifyUser(ctx, "model-pool: the model registry is unavailable", "error");
         continue;
@@ -2064,43 +2458,44 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
         notifyUser(ctx, "model-pool: no authenticated models are available", "warning");
         continue;
       }
-      const chosen = await chooseModel(ctx, models, `Add a model to @${role}`);
+      const chosen = await chooseModel(ctx, models, `Add a model to pool/${name}`);
       if (chosen === undefined) continue;
       // The dialog may outlive the snapshot: re-resolve against the live registry
       // so a model that lost authentication while the picker was open is not
       // saved and then reported as added.
       if (filterAvailable([chosen], ctx.models).eligible[0] !== true) {
-        notifyUser(ctx, `model-pool: ${chosen} is no longer authenticated; not added to @${role}`, "warning");
+        notifyUser(ctx, `model-pool: ${chosen} is no longer authenticated; not added to pool/${name}`, "warning");
         continue;
       }
-      const outcome = await savePoolEdit(role, [...pool, chosen], revision);
-      reportEditOutcome(ctx, outcome, `added ${chosen} to @${role} (slot ${pool.length + 1})`);
+      const outcome = await savePoolEdit(name, [...pool, chosen], revision);
+      reportEditOutcome(pi, ctx, outcome, `added ${chosen} to pool/${name} (slot ${pool.length + 1})`);
       continue;
     }
 
     if (action === "remove") {
-      const index = await pickSlot(ctx, `Remove an entry from @${role}`, pool);
+      const index = await pickSlot(ctx, `Remove an entry from pool/${name}`, pool);
       if (index === undefined) continue;
       const remaining = pool.filter((_, i) => i !== index);
       if (remaining.length === 0) {
         const ok = await confirmDialog(
           ctx,
-          `Delete @${role}?`,
-          "This is the last entry, so the role pool is removed and its spawns fall back to core behavior.",
+          `Delete pool/${name}?`,
+          "This is the last entry, so the pool is removed; anything still set to it stops resolving.",
         );
         if (!ok) continue;
       }
-      const outcome = await savePoolEdit(role, remaining.length === 0 ? null : remaining, revision);
+      const outcome = await savePoolEdit(name, remaining.length === 0 ? null : remaining, revision);
       reportEditOutcome(
+        pi,
         ctx,
         outcome,
-        remaining.length === 0 ? `deleted @${role}` : `removed slot ${index + 1} from @${role}`,
+        remaining.length === 0 ? `deleted pool/${name}` : `removed slot ${index + 1} from pool/${name}`,
       );
       continue;
     }
 
     if (action === "earlier" || action === "later") {
-      const index = await pickSlot(ctx, `Move which entry of @${role}?`, pool);
+      const index = await pickSlot(ctx, `Move which entry of pool/${name}?`, pool);
       if (index === undefined) continue;
       const target = action === "earlier" ? index - 1 : index + 1;
       if (target < 0 || target >= pool.length) {
@@ -2111,21 +2506,21 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
       const moved = next[index] as string;
       next[index] = next[target] as string;
       next[target] = moved;
-      const outcome = await savePoolEdit(role, next, revision);
-      reportEditOutcome(ctx, outcome, `moved ${moved} to slot ${target + 1}`);
+      const outcome = await savePoolEdit(name, next, revision);
+      reportEditOutcome(pi, ctx, outcome, `moved ${moved} to slot ${target + 1}`);
       continue;
     }
 
     if (action === "delete") {
       const ok = await confirmDialog(
         ctx,
-        `Delete @${role}?`,
-        `The @${role} pool is removed, and its spawns fall back to core behavior.`,
+        `Delete pool/${name}?`,
+        `pool/${name} is removed; anything still set to it stops resolving.`,
       );
       if (!ok) continue;
-      const outcome = await savePoolEdit(role, null, revision);
-      reportEditOutcome(ctx, outcome, `deleted @${role}`);
-      role = "";
+      const outcome = await savePoolEdit(name, null, revision);
+      reportEditOutcome(pi, ctx, outcome, `deleted pool/${name}`);
+      name = "";
       continue;
     }
   }
@@ -2148,23 +2543,23 @@ function sourceStatusLabel(): "writable" | "runtime-only" | "editing disabled" {
 /** `/model-pool status`: read-only summary; never writes. */
 function runStatus(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
   const pools = getPools();
-  const roles = Object.keys(pools);
+  const names = Object.keys(pools);
   const lines = [
     `config: ${configSource.label} (${configSource.kind}, ${sourceStatusLabel()})`,
   ];
   if (configSource.note !== undefined) lines.push(`config note: ${configSource.note}`);
-  lines.push(`main role: @${activeConfig.mainSessionRole} (rotation ${activeConfig.enableMainSessionRotation ? "on" : "off"})`);
   lines.push(
     `strict: ${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(", ") || "none" : String(activeConfig.strict)}`,
   );
   lines.push(`persistence: ${activeConfig.persistCounters ? activeConfig.stateFile : "off (in-memory counters only)"}`);
   lines.push(
-    `pools: ${roles.length === 0 ? "none configured" : roles.map((r) => `@${r}[${pools[r]?.length ?? 0}]`).join(", ")}`,
+    `pools: ${names.length === 0 ? "none configured" : names.map((key) => `pool/${key}[${pools[key]?.length ?? 0}]`).join(", ")}`,
   );
+  if (names.length > 0) lines.push("a pool applies only where it is selected: /model, a role in settings, or an agent's model");
   lines.push(`current model: ${currentModelIdentity(ctx) || "unknown"}`);
-  for (const name of roles) {
-    const entries = (pools[name] ?? []).map((selector, index) => `${index + 1}. ${selector}`).join("  ");
-    lines.push(`  @${name}: ${entries}`);
+  for (const key of names) {
+    const entries = (pools[key] ?? []).map((selector, index) => `${index + 1}. ${selector}`).join("  ");
+    lines.push(`  pool/${key}: ${entries}`);
   }
   lines.push(`counters (process-local): ${JSON.stringify(getCounters())}`);
   emit(pi, ctx, lines.join("\n"), "info");
@@ -2174,10 +2569,10 @@ function runStatus(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
 function runDoctor(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
   const report = diagnosePools(ctx.models);
   const lines = [`registry: ${report.registryNote}`];
-  if (report.roles.length === 0) lines.push("no pools configured");
-  for (const role of report.roles) {
-    lines.push(`@${role.role}:`);
-    for (const entry of role.entries) {
+  if (report.pools.length === 0) lines.push("no pools configured");
+  for (const diagnosis of report.pools) {
+    lines.push(`pool/${diagnosis.pool}:`);
+    for (const entry of diagnosis.entries) {
       lines.push(`  ${entry.eligible ? "ok" : "unavailable"}: ${entry.selector} — ${entry.reason}`);
     }
   }
@@ -2195,7 +2590,7 @@ function runHelp(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
       "/model-pool — round-robin model pool",
       "  (no argument)  open the menu",
       "  pick           switch the current main-session model",
-      "  edit [role]    add, remove, reorder or delete role pools (auto-saved)",
+      "  edit [pool]    add, remove, reorder or delete pools (auto-saved)",
       "  status         show the active configuration and pools",
       "  doctor         per-entry authentication diagnosis (read-only)",
       "  help           show this help",
@@ -2212,7 +2607,7 @@ async function runMenu(pi: ExtensionApiLike, ctx: ExtensionContextLike): Promise
   }
   const picked = await pickLabeled(ctx, "Model pool", [
     { label: "Switch Current Model", description: "change this session's model", value: "pick" },
-    { label: "Edit Role Pools", description: "add, remove, reorder or delete pools", value: "edit" },
+    { label: "Edit Pools", description: "add, remove, reorder or delete pools", value: "edit" },
     { label: "Status", description: "show configuration and pools", value: "status" },
     { label: "Doctor", description: "diagnose model availability", value: "doctor" },
     { label: "Help", description: "show command usage", value: "help" },
@@ -2223,6 +2618,8 @@ async function runMenu(pi: ExtensionApiLike, ctx: ExtensionContextLike): Promise
 
 /** Route `/model-pool` arguments. */
 async function dispatchCommand(pi: ExtensionApiLike, ctx: ExtensionContextLike, rawArgs: string): Promise<void> {
+  // Commands show and edit the live configuration, so bring it up to date first.
+  prepare(pi, ctx);
   const args = rawArgs.trim();
   if (args.length === 0) {
     await runMenu(pi, ctx);
@@ -2236,7 +2633,7 @@ async function dispatchCommand(pi: ExtensionApiLike, ctx: ExtensionContextLike, 
       await runModelPicker(pi, ctx);
       return;
     case "edit":
-      await runPoolEditor(ctx, tail);
+      await runPoolEditor(pi, ctx, tail);
       return;
     case "status":
       runStatus(pi, ctx);
@@ -2264,7 +2661,7 @@ function registerCommandSurface(pi: ExtensionApiLike): void {
   }
   try {
     pi.registerCommand(COMMAND_NAME, {
-      description: "Round-robin model pool: switch the current model or edit role pools",
+      description: "Model pools you select as pool/<name>: edit pools or switch the current model",
       handler: (args, ctx) => dispatchCommand(pi, ctx, args),
     });
     safeLog(pi, "info", `[model-pool] registered /${COMMAND_NAME}`);
@@ -2282,8 +2679,8 @@ function registerCommandSurface(pi: ExtensionApiLike): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Extension factory: load configuration, register both event handlers, then
- * register the optional command surface.
+ * Extension factory: load configuration, register the `pool` provider and
+ * both event handlers, then the optional command surface.
  *
  * Programmatic `options` are an unconditional replacement and are runtime-only.
  * Without options the environment/default source is loaded; when the factory is
@@ -2308,23 +2705,31 @@ export default function modelPoolExtension(pi: ExtensionApiLike, options?: Model
       configFingerprint = undefined;
       configRevision += 1;
       loadedSignature = signature;
+      for (const warning of normalized.warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
     }
   } else {
+    // A factory call without options always reads the environment source, even
+    // after an earlier options load; the hooks' refresh leaves options alone.
     const loaded = loadConfigWithSource();
-    const signature = sourceSignature(loaded);
+    const signature = sourceSignature(loaded.source, loaded.fingerprint);
     if (signature !== loadedSignature) {
-      configureLoaded(loaded);
+      const warnings = configureLoaded(loaded);
       loadedSignature = signature;
-      for (const warning of loaded.warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
+      for (const warning of warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
     }
   }
 
-  const roles = Object.keys(activeConfig.pools);
+  const pools = Object.keys(activeConfig.pools);
   safeLog(
     pi,
     "info",
-    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"} source=${configSource.kind}`,
+    `[model-pool] loaded pools=[${pools.map((name) => `pool/${name}`).join(", ")}] strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"} source=${configSource.kind}`,
   );
+
+  // Pools exist as models before any session starts, so `--model pool/<name>`
+  // and roles that name one resolve. Limits are refined once a registry is seen.
+  syncPoolProvider(pi, undefined);
+  loadPiAi(pi);
 
   // Routing hooks are registered first and independently of the command
   // surface: a host that cannot register commands must still rotate pools.

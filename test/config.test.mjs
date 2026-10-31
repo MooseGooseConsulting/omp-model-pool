@@ -106,8 +106,7 @@ const ROUTE_EV = {
   type: "before_subagent_spawn",
   agent: "reviewer",
   invocationKind: "task",
-  modelRole: "@slow",
-  patterns: ["@slow"],
+  patterns: ["pool/slow"],
 };
 
 function warns(logs) {
@@ -560,20 +559,25 @@ describe("automatic save transactions", () => {
     );
   });
 
-  it("C22: a role literally named __proto__ is saved as a JSON property", async () => {
+  it("C22: invalid pool names and nested pool entries are refused by the editor", async () => {
     const file = path.join(freshDir(), "proto.json");
-    process.env.OMP_MODEL_POOL_CONFIG = file; // missing: created on the first save
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
     const { pi } = makeHarness();
     mod.default(pi);
+    const before = fs.readFileSync(file, "utf8");
 
-    const outcome = await mod.savePoolEdit("__proto__", ["p/a"]);
-    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
-    const doc = readJson(file);
-    assert.ok(
-      Object.prototype.hasOwnProperty.call(doc.pools, "__proto__"),
-      "the role is stored as an own data property, not routed to the prototype",
-    );
-    assert.deepEqual(doc.pools["__proto__"], ["p/a"]);
+    for (const name of ["__proto__", "a b"]) {
+      const outcome = await mod.savePoolEdit(name, ["p/a"]);
+      assert.equal(outcome.ok, false, `"${name}" cannot become the model id pool/<name>`);
+      assert.match(outcome.error, /cannot be a pool name/);
+    }
+    const nested = await mod.savePoolEdit("slow", ["p/a", "pool/other"]);
+    assert.equal(nested.ok, false, "a pool cannot contain another pool");
+    assert.match(nested.error, /cannot contain another pool/);
+
+    assert.equal(fs.readFileSync(file, "utf8"), before, "a refused edit leaves the file untouched");
+    assert.deepEqual(mod.getPools().slow, ["p/a"]);
   });
 
   it("C23: concurrent edits from the same revision cannot both commit", async () => {
@@ -669,13 +673,13 @@ describe("authenticated membership", () => {
     const models = modelsFrom({ listed: ["p/a"], resolvable: ["p/ghost", "p/a"] });
 
     const picked = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
-    assert.equal(picked.model, "p/a");
+    assert.deepEqual(picked.model, ["p/a"], "the unauthenticated member is not offered as a fallback");
 
     const report = mod.diagnosePools(models);
-    const role = report.roles.find((r) => r.role === "slow");
-    assert.equal(role.entries[0].eligible, false);
-    assert.match(role.entries[0].reason, /not authenticated/);
-    assert.equal(role.entries[1].eligible, true);
+    const pool = report.pools.find((p) => p.pool === "slow");
+    assert.equal(pool.entries[0].eligible, false);
+    assert.match(pool.entries[0].reason, /not authenticated/);
+    assert.equal(pool.entries[1].eligible, true);
   });
 
   it("E24: a readable but empty registry makes every entry unavailable", async () => {
@@ -688,7 +692,8 @@ describe("authenticated membership", () => {
 
     const report = mod.diagnosePools(models);
     assert.equal(report.registryReadable, true);
-    assert.equal(report.roles[0].entries[0].eligible, false);
+    assert.equal(report.pools[0].pool, "slow");
+    assert.equal(report.pools[0].entries[0].eligible, false);
   });
 
   it("E25: a missing or throwing registry fails open and reports unreadable", async () => {
@@ -713,10 +718,8 @@ describe("authenticated membership", () => {
       ROUTE_EV,
       subCtx(modelsFrom({ listed: ["p/other"] })),
     );
-    assert.deepEqual(blocked, {
-      block: true,
-      reason: "model-pool: no authenticated model available for role @slow",
-    });
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /no authenticated model available in pool\/slow/);
 
     const unreadable = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(undefined));
     assert.equal(unreadable, undefined);
@@ -728,11 +731,150 @@ describe("authenticated membership", () => {
     const models = modelsFrom({ listed: ["p/a", "p/b"], resolvable: ["p/a", "p/ghost", "p/b"] });
 
     const report = mod.diagnosePools(models);
-    assert.deepEqual(report.roles[0].entries.map((e) => e.eligible), [true, false, true]);
+    assert.deepEqual(report.pools[0].entries.map((e) => e.eligible), [true, false, true]);
 
     const first = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
     const second = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
-    assert.equal(first.model, "p/a");
-    assert.equal(second.model, "p/b");
+    assert.equal(first.model[0], "p/a");
+    assert.equal(second.model[0], "p/b");
+  });
+});
+
+describe("reload on change", () => {
+  it("applies an on-disk edit on the very next spawn without re-running the factory", async () => {
+    const file = path.join(freshDir(), "reload.json");
+    writeJson(file, { pools: { t: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+
+    const { pi, handlers } = makeHarness();
+    mod.default(pi);
+    assert.deepEqual(mod.getPools().t, ["p/a"]);
+
+    const models = modelsFrom({ listed: ["p/a", "p/b"] });
+    const ev = { ...ROUTE_EV, patterns: ["pool/t"] };
+    const first = await handlers.before_subagent_spawn(ev, subCtx(models));
+    assert.deepEqual(first.model, ["p/a"]);
+    assert.match(first.note, /^pool\/t\[1\/1\]: p\/a$/);
+
+    // Edit the file behind the module's back: no factory call, no save API.
+    writeJson(file, { pools: { t: ["p/b"] } });
+
+    const second = await handlers.before_subagent_spawn(ev, subCtx(models));
+    assert.deepEqual(second.model, ["p/b"], "the edited pool is used by the next spawn, not one spawn later");
+    assert.match(second.note, /^pool\/t\[1\/1\]: p\/b$/);
+    assert.deepEqual(mod.getPools().t, ["p/b"], "the active configuration reflects the edited file");
+  });
+});
+
+describe("retired main-session keys", () => {
+  function loadFlat() {
+    const file = path.join(freshDir(), "retired-flat.json");
+    writeJson(file, {
+      slow: ["p/a"],
+      mainSessionRole: "default",
+      enableMainSessionRotation: true,
+    });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    return file;
+  }
+
+  function loadNested() {
+    const file = path.join(freshDir(), "retired-nested.json");
+    writeJson(file, {
+      pools: { slow: ["p/a"] },
+      mainSessionRole: "default",
+      enableMainSessionRotation: true,
+    });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    return file;
+  }
+
+  it("a flat config warns about each retired key and does not treat them as pools", () => {
+    loadFlat();
+    const { pi, logs } = makeHarness();
+    mod.default(pi);
+
+    const messages = warns(logs);
+    for (const key of ["mainSessionRole", "enableMainSessionRotation"]) {
+      assert.ok(
+        messages.some((m) => m.includes(key) && m.includes("is no longer used")),
+        `the retired key ${key} is reported as no longer used; got ${JSON.stringify(messages)}`,
+      );
+    }
+    assert.deepEqual(Object.keys(mod.getPools()), ["slow"], "only real pools are configured");
+  });
+
+  it("a nested config warns about each retired key and does not treat them as pools", () => {
+    loadNested();
+    const { pi, logs } = makeHarness();
+    mod.default(pi);
+
+    const messages = warns(logs);
+    for (const key of ["mainSessionRole", "enableMainSessionRotation"]) {
+      assert.ok(
+        messages.some((m) => m.includes(key) && m.includes("is no longer used")),
+        `the retired key ${key} is reported as no longer used; got ${JSON.stringify(messages)}`,
+      );
+    }
+    assert.deepEqual(Object.keys(mod.getPools()), ["slow"], "only real pools are configured");
+  });
+});
+
+describe("invalid pool names and nested entries", () => {
+  it("skips unusable names and pool/ entries while loading the valid pools", async () => {
+    const file = path.join(freshDir(), "invalid.json");
+    // A literal document on purpose: object literals would route `__proto__` to
+    // the prototype instead of writing an own key, and the point is to prove a
+    // hostile-looking key from the file is rejected like any other bad name.
+    writeText(
+      file,
+      [
+        "{",
+        '  "pools": {',
+        '    "slow": ["p/a"],',
+        '    "a b": ["p/x"],',
+        '    "__proto__": ["p/y"],',
+        '    "nested": ["pool/other", "p/z"]',
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(readJson(file).pools, "__proto__"),
+      "the fixture really carries __proto__ as an own key",
+    );
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi, handlers, logs } = makeHarness();
+    mod.default(pi);
+
+    const names = Object.keys(mod.getPools()).sort();
+    assert.deepEqual(names, ["nested", "slow"], "invalid names are skipped, valid pools still load");
+    assert.deepEqual(mod.getPools().nested, ["p/z"], "a pool/ entry is dropped, its siblings are kept");
+
+    const messages = warns(logs);
+    for (const bad of ["a b", "__proto__"]) {
+      assert.ok(
+        messages.some((m) => m.includes(`pool "${bad}"`) && /skipped/.test(m)),
+        `the invalid pool name ${bad} is reported; got ${JSON.stringify(messages)}`,
+      );
+    }
+    assert.ok(
+      messages.some((m) => m.includes("pool/other") && /cannot contain another pool/.test(m)),
+      `the nested entry is reported; got ${JSON.stringify(messages)}`,
+    );
+
+    // The surviving pools route normally.
+    const models = modelsFrom({ listed: ["p/a", "p/z"] });
+    const picked = await handlers.before_subagent_spawn(
+      { ...ROUTE_EV, patterns: ["pool/slow"] },
+      subCtx(models),
+    );
+    assert.deepEqual(picked.model, ["p/a"]);
+    const nested = await handlers.before_subagent_spawn(
+      { ...ROUTE_EV, patterns: ["pool/nested"] },
+      subCtx(models),
+    );
+    assert.deepEqual(nested.model, ["p/z"]);
   });
 });
