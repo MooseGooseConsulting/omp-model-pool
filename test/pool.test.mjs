@@ -938,3 +938,66 @@ describe("strict policy boundary", () => {
     assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available in pool/slow" });
   });
 });
+
+// A registry whose models carry the capability fields the host reads before a
+// request, so a pool's advertised limits, price and inputs are checkable.
+function makeRichModels(entries) {
+  const find = (spec) => {
+    const t = String(spec).trim();
+    return entries.find((m) => m.id === t || `${m.provider}/${m.id}` === t);
+  };
+  return {
+    list: () => entries.map((m) => ({ ...m })),
+    current: () => undefined,
+    resolve: (spec) => {
+      const found = find(spec);
+      return found === undefined ? undefined : { ...found };
+    },
+  };
+}
+
+/** The last config published for `name` through `registerProvider`. */
+function providersFor(providers, name) {
+  let found;
+  for (const [registered, config] of providers) {
+    if (registered === name) found = config;
+  }
+  return found;
+}
+
+describe("published pool model metadata", () => {
+  it("prices a pool by its dearest member, so a paid call is never free", async () => {
+    const { pi, handlers, providers } = makeHarness();
+    mod.default(pi, { pools: { mixed: ["free/m1", "paid/m2"] } });
+    const models = makeRichModels([
+      { provider: "free", id: "m1", contextWindow: 200000, maxTokens: 8000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+      { provider: "paid", id: "m2", contextWindow: 100000, maxTokens: 4000, cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+    ]);
+    await handlers.session_start({ type: "session_start" }, subCtx(models));
+    const published = providersFor(providers, mod.POOL_PROVIDER).models.find((m) => m.id === "mixed");
+    assert.deepEqual(published.cost, { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 });
+    assert.equal(published.contextWindow, 100000, "the smallest member limit is advertised");
+    assert.equal(published.maxTokens, 4000);
+  });
+
+  it("offers images only when every member accepts them", async () => {
+    const viaText = makeHarness();
+    mod.default(viaText.pi, { pools: { mixed: ["a/vision", "b/text"] } });
+    const mixedModels = makeRichModels([
+      { provider: "a", id: "vision", input: ["text", "image"], contextWindow: 1000, maxTokens: 100 },
+      { provider: "b", id: "text", input: ["text"], contextWindow: 1000, maxTokens: 100 },
+    ]);
+    await viaText.handlers.session_start({ type: "session_start" }, subCtx(mixedModels));
+    const mixed = providersFor(viaText.providers, mod.POOL_PROVIDER).models.find((m) => m.id === "mixed");
+    assert.deepEqual(mixed.input, ["text"], "one text-only member makes the pool text-only");
+
+    const allVision = makeHarness();
+    mod.default(allVision.pi, { pools: { eyes: ["a/vision"] } });
+    const visionModels = makeRichModels([
+      { provider: "a", id: "vision", input: ["text", "image"], contextWindow: 1000, maxTokens: 100 },
+    ]);
+    await allVision.handlers.session_start({ type: "session_start" }, subCtx(visionModels));
+    const eyes = providersFor(allVision.providers, mod.POOL_PROVIDER).models.find((m) => m.id === "eyes");
+    assert.deepEqual(eyes.input, ["text", "image"]);
+  });
+});

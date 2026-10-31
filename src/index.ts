@@ -146,11 +146,11 @@ interface EventStreamLike extends AsyncIterable<unknown> {
 }
 
 interface ProviderConfigLike {
-  baseUrl: string;
-  apiKey: string;
-  api: string;
-  streamSimple: (model: ModelLike, context: unknown, options?: StreamOptionsLike) => EventStreamLike;
-  models: ProviderModelDefinition[];
+  baseUrl?: string;
+  apiKey?: string;
+  api?: string;
+  streamSimple?: (model: ModelLike, context: unknown, options?: StreamOptionsLike) => EventStreamLike;
+  models?: ProviderModelDefinition[];
 }
 
 interface ExtensionApiLike {
@@ -850,10 +850,11 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): NormalizedCon
   const rawPools: unknown = raw?.pools ?? raw;
   if (rawPools !== null && typeof rawPools === "object" && !Array.isArray(rawPools)) {
     for (const [k, v] of Object.entries(rawPools as Record<string, unknown>)) {
-      // Skip the wrapper-level option keys when a flat config is passed.
-      if (raw?.pools === undefined && RESERVED_FLAT_KEYS.has(k)) continue;
       const key = normalizePoolName(k);
       if (key.length === 0) continue;
+      // Compare the name a pool would actually get, so `"@strict"` and
+      // `" strict "` cannot alias past the guard and shadow a real option.
+      if (raw?.pools === undefined && RESERVED_FLAT_KEYS.has(key)) continue;
       if (!POOL_NAME_PATTERN.test(key)) {
         warnings.push(`pool "${k}" skipped: a pool name becomes the model id pool/<name>, so use letters, digits, ".", "_" or "-"`);
         continue;
@@ -1099,7 +1100,20 @@ function refreshFromSource(pi: ExtensionApiLike): void {
   if (signature === loadedSignature) return;
   const warnings = configureLoaded(loaded);
   loadedSignature = signature;
+  prunePinsForConfiguredPools();
   for (const warning of warnings) safeLog(pi, "warn", `[model-pool] ${warning}`);
+}
+
+/**
+ * Drop pins whose pool no longer exists. A pin is only meaningful while its
+ * pool does, so removing the pool's members must not leave a stale entry that a
+ * later pool of the same name could inherit.
+ */
+function prunePinsForConfiguredPools(): void {
+  for (const key of sessionPins.keys()) {
+    const separator = key.lastIndexOf("\u0000");
+    if (separator === -1 || activeConfig.pools[key.slice(separator + 1)] === undefined) sessionPins.delete(key);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,16 +1171,26 @@ function positiveNumber(value: unknown): number | undefined {
 }
 
 /**
- * One provider model per pool. Limits are the smallest among the members that
- * resolve, so a pool never advertises more context than its weakest member can
- * take; without a registry they fall back to conservative defaults.
+ * One provider model per pool, described by its members: limits are the
+ * smallest among the members that resolve, so a pool never advertises more
+ * context than its weakest member can take; cost is the highest member price,
+ * so a paid member is never reported as a free call; and images are offered
+ * only when every member accepts them, since the host decides on the pool's
+ * capabilities before the request reaches whichever member answers.
+ *
+ * Without a registry the defaults stay conservative: the fallback limits, zero
+ * cost, and text-only input.
  */
 function poolModelDefinitions(models: ModelsQuery | undefined): ProviderModelDefinition[] {
   const out: ProviderModelDefinition[] = [];
   for (const name of Object.keys(activeConfig.pools).sort()) {
+    const members = activeConfig.pools[name] ?? [];
     let contextWindow: number | undefined;
     let maxTokens: number | undefined;
-    for (const selector of activeConfig.pools[name] ?? []) {
+    let reasoning = false;
+    let images = members.length > 0;
+    const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    for (const selector of members) {
       let resolved: ModelLike | undefined;
       try {
         resolved = models?.resolve(selector);
@@ -1178,13 +1202,23 @@ function poolModelDefinitions(models: ModelsQuery | undefined): ProviderModelDef
       const tokens = positiveNumber(resolved["maxTokens"]);
       if (window !== undefined) contextWindow = contextWindow === undefined ? window : Math.min(contextWindow, window);
       if (tokens !== undefined) maxTokens = maxTokens === undefined ? tokens : Math.min(maxTokens, tokens);
+      if (resolved["reasoning"] === true) reasoning = true;
+      const input = resolved["input"];
+      if (!Array.isArray(input) || input.includes("image") !== true) images = false;
+      const memberCost = resolved["cost"];
+      if (memberCost !== null && typeof memberCost === "object") {
+        for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+          const value = positiveNumber((memberCost as Record<string, unknown>)[key]);
+          if (value !== undefined) cost[key] = Math.max(cost[key], value);
+        }
+      }
     }
     out.push({
       id: name,
-      name: `Pool: ${name} (${(activeConfig.pools[name] ?? []).length} models)`,
-      reasoning: true,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      name: `Pool: ${name} (${members.length} models)`,
+      reasoning,
+      input: images ? ["text", "image"] : ["text"],
+      cost,
       contextWindow: contextWindow ?? FALLBACK_CONTEXT_WINDOW,
       maxTokens: maxTokens ?? FALLBACK_MAX_TOKENS,
     });
@@ -1210,7 +1244,11 @@ function syncPoolProvider(pi: ExtensionApiLike, models: ModelsQuery | undefined)
   if (previous === signature) return;
   try {
     if (definitions.length === 0) {
-      if (previous !== undefined) pi.unregisterProvider?.(POOL_PROVIDER);
+      // Re-registering with no models also clears the old ones on hosts that
+      // cannot unregister: a deleted pool must not stay selectable and then
+      // fail because nothing backs it.
+      if (typeof pi.unregisterProvider === "function") pi.unregisterProvider(POOL_PROVIDER);
+      else if (previous !== undefined) pi.registerProvider(POOL_PROVIDER, { models: [] });
     } else {
       pi.registerProvider(POOL_PROVIDER, {
         baseUrl: "https://model-pool.invalid/",
@@ -1247,18 +1285,56 @@ async function forwardTarget(poolName: string, sessionId: string | undefined): P
   const pinned = pinKey === undefined ? undefined : sessionPins.get(pinKey);
   let selector = pinned !== undefined && availability.eligible[pool.indexOf(pinned)] === true ? pinned : undefined;
   if (selector === undefined) {
-    const pick = await pickForPool(api, poolName, pool, availability);
-    if (pick === undefined) throw new Error(`model-pool: no authenticated model available in pool "${poolName}"`);
-    selector = pick.picked;
-    if (pinKey !== undefined) sessionPins.set(pinKey, selector);
+    // Two first requests for one session can overlap before either stores a
+    // pin; sharing one in-flight decision keeps them on the same member instead
+    // of streaming on two models at once.
+    selector = await pickOnceForPin(pinKey, async () => {
+      const pick = await pickForPool(api, poolName, pool, availability);
+      if (pick === undefined) throw new Error(`model-pool: no authenticated model available in pool "${poolName}"`);
+      return pick.picked;
+    });
     safeLog(api, "info", `[model-pool] forwarding pool/${poolName} → ${selector}${pinKey === undefined ? " (one-shot)" : " (pinned for this session)"}`);
   }
+
   const model = models.resolve(selector);
   if (model === undefined || model === null) throw new Error(`model-pool: ${selector} no longer resolves`);
   return { selector, model };
 }
 
-/** The `pool` provider's transport: replay the request on one real member. */
+/** In-flight first picks, so concurrent first requests share one decision. */
+const pinPicks = new Map<string, Promise<string>>();
+
+/**
+ * Choose a member for `pinKey` once. A request without a session id has no pin
+ * to share, so it takes its own fresh rotation. A shared pick stores the pin
+ * before any caller uses it.
+ */
+async function pickOnceForPin(pinKey: string | undefined, pick: () => Promise<string>): Promise<string> {
+  if (pinKey === undefined) return pick();
+  const existing = pinPicks.get(pinKey);
+  if (existing !== undefined) return existing;
+  const started = (async () => {
+    const selector = await pick();
+    sessionPins.set(pinKey, selector);
+    return selector;
+  })();
+  pinPicks.set(pinKey, started);
+  try {
+    return await started;
+  } finally {
+    pinPicks.delete(pinKey);
+  }
+}
+
+/**
+ * The `pool` provider's transport: replay the request on one real member and
+ * pass the member's stream through unchanged.
+ *
+ * The member's terminal result is what settles this stream's `result()`, so it
+ * is handed to `end()`: a consumer that awaits a final message must get the
+ * member's, not an empty one. Everything else — tool calls, thinking, usage —
+ * arrives as ordinary events and is pushed as it comes.
+ */
 function forwardPoolRequest(model: ModelLike, context: unknown, options?: StreamOptionsLike): EventStreamLike {
   const lib = piAi;
   if (lib === undefined) {
@@ -1268,16 +1344,37 @@ function forwardPoolRequest(model: ModelLike, context: unknown, options?: Stream
   void (async () => {
     try {
       const poolName = typeof model.id === "string" ? model.id : "";
+      // A running session can outlive an edit to the pool file, so refresh
+      // before picking: a removed member must not be reached again.
+      refreshHost();
       const target = await forwardTarget(poolName, options?.sessionId);
       const apiKey = await hostRegistry?.getApiKey?.(target.model, options?.sessionId);
       if (apiKey === undefined || apiKey.length === 0) throw new Error(`model-pool: no credential for ${target.selector}`);
-      for await (const event of lib.streamSimple(target.model, context, { ...options, apiKey })) out.push(event);
-      out.end();
+      let final: unknown;
+      for await (const event of lib.streamSimple(target.model, context, { ...options, apiKey })) {
+        out.push(event);
+        if (isDoneEvent(event)) final = event.message;
+      }
+      out.end(final);
     } catch (err) {
       out.fail(err);
     }
   })();
   return out;
+}
+
+/** The member stream's successful terminal event, which carries its final message. */
+function isDoneEvent(event: unknown): event is { type: "done"; message: unknown } {
+  if (event === null || typeof event !== "object") return false;
+  const record = event as Record<string, unknown>;
+  return record.type === "done" && record.message !== null && typeof record.message === "object";
+}
+
+/** Re-read the config file and re-register pool models from the last captured host. */
+function refreshHost(): void {
+  if (hostApi === undefined) return;
+  refreshFromSource(hostApi);
+  syncPoolProvider(hostApi, hostModels);
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,13 +1396,26 @@ const RESERVED_FLAT_KEYS = new Set([
   "stateFile",
 ]);
 
-/** Replace or delete one pool in memory without touching counters. */
+/**
+ * Replace or delete one pool in memory without touching counters. Pins for the
+ * pool are dropped: a pin describes a member of the pool as it was, and a
+ * re-created pool must pick afresh rather than resume an older edition's member.
+ */
 function applyPoolChange(name: string, selectors: string[] | null): void {
   const pools: Record<string, string[]> = Object.create(null);
   for (const [k, v] of Object.entries(activeConfig.pools)) pools[k] = [...v];
   if (selectors === null) delete pools[name];
   else pools[name] = [...selectors];
   activeConfig.pools = pools;
+  forgetPins(name);
+}
+
+/** Drop every session's pin for one pool. */
+function forgetPins(poolName: string): void {
+  const suffix = `\u0000${poolName}`;
+  for (const key of sessionPins.keys()) {
+    if (key.endsWith(suffix)) sessionPins.delete(key);
+  }
 }
 
 /**
@@ -1964,9 +2074,12 @@ async function handleSessionStart(
     // same host boundary the manual picker uses. A refusal, an unresolvable
     // selector, or a host that keeps a different model is never reported as a
     // successful rotation.
-    const result = await applyModelToSession(pi, ctx, pick.picked);
+    // Carry the pool's own thinking level onto the member, so a fresh session
+    // on `pool/x:high` starts at high instead of the member's default.
+    const applied = withThinking(pick.picked, selected.thinking);
+    const result = await applyModelToSession(pi, ctx, applied);
     if (!result.ok) {
-      safeLog(pi, "warn", describeApplyFailure("main session", pick.picked, result));
+      safeLog(pi, "warn", describeApplyFailure("main session", applied, result));
       return;
     }
     if (result.confirmed) {
