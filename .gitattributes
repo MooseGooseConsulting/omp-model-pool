@@ -1,0 +1,5 @@
+# Line endings: LF in the repository and in every checkout, whatever the client's core.autocrlf.
+# Standard: MooseGooseConsulting/coldaine-codeOps docs/ORG_STANDARDS.md, "Line endings".
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
