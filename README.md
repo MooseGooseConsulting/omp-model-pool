@@ -1,20 +1,28 @@
 # omp-model-pool
 
-Round-robin model rotation: every new subagent spawn takes the next model in
-its role's pool.
+Model pools you pick like models: select `pool/<name>` anywhere OMP takes a
+model, and every new subagent or session on it starts on the next model in the
+pool.
 
-Standalone [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that
-cycles the model **by role** on every new subagent spawn. The agent definition
-never changes; only the model it runs on rotates.
+Standalone [oh-my-pi](https://github.com/can1357/oh-my-pi) extension. Each pool
+in your config registers as a model, `pool/<name>`, so it shows up in `/model`
+and in role settings next to every other model. Choosing it is the opt-in:
 
-Every child resolving via `@slow` gets `slow[0]`, then `slow[1]`, then
-`slow[2]`, then wraps — regardless of whether the agent was `reviewer`,
-`scout`, or `task`. Agent names are logged, never used as the counter key.
+```yaml
+# ~/.omp/agent/config.yml
+modelRoles:
+  task: pool/cheap-coders # task subagents rotate through the pool
+  slow: anthropic/claude-opus-5-5:high # a real model: never rerouted
+```
+
+A role, `--model`, or an agent set to a real model is never touched, even when
+a pool happens to share the role's name. Rotation never switches a running
+conversation's model, so prompt caches survive: a subagent or a fresh session
+picks its model once, before its first turn.
 
 Authoritative event reference:
 `can1357/oh-my-pi` main `docs/extensions.md`
-(`before_subagent_spawn → { model, block, reason, note }`).
-The `omp.sh` site docs omit this event; the GitHub doc wins on conflict.
+(`before_subagent_spawn → { model, block, reason, note }`, `registerProvider`).
 
 ## Install
 
@@ -32,23 +40,34 @@ Git/marketplace entry.
 
 ## Configure
 
-Pools are keyed by **bare role name** (`slow`, `smol`, …) holding selectors in
-cycle order. Unconfigured roles return nothing and core behavior is unchanged.
-Only roles you configure cycle.
+Pools are keyed by **name** and hold real model selectors in cycle order. A
+name becomes the model id, so use letters, digits, `.`, `_` and `-` (a leading
+`@` is stripped; anything else is skipped with a warning). A pool cannot
+contain another pool.
 
 ```jsonc
 // model-pool.json (see model-pool.example.json)
 {
   "pools": {
-    "slow": ["anthropic/claude-haiku-4-5", "openai/gpt-5-mini"],
-    "default": ["anthropic/claude-sonnet-4-6", "openai/gpt-5.2"]
+    "cheap-coders": ["litellm/bloodarrow-deepseek", "isoquant/glm-5.3-flash"],
+    "reviewers": ["anthropic/claude-sonnet-4-6", "openai/gpt-5.2"]
   },
-  "mainSessionRole": "default",      // role rotated by session_start (bare name)
-  "enableMainSessionRotation": true, // false keeps subagent cycling only
-  "strict": false,                   // true | ["slow"] blocks empty-pool spawns
-  "persistCounters": false           // true shares the cycle across OMP processes
+  "strict": false,         // true | ["reviewers"] blocks spawns on an empty pool
+  "persistCounters": false // true shares the cycle across OMP processes
 }
 ```
+
+Then select a pool where you want it: `/model` → `pool/cheap-coders`, a role in
+settings (`modelRoles.task: pool/cheap-coders`), `--model pool/reviewers`, or
+an agent's `model:`. A thinking suffix carries over to members that have none:
+`pool/reviewers:high` runs `openai/gpt-5.2:high`.
+
+`mainSessionRole` and `enableMainSessionRotation` are retired: a main session
+rotates when its model is a pool (for example `modelRoles.default:
+pool/reviewers`). If they are still in your file they are ignored with a
+warning. Pools from an older config that are named after a role (`slow`,
+`task`) no longer apply to that role by themselves; on the first main session
+the extension names any such pool and the role setting that would select it.
 
 Flat shorthand (`{ "slow": [...] }`) is also accepted. Sources, in precedence
 order:
@@ -89,7 +108,7 @@ its agent directory with `omp config init-xdg`.
 
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
-export OMP_MODEL_POOLS_JSON='{"slow":["anthropic/claude-haiku-4-5","openai/gpt-5-mini"]}'
+export OMP_MODEL_POOLS_JSON='{"cheap":["litellm/bloodarrow-deepseek","isoquant/glm-5.3-flash"]}'
 omp --extension ./omp-model-pool
 ```
 
@@ -98,7 +117,7 @@ omp --extension ./omp-model-pool
 With no source configured the extension loads, reads nothing, and rotates
 nothing. To give it a persistent home, either point `OMP_MODEL_POOL_CONFIG` at
 a file, copy `model-pool.example.json` to `<OMP agent dir>/model-pool.json`, or
-just open `/model-pool` and add a model to a role: the first confirmed edit
+just open `/model-pool` and add a model to a pool: the first confirmed edit
 creates the profile-scoped default file in the nested shape. Loading the
 extension, running `status`/`doctor`, or opening the editor never creates a
 file on its own.
@@ -126,8 +145,8 @@ authoritative.
 
 The extension registers one user command, `/model-pool` (registered as
 `model-pool`). With no argument it opens a menu: **Switch Current Model**,
-**Edit Role Pools**, **Status**, **Doctor**, and **Help**. It also accepts the
-arguments `pick`, `edit [role]`, `status`, `doctor`, and `help`; unknown
+**Edit Pools**, **Status**, **Doctor**, and **Help**. It also accepts the
+arguments `pick`, `edit [pool]`, `status`, `doctor`, and `help`; unknown
 arguments print usage and change nothing.
 
 `pick` switches the active model of the **main** session only. It requires an
@@ -138,37 +157,47 @@ after the host confirms the new active model. Selecting the current model is a
 no-op. It never touches pools or counters and never switches a child session's
 model.
 
-`edit` opens the role-pool editor. It accepts an existing role or a new bare
-role name (a single leading `@` is stripped) and offers **Add Model**,
-**Remove Entry**, **Move Earlier**, **Move Later**, **Delete Pool**, and
-**Back**. Each accepted edit is saved as its own transaction when a file is
-authoritative (see *Automatic saving*). Creating a pool for an unknown role
-does not create or assign an OMP core role.
+`edit` opens the pool editor. It accepts an existing pool or a new name and
+offers **Add Model**, **Remove Entry**, **Move Earlier**, **Move Later**,
+**Delete Pool**, and **Back**. Each accepted edit is saved as its own
+transaction when a file is authoritative (see *Automatic saving*), and the
+`pool/<name>` models are re-registered at once, so a new pool appears in
+`/model` without a restart. Creating a pool assigns it nowhere; select it where
+you want it.
 
 `status` reports the effective configuration source, whether edits are writable
-or runtime-only, the main role and rotation toggle, pool order, the current
-model, the persistence mode, and the resolved state path. `doctor` reports
-per-entry resolve and authenticated-membership results, distinguishes an
-unreadable registry from a readable empty one, and performs no writes.
+or runtime-only, the pools, the current model, the persistence mode, and the
+resolved state path. `doctor` reports per-entry resolve and
+authenticated-membership results, distinguishes an unreadable registry from a
+readable empty one, and performs no writes. Every command re-reads the
+configuration first, so it shows what is on disk.
 
 ## Behavior
 
-- `before_subagent_spawn` (primary): strips one leading `@` from
-  `event.modelRole` → `roleKey`. No pool → return nothing. No `modelRole`
-  (explicit per-dispatch pin, not via role) → return nothing and log the skip.
-  Each pool entry is validated with `ctx.models.resolve` and must also appear
-  in `ctx.models.list()`; failures filter out. Empty pool → fail open (leave
-  the spawn unmodified, log) unless `strict` covers the role, in which case
-  `{ block: true, reason }` refuses the spawn. Otherwise pick
-  `pool[counter[roleKey]++ % pool.length]` and return
-  `{ model: picked, note: "pool slow[i/n]: picked" }`. The note surfaces in
-  the task UI; `{ roleKey, agent, invocationKind, picked, index }` goes to
-  `pi.logger`. Last returned `model` wins when several extensions handle the
-  event — this extension only claims pools it configures.
-- `session_start` (secondary): `before_subagent_spawn` never fires for the
-  main session, so main-session rotation is a `session_start` handler gated on
+- **Provider.** The factory registers provider `pool` with one model per pool
+  (`pool/<name>`). Its context window and output limit are the smallest among
+  the members that resolve (conservative defaults until a registry is seen), so
+  a pool never advertises more than its weakest member takes. The registration
+  is refreshed whenever the pools change.
+- **Fresh config.** Every spawn, session start and command re-reads the
+  configuration source first; an edit to the pool file applies to the very next
+  pick. An unchanged source keeps runtime-only edits.
+- `before_subagent_spawn`: looks only at the spawn's primary pattern. If it is
+  `pool/<name>` (optionally `:<thinking>`), each pool entry is validated with
+  `ctx.models.resolve` and must also appear in `ctx.models.list()`; failures
+  are skipped. The handler picks the next eligible entry and returns
+  `{ model: [picked, ...the pool's other eligible members, ...the spawn's own
+  fallbacks], note: "pool/<name>[i/n]: picked" }`: the child starts on the pick
+  and OMP's retry policy walks the rest if it fails, as separate attempts, never
+  a switch inside one conversation. Any other spawn (a role alias, a real
+  model, or a pool further down the fallback list) is returned untouched. An
+  empty pool fails open (spawn unmodified, logged) unless `strict` covers it,
+  in which case `{ block: true, reason }` refuses the spawn. The note shows in
+  the task UI; pick details go to `pi.logger`.
+- `session_start`: `before_subagent_spawn` never fires for the main session, so
+  a main session whose model is `pool/<name>` is resolved here, gated on
   `ctx.agent?.kind === "main"` (checked via `kind`, never `depth`: `/tan`
-  clones are subs at depth 0). It rotates a **genuinely new** session only.
+  clones are subs at depth 0). It switches a **genuinely new** session only.
   `session_start` also fires for a loaded session, and overriding a restored
   model mid-conversation would invalidate prompt caches, so two signals both
   mean "loaded": the session header predates this process
@@ -182,14 +211,17 @@ unreadable registry from a readable empty one, and performs no writes.
   title/mode/model and usage records, and another extension's `session_start`
   handler may already have appended its own with `pi.appendEntry`. An unknown
   answer also skips rather than guessing.
-  Otherwise: same
-  resolve → pick → advance against `mainSessionRole` (default `"default"`),
-  then apply it: resolve the selector to a `Model` with
+  Otherwise: pick from the pool, resolve the selector to a `Model` with
   `ctx.models.resolve()`, await `pi.setModel(model)`, and only notify once the
   host confirms it now reports that model. A refusal (`false`), an unresolvable
   selector, or a host that keeps a different model logs a warning and leaves the
-  model alone — none of them is reported as a rotation. Disabled with
-  `enableMainSessionRotation: false`.
+  model alone — none of them is reported as a rotation.
+- **Direct calls.** Anything that calls `pool/<name>` itself rather than through
+  a spawn or a fresh session (commit messages, memory, a resumed session still
+  on the pool) goes through the provider's own transport: it picks one member,
+  pins it to that session id so later turns stay on it, fetches that member's
+  credential from the host registry, and replays the request on it. A call
+  without a session id takes the next member each time.
 - Handler errors fail open (log, return nothing) unless `strict` applies.
 - `strict` hard-blocks only when the model registry actually answered and none
   of the pool's entries are authenticated. An unreadable registry (no
@@ -201,18 +233,15 @@ unreadable registry from a readable empty one, and performs no writes.
   fails open.
 - Host compatibility: routing hooks are registered before optional command
   registration, so a host without command registration keeps rotating pools and
-  gets a compatibility warning instead of failing. Commands that mutate state
-  require an interactive main session; non-interactive contexts never open
-  dialogs or mutate configuration.
-- Core fallback is preserved: the returned single `model` keeps role identity
-  so `retry.fallbackChains` / prewalk / advisor semantics still apply. If the
-  requirement ever becomes "model must never change mid-instance", verify
-  `retry.fallbackChains` + prewalk handoff behavior first — that is a separate
-  follow-up, not this extension.
+  gets a compatibility warning instead of failing. A host without
+  `registerProvider` cannot show pools as models, so nothing routes, and the
+  extension logs that once. Commands that mutate state require an interactive
+  main session; non-interactive contexts never open dialogs or mutate
+  configuration.
 
 ## Counter semantics
 
-- Strict in-order round-robin per role. Random / shuffle-bag is out.
+- Strict in-order round-robin per pool. Random / shuffle-bag is out.
 - The cursor is an index into the **configured** pool, stored modulo its
   length, so it stays bounded. An entry that is temporarily unauthenticated is
   skipped without re-phasing the rotation, and a pool with nothing eligible
@@ -254,32 +283,35 @@ unreadable registry from a readable empty one, and performs no writes.
   above.
 - Revived / resumed children do not advance (the event fires once per new
   child, never on revive/resume).
-- New main sessions share the same counters when roles overlap;
-  e.g. a `@default` subagent pool and main-session `default` rotation draw
-  from one counter.
+- Every path that picks from a pool (spawns, fresh main sessions, direct calls)
+  shares that pool's counter.
 - Editing a pool never advances or resets a cursor. Duplicate entries are
   preserved as distinct configured slots, and removing the last entry deletes
-  the role's pool (restoring core passthrough) after confirmation.
+  the pool after confirmation; anything still set to `pool/<name>` then stops
+  resolving.
 
 ## Validate
 
-1. `omp --extension ./omp-model-pool`; check `/extensions`.
-2. Pool of 2–3 authenticated models on `slow`; dispatch the same agent
-   (`reviewer` → `@slow`) 4+ times; task rows show rotating model + note.
-3. Dispatch different agents sharing `@slow`; the shared counter advances.
-4. Dispatch on an unconfigured role; behavior unchanged.
-5. Dispatch with an explicit model pin; the pool does not override.
+1. `omp --extension ./omp-model-pool`; check `/extensions`, then `/model`:
+   every configured pool is listed as `pool/<name>`.
+2. Set `modelRoles.task: pool/<name>` with 2–3 authenticated models; dispatch
+   `task` agents 4+ times; each child runs on the next model and the task rows
+   show the note.
+3. Keep a pool named `slow` while `modelRoles.slow` is a real model; a
+   `reviewer` still runs on the real model.
+4. Dispatch with an explicit model pin; the pool does not override.
+5. Edit the pool file by hand, then dispatch once; that very spawn uses the
+   edited pool.
 6. Revive/resume a parked child; no counter advance.
 7. Restart OMP; counters reset (or, with `persistCounters: true`, continue from
    the state file).
-8. Open 3+ fresh main sessions; the `default` pool (when configured) advances
-   per session; `@slow` subagent cycling is unaffected except for shared
-   counters when roles overlap.
+8. Start 3+ fresh main sessions with `--model pool/<name>` (or
+   `modelRoles.default: pool/<name>`); each switches to the next member before
+   its first turn.
 9. With `persistCounters: true`, run two sequential `omp` processes against a
-   `slow` pool of 2; the second process continues where the first stopped.
+   pool of 2; the second process continues where the first stopped.
 10. Resume a session (`omp -r`); the restored main-session model is not
-    overridden. Start a brand-new session with the `default` pool configured;
-    it rotates.
+    overridden.
 11. Make one entry of a 3-model pool unavailable (logout / remove its key);
     the cycle skips it without repeating the entry before it.
 12. Run under a named profile (`omp --profile work`) with `persistCounters:
@@ -291,29 +323,31 @@ unreadable registry from a readable empty one, and performs no writes.
 14. `pick` on an idle main session: filter and select a listed model and confirm
     the host reports it as active. Cancelling, selecting the current model, and
     running `pick` in a busy or non-interactive session change nothing.
-15. `edit`: add, reorder, and remove an entry; each accepted edit is saved
-    immediately when a file is authoritative, the next spawn uses the edited
-    pool, and the cursor did not move. Remove the last entry of a role and
-    confirm the pool is deleted and core passthrough restored.
+15. `edit`: create a pool, add, reorder, and remove entries; each accepted edit
+    is saved immediately when a file is authoritative, the new pool shows in
+    `/model` at once, the next spawn uses the edited pool, and the cursor did
+    not move.
 16. First-run: with no config file, opening the editor or running `status`
     creates nothing; the first confirmed edit creates
     `<OMP agent dir>/model-pool.json` in the nested shape. With
     `OMP_MODEL_POOLS_JSON` set, edits are labelled runtime-only and the inline
     source is never rewritten.
 
-Unit coverage (`npm test`): same-agent wrap, cross-agent shared counter,
-`@`-prefix key equivalence, unconfigured-role and explicit-pin passthrough,
-unauthenticated filtering with fail-open vs `strict` block, stable phase across
-an availability change, restart reset, main-session advance with sub exclusion
-and a session-header load signal (metadata-only resumed session, session created
-by this process, unreadable header, unparseable timestamp), the real-host apply
-contract (a resolved `Model` is passed, and a refusal or a wrong active model is
-never logged as a rotation), profile- and `PI_CONFIG_DIR`-aware state paths, and
-opt-in persistence (cross-process continuation, abandoned-lock reclaim, a live
-holder's lock never stolen, a 4-process × 5-pick contention run,
-disabled-is-in-memory-only, schema- and malformed-state fail-open, version-1
-replacement, non-boolean opt-in ignored, flat-config opt-in, and in-process
-serialization).
+Unit coverage (`npm test`): pool selection only through `pool/<name>` (a pool
+named after a role does not reroute that role), rotation order and the
+fallback list, thinking-suffix carry-over, shared counters, unauthenticated
+filtering with fail-open vs `strict` block, stable phase across an
+availability change, provider registration, edits applied on the next spawn,
+retired-key warnings, main-session switching only for a fresh session on a
+pool (session-header load signal: metadata-only resumed session, session
+created by this process, unreadable header, unparseable timestamp), the
+real-host apply contract (a resolved `Model` is passed, and a refusal or a
+wrong active model is never logged as a rotation), profile- and
+`PI_CONFIG_DIR`-aware state paths, and opt-in persistence (cross-process
+continuation, abandoned-lock reclaim, a live holder's lock never stolen, a
+4-process × 5-pick contention run, schema- and malformed-state fail-open,
+version-1 replacement, non-boolean opt-in ignored, flat-config opt-in, and
+in-process serialization).
 
 ## Live integration test (optional)
 
@@ -325,12 +359,12 @@ by an opt-in suite that runs an installed OMP:
 npm run test:live
 ```
 
-It proves main-session rotation end to end: two fresh OMP *processes* share one
-state file over a `[B, A]` pool while the starting model is pinned to `A`, so
-each run has to change the model to pass and the two runs have to differ. The
-evidence is the `model`/`provider` OMP recorded on the assistant turn, not the
-extension's log line — the log only reports what the extension asked for, which
-is the claim under test.
+It proves main-session switching end to end: two fresh OMP *processes* start on
+`--model pool/main` over a `[B, A]` pool and share one state file. `pool/main`
+is not a real model, so each run has to switch to a member to pass, and the two
+runs have to differ. The evidence is the `model`/`provider` OMP recorded on the
+assistant turn, not the extension's log line — the log only reports what the
+extension asked for, which is the claim under test.
 
 Safety properties, since it spends real turns:
 
@@ -346,20 +380,21 @@ Safety properties, since it spends real turns:
   else runs and no paid role is reachable.
 - anything unproven reports `skip` with the reason rather than passing.
 
-It also proves role rotation: the bundled `reviewer` agent declares
-`model: ["@slow"]`, an unpinned role alias, so spawning it exercises the same
-`before_subagent_spawn` path a normal delegation does. The trigger is
+It also proves the role path: the overlay sets `slow: pool/review`, and the
+bundled `reviewer` agent declares `model: ["@slow"]`, so spawning it exercises
+the same `before_subagent_spawn` path a normal delegation does. The trigger is
 model-driven — OMP exposes no "spawn agent X" command — so a run where the
 parent declines to delegate reports `skip` with that reason rather than passing.
 The assertion is still not model-dependent: it reads the model on the child's
 own assistant turn. At the end both counters are checked independently, so a
-main rotation cannot be mistaken for a role rotation.
+main-session pick cannot be mistaken for a spawn pick.
 
 ## API (tests / hosts)
 
 ```ts
-import pool, { configurePools, resetCounters, getCounters, getPools, resolveStateFilePath } from "./src/index.ts";
-configurePools({ pools: { slow: ["p/a", "p/b"] }, strict: false, persistCounters: false });
+import pool, { configurePools, parsePoolSelector, resetCounters, getCounters, getPools, resolveStateFilePath } from "./src/index.ts";
+configurePools({ pools: { reviewers: ["p/a", "p/b"] }, strict: false, persistCounters: false });
+parsePoolSelector("pool/reviewers:high"); // { name: "reviewers", thinking: ":high" }
 resetCounters(); // mirrors an OMP restart (in-memory counters only)
 ```
 

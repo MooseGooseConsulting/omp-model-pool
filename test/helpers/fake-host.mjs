@@ -1,11 +1,11 @@
 // Fake OMP host for the `/model-pool` command surface.
 //
 // Mirrors the structural contract `src/index.ts` depends on: `pi.on`,
-// `pi.setModel`, `pi.logger`, an optional `pi.registerCommand`, and a
-// `ctx.ui` with `select` / `input` / `confirm` / `notify`. Dialogs are driven
-// by queues so a test can script exactly what the user picks and can leave a
-// queue empty to exercise "cancelled". Nothing here touches the network or the
-// filesystem.
+// `pi.setModel`, `pi.logger`, an optional `pi.registerCommand`, and an optional
+// `pi.registerProvider` / `pi.unregisterProvider` pair (the pool models are
+// published through it). Dialogs are driven by queues so a test can script
+// exactly what the user picks and can leave a queue empty to exercise
+// "cancelled". Nothing here touches the network or the filesystem.
 
 function parseSelector(spec) {
   const slash = spec.indexOf("/");
@@ -27,6 +27,11 @@ export function makeModels(available, currentSpec) {
   let current;
 
   function find(spec) {
+    if (spec !== null && typeof spec === "object") {
+      // An explicit model object: a test can name a current model (for example
+      // `pool/slow`) that the registry list does not contain.
+      return { provider: String(spec.provider ?? ""), id: String(spec.id ?? "") };
+    }
     const text = String(spec).trim();
     if (text.startsWith("@")) return undefined;
     const found = parsed.find(
@@ -71,6 +76,13 @@ export function createFakeHost(options = {}) {
   const logs = [];
   const notified = [];
   const setModels = [];
+  // Every `registerProvider` call, in order: [name, config]. `pool` models are
+  // published this way, so a test can assert the host really saw them.
+  const providers = [];
+  const unregisteredProviders = [];
+  // What the host currently has published, so a provider that was removed is
+  // not reported as still live.
+  const published = new Map();
   const command = { registered: false, name: undefined, options: undefined };
   const queues = { select: [], input: [], confirm: [] };
   // Every dialog invocation, for "no dialog was shown" assertions.
@@ -114,6 +126,16 @@ export function createFakeHost(options = {}) {
       error: (...args) => logs.push(["error", args.join(" ")]),
     },
   };
+  if (options.registerProvider !== false) {
+    pi.registerProvider = (name, config) => {
+      providers.push([name, config]);
+      published.set(name, config);
+    };
+    pi.unregisterProvider = (name) => {
+      unregisteredProviders.push(name);
+      published.delete(name);
+    };
+  }
 
   const registerCommandMode =
     options.registerCommand === undefined ? true : options.registerCommand;
@@ -133,6 +155,8 @@ export function createFakeHost(options = {}) {
     logs,
     notified,
     setModels,
+    providers,
+    unregisteredProviders,
     calls,
     queues,
     command,
@@ -141,6 +165,11 @@ export function createFakeHost(options = {}) {
     pushConfirm: (value) => queues.confirm.push(value),
     models: (available, currentSpec) => makeModels(available, currentSpec),
     mainCtx: (models, overrides = {}) => makeCtx(host, "main", models, overrides),
+    /** Models the host currently has published under one provider name. */
+    registeredModels: (name) => {
+      const config = published.get(name);
+      return config !== undefined && Array.isArray(config.models) ? config.models : [];
+    },
     subCtx: (models, overrides = {}) => makeCtx(host, "sub", models, overrides),
   };
 
