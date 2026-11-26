@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
     "test:e2e": "node test/e2e/run-e2e.mjs",
     "test:live": "npm run build && node test/live/run-live.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"

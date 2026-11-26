@@ -200,12 +200,11 @@ function resolveExplicitThinking(
   // request on an alias applies even when the alias resolves to an id that
   // already ends in the level.
   if (!first.alternative.startsWith("@")) {
-    if (
-      first.identity.endsWith(`:${token}`) ||
-      (canonical !== undefined && first.identity.endsWith(canonical))
-    ) {
-      return {};
-    }
+    // Only an id that literally carries the suffix (`p/model:high` resolving to
+    // a row whose id is `model:high`) means the writer did not ask for effort.
+    // A name that merely ends in the level word (`p/b-high`) is still an
+    // explicit `:high` request, because nobody types that suffix by accident.
+    if (first.identity.endsWith(`:${token}`)) return {};
   }
   if (canonical !== undefined) return { level: canonical };
   if (token === "auto") return { autoExplicit: true };

@@ -18,8 +18,8 @@ const headOf = (model) => (Array.isArray(model) ? model[0] : model);
 
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, "..");
-const helper = path.join(here, "helpers", "dispatch-once.mjs");
+const root = path.resolve(here, "..", "..");
+const helper = path.join(here, "..", "helpers", "dispatch-once.mjs");
 
 function tmpStateFile() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-xp-"));

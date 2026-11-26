@@ -28,7 +28,7 @@ import {
   PROVIDER_NAMES,
   PROVIDERS,
   rankFreeRoutes,
-} from "./live/free-routes.mjs";
+} from "./free-routes.mjs";
 import {
   createFreeGateway,
   FORWARD_MAX_TOKENS,
@@ -36,7 +36,7 @@ import {
   publicSelectorFromSmokeIdentity,
   renderSmokeProvidersYaml,
   toSmokeSelector,
-} from "./live/free-gateway.mjs";
+} from "./free-gateway.mjs";
 
 const REAL_KILO_KEY = "test-kilo-real-key";
 

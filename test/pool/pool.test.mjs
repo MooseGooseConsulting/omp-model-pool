@@ -4,8 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const mod = await import("../dist/index.js");
-import * as fakeHost from "./helpers/fake-host.mjs";
+const mod = await import("../../dist/index.js");
+import * as fakeHost from "../helpers/fake-host.mjs";
 import nodeFs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 
@@ -1318,7 +1318,11 @@ describe("main-session acceptance gate", () => {
       assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
       // An external rewrite returns the cursor to 0 with new bytes.
       writeState(1);
-      writeState(0);
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: 0 }, rewritten: "external" }, null, 2)}\n`,
+        "utf8",
+      );
       // The next attempt is REFUSED. It commits nothing, so it must not refresh
       // the fingerprint the mirror is validated against.
       harness.pi.setModel = async (model) => {
