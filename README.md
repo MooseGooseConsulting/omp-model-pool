@@ -26,9 +26,26 @@ omp --extension ./omp-model-pool
 omp plugin link ./omp-model-pool
 ```
 
-The manifest entry is `omp.extensions: ["./src/index.ts"]` in
+The manifest entry is `omp.extensions: ["./src/index.ts", "./src/mistral-live.ts"]` in
 `package.json`; no OMP fork is required. Distribute via npm or a
 Git/marketplace entry.
+
+## Included extension: `mistral-live`
+
+`./src/mistral-live.ts` registers Mistral with `fetchDynamicModels` so OMP treats
+Mistral's live `GET /v1/models` chat roster (`capabilities.completion_chat === true`)
+as authoritative instead of merging retired static bundled IDs that fail at runtime
+with `HTTP 400 invalid_model`.
+
+- **Zero hardcoded model IDs:** newly released Mistral chat models appear
+  automatically on refresh; retired IDs disappear automatically.
+- **Auth preserved:** uses your existing OMP Mistral credential without overriding
+  `apiKey`.
+- **Fail-safe cache fallback:** network/auth/schema failures throw so OMP keeps
+  its last cached catalog rather than emptying Mistral models.
+- **Controls:** set `OMP_MISTRAL_LIVE_BASE_URL` for a custom Mistral-compatible
+  endpoint, or `OMP_MISTRAL_LIVE_DISABLE=1` to disable the extension without
+  uninstalling the package.
 
 ## Configure
 
