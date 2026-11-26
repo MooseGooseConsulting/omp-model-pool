@@ -736,3 +736,94 @@ describe("authenticated membership", () => {
     assert.equal(second.model, "p/b");
   });
 });
+
+describe("editor revision survival and save provenance", () => {
+  it("C24: creating an explicitly configured file keeps kind file-env and clears the missing-file note", async () => {
+    const file = path.join(freshDir(), "created.json");
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+    assert.equal(mod.getConfigSource().kind, "file-env");
+    assert.equal(
+      mod.getConfigSource().note,
+      "missing file will be created on the first saved edit",
+      "the note is present while the file is missing",
+    );
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+
+    const src = mod.getConfigSource();
+    assert.equal(src.kind, "file-env", "an explicitly configured file stays file-env after creation");
+    assert.equal(src.note, undefined, "the missing-file note is cleared once the file exists");
+    assert.equal(src.writable, true);
+    assert.deepEqual(readJson(file), { pools: { slow: ["p/a"] } });
+
+    // The rebind compares against the saved fingerprint, so it does not reload
+    // and does not bump the revision the saved edit produced.
+    const revisionAfterSave = mod.getConfigRevision();
+    mod.default(makeHarness().pi);
+    assert.deepEqual(mod.getPools().slow, ["p/a"]);
+    assert.equal(mod.getConfigRevision(), revisionAfterSave);
+  });
+
+  it("C25: a successful file-backed edit keeps a newly opened editor's revision valid across a factory rebind", async () => {
+    const file = path.join(freshDir(), "rebind.json");
+    writeJson(file, { pools: { slow: ["p/a"] } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi: first } = makeHarness();
+    mod.default(first);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    const revisionAfterEdit = mod.getConfigRevision();
+
+    // A child-session rebind with the unchanged source behind the file must
+    // keep the revision a newly opened editor would capture.
+    mod.default(makeHarness().pi);
+    assert.equal(
+      mod.getConfigRevision(),
+      revisionAfterEdit,
+      "the unchanged source signature avoids a reload, so the revision survives",
+    );
+
+    const edit = await mod.savePoolEdit("fast", ["p/c"], revisionAfterEdit);
+    assert.deepEqual(edit, { ok: true, runtimeOnly: false });
+    assert.deepEqual(readJson(file).pools, { slow: ["p/a", "p/b"], fast: ["p/c"] });
+    assert.deepEqual(mod.getPools().fast, ["p/c"]);
+
+    // And a real external change after that still conflicts for the same editor.
+    writeJson(file, { pools: { slow: ["p/external"] } });
+    const conflict = await mod.savePoolEdit("fast", ["p/x"], mod.getConfigRevision());
+    assert.equal(conflict.ok, false);
+    assert.match(conflict.error, /changed on disk/);
+    assert.deepEqual(
+      readJson(file),
+      { pools: { slow: ["p/external"] } },
+      "the external change survives the conflicted attempt",
+    );
+  });
+
+  it("C26: after a first creation the saved signature is authoritative and the revision remains valid", async () => {
+    const file = path.join(freshDir(), "late-birth.json");
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const outcome = await mod.savePoolEdit("slow", ["p/a"]);
+    assert.deepEqual(outcome, { ok: true, runtimeOnly: false });
+    const revisionAfterSave = mod.getConfigRevision();
+
+    mod.default(makeHarness().pi);
+    assert.deepEqual(mod.getPools().slow, ["p/a"], "the created file is loaded by the rebind");
+    assert.equal(
+      mod.getConfigRevision(),
+      revisionAfterSave,
+      "the saved fingerprint makes the rebind's reload a no-op bump",
+    );
+
+    const edit = await mod.savePoolEdit("slow", ["p/a", "p/b"], revisionAfterSave);
+    assert.deepEqual(edit, { ok: true, runtimeOnly: false });
+    assert.deepEqual(readJson(file).pools.slow, ["p/a", "p/b"]);
+  });
+});

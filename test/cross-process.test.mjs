@@ -17,6 +17,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const helper = path.join(here, "helpers", "dispatch-once.mjs");
 
+function tmpStateFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-xp-"));
+  return { dir, file: path.join(dir, "state.json"), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
 function runOnce(stateFile, models, persist, iterations = 1) {
   const out = execFileSync(
     process.execPath,
@@ -35,11 +40,6 @@ function runAsync(stateFile, models, persist, iterations = 1) {
       (err, stdout) => (err ? reject(err) : resolve(JSON.parse(stdout.trim()))),
     );
   });
-}
-
-function tmpStateFile() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-xp-"));
-  return { dir, file: path.join(dir, "state.json"), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 describe("cross-process rotation (separate OS processes)", () => {

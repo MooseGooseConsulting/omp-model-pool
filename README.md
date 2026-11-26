@@ -207,6 +207,20 @@ unreadable registry from a readable empty one, and performs no writes.
   selector, or a host that keeps a different model logs a warning and leaves the
   model alone — none of them is reported as a rotation. Disabled with
   `enableMainSessionRotation: false`.
+  The cursor step is committed **only after the host accepts** the model
+  (see "Counter semantics"), so a main session whose model could not be
+  applied does not burn a slot; the next startup retries the same one. A host
+  that accepts but cannot report its active model consumes the slot and emits
+  the unconfirmed-model warning rather than pretending the rotation completed.
+  An explicit effort suffix on the chosen entry is applied after the model is
+  accepted: `model: ["provider/model:high@upstream"]` or
+  `["provider/model@upstream:high"]` sets the thinking level through the host's
+  public setter, which clamps to the selected model's ladder. A comma-separated
+  slot uses the first alternative that both resolves and matches the applied
+  model; a literal id that already ends in the level, a selector with no
+  suffix, or an explicit `:auto` (not selectable through the public setter)
+  leaves the level alone with a warning. Manual `/model-pool pick` changes only
+  the model, and subagents still receive the exact configured selector.
 - Handler errors fail open (log, return nothing) unless `strict` applies.
 - `strict` hard-blocks only when the model registry actually answered and none
   of the pool's entries are authenticated. An unreadable registry (no
@@ -259,16 +273,33 @@ unreadable registry from a readable empty one, and performs no writes.
   in-memory counter, and a state file that is malformed or carries an unknown
   `version` is left untouched for the operator to repair or delete rather than
   silently reset.
+- A main-session pick is committed **after** the host accepts it. Selection and
+  the host call happen under the same lock, so the durable cursor and the live
+  session cannot disagree: a refusal, an unresolvable or unauthenticated
+  selector, a host without `setModel`, or a host that reports a different model
+  consumes nothing and leaves the state file byte-identical. If the host
+  accepts but the write then fails, the model is **not** applied again; the
+  process mirrors the accepted index in memory, reports the pick as
+  `persisted: false`, and logs that rotation continues from the local cursor
+  only. A read/lock failure before acceptance falls back to the in-memory
+  cursor and says so (that fallback is not serialized across processes) rather
+  than claiming a durable pick.
+- Replacing the state file retries only a transient Windows sharing violation
+  (`EPERM`/`EBUSY` from the final rename) after 10/20/40/80 ms, with one temp
+  file and no unlink of the destination; the writer stays synchronous, so no
+  other process can observe a half-applied edit. Other errors are fatal and the
+  temp file is removed. Lock-reclaim renames never retry.
 - The state file is written as `version: 2`. A `version: 1` file — written by
   the earlier release, which also used a different extension name — is
   **replaced, not reinterpreted**: v1 stored an unbounded running count that
   was reduced modulo the *filtered* list of authenticated entries, while v2
   stores an index into the *configured* pool, so the same integer means a
   different slot and no translation is sound. Rotation restarts from a fresh
-  cursor, the old file moves to `<stateFile>.v1.bak` so nothing is destroyed,
-  and persistence keeps working. Only a schema we positively identified is
-  superseded this way; a file we cannot recognize at all is left alone, as
-  above.
+  cursor, the old bytes are **copied** to `<stateFile>.v1.bak` (the live file is
+  not moved away before the new one replaces it, and a failed copy is reported
+  instead of hidden) so nothing is destroyed, and persistence keeps working.
+  Only a schema we positively identified is superseded this way; a file we
+  cannot recognize at all is left alone, as above.
 - Revived / resumed children do not advance (the event fires once per new
   child, never on revive/resume).
 - New main sessions share the same counters when roles overlap;
@@ -332,45 +363,95 @@ disabled-is-in-memory-only, schema- and malformed-state fail-open, version-1
 replacement, non-boolean opt-in ignored, flat-config opt-in, and in-process
 serialization).
 
-## Live integration test (optional)
+The acceptance gate is covered directly: refusal, a throwing `setModel`, an
+identity mismatch, a missing setter, an unauthenticated entry and a throwing
+`list()` all leave the state file byte-identical and the next startup retries
+the same slot; a setter that completes without confirmable `current()` consumes
+exactly one. A gated `setModel` proves a queued same-role spawn takes the slot
+after the accepted startup pick (or the same slot after a refusal) while a
+different role is unaffected. A durable-write failure after acceptance mutates
+the session once, mirrors the cursor in memory and preserves the live state
+bytes. Effort coverage pins the setter call order and every accepted spelling
+(`:high`, `:max`, `:low`, unique prefixes, `@alias:high`, `id:high@upstream`,
+`id@upstream:high`) and the cases that must set nothing (losing comma
+alternative, literal level suffix, absent suffix, refusal, mismatch, `:auto`).
+Windows atomic replacement is fault-injected to prove one commit from the same
+temp file after a transient sharing violation, and that exhaustion removes the
+temp without unlinking the live file. Doctor is pinned to a single
+authenticated snapshot per invocation, and the editor's navigation is pinned so
+deleting the last entry returns to the role picker.
 
-`npm test` is a fake host: it proves the pool logic, and it is why a wrong
-`setModel` argument survived a green suite. The real host is covered separately
-by an opt-in suite that runs an installed OMP:
+## End-to-end test against a real OMP (offline)
+
+```bash
+npm run test:e2e
+```
+
+Deterministic and offline: a Node loopback server implements OpenAI-style
+`/v1/chat/completions` for a generated `agentDir/models.yml` provider, and a
+real installed OMP (v19.2.1 or a newer compatible CLI) runs against it. No
+credentials and no network leave the process — the fixture is the only
+inference endpoint, and proxy variables point away from the internet.
+
+Every assertion is taken from the host's own record, never the extension's log:
+
+- a fresh session rotates a `[B, A]` pool, asserting the assistant turn ran on
+  `B` with `reasoning_effort: "high"`, then on `A` with no effort, and that the
+  durable cursor reads `1` then `0`;
+- an exact `--resume` of the second transcript adds one turn on `A` and leaves
+  the cursor at `0`;
+- delegation through the real `task` tool produces one child transcript per
+  spawn, located by `parentSession`, so `slow-a:high` → `slow-b` → `slow-a`
+  proves in-process wraparound and that the counter is keyed by role, not by
+  agent name;
+- a pool whose only entry is unavailable leaves the spawn on its pinned model
+  (fail open) without a wire request for the missing entry;
+- three successive `mistral models refresh` runs against the fixture prove live
+  discovery: a new roster appears, a retired id disappears, and a malformed
+  response keeps the previous catalog.
+
+An absent binary, a timeout, a CLI error, a malformed transcript or a model
+mismatch fails the suite. CI pins the published `omp-linux-x64` v19.2.1 asset
+and verifies its SHA-256 before use.
+
+## Live gateway smoke test (optional)
 
 ```bash
 npm run test:live
 ```
 
-It proves main-session rotation end to end: two fresh OMP *processes* share one
-state file over a `[B, A]` pool while the starting model is pinned to `A`, so
-each run has to change the model to pass and the two runs have to differ. The
-evidence is the `model`/`provider` OMP recorded on the assistant turn, not the
-extension's log line — the log only reports what the extension asked for, which
-is the claim under test.
+The only check that talks to a real provider. It is deliberately narrow and
+free-only:
 
-Safety properties, since it spends real turns:
+- routes must be marked free by the provider's own catalog (`isFree` for Kilo)
+  *and* carry all-zero monetary fields. Live catalogs return prices as strings
+  (`"0"`), so zero is accepted as a number or a numeric string; `"-1"`, blank,
+  boolean and null pricing are unknown, never free. IDs must be concrete
+  `owner/model:free` entries — routing aliases and upstream pins are rejected;
+- credentials come from `KILO_API_KEY` / `OPENROUTER_API_KEY` /
+  `MISTRAL_API_KEY` when exported, otherwise from the same Doppler secrets OMP
+  itself uses (`doppler secrets get KILO_GATEWAY_API --project ai-automation
+  --config dev --plain`). A key is never printed, never written to disk and
+  never placed in the sandbox environment;
+- a test-only loopback relay admits only the allowlisted chat path and exact
+  model id, forwards only `messages`, `model`, `stream` and a bounded
+  `max_tokens` with the real bearer, and never retries; the sandbox knows only
+  the verified free rows, so no fallback can reach a paid model;
+- two fresh processes rotate `[B, A]` with the start pinned outside the pool,
+  asserting the assistant turn's recorded model and the durable cursor (`1`
+  then `0`), then an exact `--resume` must not re-rotate;
+- Mistral is checked independently: `fetchMistralLiveModels` is called against
+  the official catalog and must return a non-empty chat roster with positive
+  limits.
 
-- routes must be marked free by the provider's own catalog (`isFree`) *and*
-  present in OMP's registry. OMP's registry alone is not enough: it advertises
-  `:free` ids the provider then rejects with 404, and reports `unknown` pricing
-  for every zero-cost entry. `OMP_LIVE_ROUTES=a,b` pins the pair.
-- everything lands under one temp root: its own `--session-dir`, cwd, config
-  overlay and state file. The owner's config is hashed before and after and the
-  run fails if any file changed. No plugin is installed.
-- `--no-extensions -e <this repo>`, `--no-prewalk`, `--no-skills`, `--no-rules`,
-  `--no-title`, plus an overlay disabling prewalk and the advisor, so nothing
-  else runs and no paid role is reachable.
-- anything unproven reports `skip` with the reason rather than passing.
+A provider failure may skip a turn only when the relay observed the matching
+admitted request, and a skip is reported as a skip — never as a pass. Missing
+credentials, unavailable catalogs or fewer than three verified free routes skip
+with the reason. Anything else that goes wrong fails.
 
-It also proves role rotation: the bundled `reviewer` agent declares
-`model: ["@slow"]`, an unpinned role alias, so spawning it exercises the same
-`before_subagent_spawn` path a normal delegation does. The trigger is
-model-driven — OMP exposes no "spawn agent X" command — so a run where the
-parent declines to delegate reports `skip` with that reason rather than passing.
-The assertion is still not model-dependent: it reads the model on the child's
-own assistant turn. At the end both counters are checked independently, so a
-main rotation cannot be mistaken for a role rotation.
+`OMP_LIVE_ROUTES=a,b,c` pins the trio (pin, B, A); each is still verified, and a
+malformed or proven-unfree selection fails instead of silently choosing
+another route.
 
 ## API (tests / hosts)
 

@@ -5,27 +5,32 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const mod = await import("../dist/index.js");
+import * as fakeHost from "./helpers/fake-host.mjs";
+import nodeFs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 
-function makeModels(available) {
-  // available: string[] like "prov/model"
-  const parsed = available.map((s) => {
-    const i = s.indexOf("/");
-    return i >= 0
-      ? { provider: s.slice(0, i), id: s.slice(i + 1) }
-      : { provider: "", id: s };
-  });
-  return {
-    list: () => parsed.map((m) => ({ ...m })),
-    current: () => undefined,
-    resolve: (spec) => {
-      const t = String(spec).trim();
-      // role aliases do not resolve here; only concrete selectors do.
-      if (t.startsWith("@")) return undefined;
-      const found = parsed.find(
-        (m) => `${m.provider}/${m.id}` === t || m.id === t,
-      );
-      return found ? { ...found } : undefined;
-    },
+// The shared registry from the fake host replaces this file's private
+// duplicate matcher. `current()` is undefined unless a case seeds it, which is
+// exactly the "host cannot report its active model" shape.
+const makeModels = fakeHost.makeModels;
+
+/** A `@slow` subagent spawn, the event shape OMP hands the routing hook. */
+const SLOW_EVENT_FOR_SLOW = {
+  type: "before_subagent_spawn",
+  agent: "reviewer",
+  invocationKind: "task",
+  modelRole: "@slow",
+  patterns: ["@slow"],
+};
+
+/** Patch the default `node:fs` export and push it into the ESM namespace. */
+function patchRename(impl) {
+  const original = nodeFs.renameSync;
+  nodeFs.renameSync = impl(original);
+  syncBuiltinESMExports();
+  return () => {
+    nodeFs.renameSync = original;
+    syncBuiltinESMExports();
   };
 }
 
@@ -34,12 +39,21 @@ function makeHarness() {
   const logs = [];
   const notified = [];
   const setModels = [];
+  // One ordered record across both setter kinds, for call-order assertions
+  // ("setModel" / "setThinkingLevel:<level>").
+  const order = [];
+  const effortCalls = [];
   const pi = {
     on: (event, handler) => {
       handlers[event] = handler;
     },
     setModel: async (m) => {
       setModels.push(m);
+      order.push("setModel");
+    },
+    setThinkingLevel: (level) => {
+      effortCalls.push(level);
+      order.push(`setThinkingLevel:${level}`);
     },
     logger: {
       info: (...a) => logs.push(["info", a.join(" ")]),
@@ -48,7 +62,7 @@ function makeHarness() {
       error: (...a) => logs.push(["error", a.join(" ")]),
     },
   };
-  return { handlers, logs, notified, setModels, pi };
+  return { handlers, logs, notified, setModels, order, effortCalls, pi };
 }
 
 // The host applies a resolved `Model`, so assertions compare `provider/id`
@@ -57,6 +71,12 @@ function appliedIds(setModels) {
   return setModels.map((m) =>
     m !== null && typeof m === "object" ? `${m.provider}/${m.id}` : String(m),
   );
+}
+
+// Drive a registered `session_start` handler exactly the way OMP does: one
+// event object and one extension context.
+function handleSessionStart(harness, ctx) {
+  return harness.handlers.session_start({ type: "session_start" }, ctx);
 }
 
 function subCtx(models, agentKind = "sub") {
@@ -486,9 +506,16 @@ describe("main-session rotation", () => {
     mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
     const ctx = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init" }], freshHeader());
     await handlers.session_start({ type: "session_start" }, ctx);
-    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("session_start error")));
+    assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("threw; leaving model unchanged")));
   });
 });
+
+// A per-test state file under a fresh temporary directory, so tests never
+// share on-disk state.
+function tmpStateFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-pool-"));
+  return { dir, file: path.join(dir, "model-pool-state.json") };
+}
 
 describe("cross-process counter persistence (opt-in)", () => {
   const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
@@ -810,5 +837,846 @@ describe("strict policy boundary", () => {
     mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
     const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
     assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
+  });
+});
+
+// A minimal deferred promise: a gate a test controls explicitly, without any
+// clock dependency.
+function deferred() {
+  let release;
+  const promise = new Promise((res) => { release = res; });
+  return { promise, resolve: () => release() };
+}
+
+// ---------------------------------------------------------------------------
+// Main-session acceptance gate (persistCounters + stateFile)
+//
+// A main-session pick is one serialized turn: peek the eligible slot, offer
+// it to the host, and consume it only once the host accepts. These cases
+// cover the acceptance/refusal boundary at the setModel step.
+// ---------------------------------------------------------------------------
+describe("main-session acceptance gate", () => {
+  function setupRefusedPick() {
+    const harness = makeHarness();
+    const refused = deferred();
+    harness.pi.setModel = async () => false; // the host refuses every apply
+    return { harness, refused };
+  }
+
+  it("does not consume a slot when the host refuses the model", async () => {
+    const { harness, refused } = setupRefusedPick();
+    const { dir, file } = tmpStateFile();
+    try {
+      mod.default(harness.pi, { pools: { default: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(mod.getCounters(), {});
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a slot when setModel throws, and never retries it", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      let calls = 0;
+      const harness = makeHarness();
+      harness.pi.setModel = async () => {
+        calls += 1;
+        throw new Error("host exploded");
+      };
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(calls, 1, "a throwing host is never retried");
+      assert.deepEqual(mod.getCounters(), {});
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a slot when the host exposes no setModel", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const harness = makeHarness();
+      delete harness.pi.setModel;
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(mod.getCounters(), {});
+      assert.equal(fs.existsSync(file), false);
+      assert.ok(harness.logs.some(([l, m]) => l === "warn" && m.includes("setModel")));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a slot when the only entry is not authenticated", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // `p/b` resolves but is absent from `list()`: not authenticated.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a"]), [], freshHeader()));
+      assert.deepEqual(harness.setModels, []);
+      assert.deepEqual(mod.getCounters(), {});
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a slot when the registry read throws", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      models.list = () => {
+        throw new Error("registry offline");
+      };
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(harness.setModels, []);
+      assert.deepEqual(mod.getCounters(), {});
+      assert.ok(
+        harness.logs.some(([l, m]) => l === "warn" && m.includes("registryReadable=false")),
+        "an unreadable registry is reported as such, not as authenticated-nothing",
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("consumes exactly one slot when the host cannot report its active model", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // `current()` is undefined: the apply is unconfirmed, not a failure.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      assert.deepEqual(mod.getCounters(), { default: 1 });
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+      assert.ok(
+        harness.logs.some(([l, m]) => l === "warn" && m.includes("did not confirm")),
+        "the unconfirmed apply is reported",
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not consume a slot when the host keeps a different model", async () => {
+    const { dir, file } = tmpStateFile();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // The seeded active model never changes, so applying `p/a` mismatches.
+      const models = makeModels(["p/a", "p/b"], "p/b");
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      assert.deepEqual(mod.getCounters(), {});
+      assert.equal(fs.existsSync(file), false, "a mismatch writes no cursor");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("queues a same-role spawn behind the startup pick and gives it the next slot", async () => {
+    const gate = deferred();
+    let calls = 0;
+    const harness = makeHarness();
+    harness.pi.setModel = async () => {
+      calls += 1;
+      await gate.promise;
+      return undefined;
+    };
+    mod.default(harness.pi, {
+      pools: { slow: ["p/a", "p/b"] },
+      mainSessionRole: "slow",
+    });
+    const models = makeModels(["p/a", "p/b"]);
+    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+    const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+    assert.equal(await Promise.race([spawn.then(() => "settled"), Promise.resolve("open")]), "open",
+      "a same-role spawn waits for the startup pick to settle");
+    gate.resolve();
+    await startup;
+    assert.equal((await spawn).model, "p/b", "the accepted pick consumed slot 0");
+    assert.equal(calls, 1);
+  });
+
+  it("gives a queued same-role spawn the same slot when the startup pick is refused", async () => {
+    const gate = deferred();
+    const harness = makeHarness();
+    harness.pi.setModel = async () => {
+      await gate.promise;
+      return false;
+    };
+    mod.default(harness.pi, {
+      pools: { slow: ["p/a", "p/b"] },
+      mainSessionRole: "slow",
+    });
+    const models = makeModels(["p/a", "p/b"]);
+    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+    const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+    gate.resolve();
+    await startup;
+    assert.equal((await spawn).model, "p/a", "a refusal consumed nothing, so the spawn sees slot 0");
+  });
+
+  it("does not block a different role while a startup pick is in flight", async () => {
+    const gate = deferred();
+    const harness = makeHarness();
+    harness.pi.setModel = async () => {
+      await gate.promise;
+      return undefined;
+    };
+    mod.default(harness.pi, {
+      pools: { slow: ["p/a", "p/b"], other: ["p/x"] },
+      mainSessionRole: "slow",
+    });
+    const models = makeModels(["p/a", "p/b", "p/x"]);
+    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+    const other = await harness.handlers.before_subagent_spawn(
+      { type: "before_subagent_spawn", agent: "scout", invocationKind: "task", modelRole: "@other", patterns: ["@other"] },
+      subCtx(models),
+    );
+    assert.equal(other?.model, "p/x", "an unrelated role is not serialized behind another role's turn");
+    gate.resolve();
+    await startup;
+  });
+
+  it("applies the model once and mirrors the cursor when the durable write fails", async () => {
+    const { dir, file } = tmpStateFile();
+    const restore = patchRename(() => () => {
+      const err = new Error("denied");
+      err.code = "EACCES";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(harness.setModels.length, 1, "the accepted model is applied exactly once");
+      assert.deepEqual(mod.getCounters(), { default: 1 }, "the in-memory cursor mirrors the acceptance");
+      assert.equal(fs.existsSync(file), false);
+      assert.ok(
+        harness.logs.some(([l, m]) => l === "warn" && /(could not be written|in-memory)/.test(m)),
+        "the durable failure is reported instead of claimed as a rotation",
+      );
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("continues from the in-memory cursor on the next startup when the write keeps failing", async () => {
+    const { dir, file } = tmpStateFile();
+    const restore = patchRename(() => () => {
+      const err = new Error("denied");
+      err.code = "EACCES";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Two fresh main sessions in ONE process: the second must not re-read the
+      // stale state file and re-apply the slot the host already took.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b"]);
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns to the durable cursor once a write finally succeeds", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      failing = false;
+      // The degraded role continues from the mirror, commits, and clears the mark.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+      // The next startup is back on the file's cursor.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/a"]);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers to a slot another process committed while this one was degraded", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Two failed commits: a was applied (mirror -> b), then b (mirror -> a).
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      // Another process now commits slot b for itself: the file moves to 1.
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: 1 } }, null, 2)}\n`,
+        "utf8",
+      );
+      failing = false;
+      // The mirror says "a" but the durable cursor says "b"; the durable write
+      // wins, or this process would apply a slot someone else already took.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects a rewritten state file whose cursor wrapped back to the same value", async () => {
+    const { dir, file } = tmpStateFile();
+    const writeState = (cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeState(0);
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // One failed commit: a was applied, mirror points at b, disk still says 0.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      // Another process commits a, then b: a full wrap puts the cursor back on
+      // 0, but the bytes are new. Equality on the cursor would call this
+      // "unchanged" and let this process apply b again.
+      writeState(1);
+      // Same cursor, different bytes: the rewrite must be detectable from the
+      // file content itself, not from filesystem timestamp resolution.
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: 0 }, rewritten: true }, null, 2)}\n`,
+        "utf8",
+      );
+      failing = false;
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not carry a degraded mirror across a rebind to another state file", async () => {
+    const first = tmpStateFile();
+    const second = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: first.file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      failing = false;
+      // Rebind to a different file: its own cursor is 0, so the first pick must
+      // be slot 0 again rather than the mirror from the previous file.
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: second.file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(second.file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(first.dir, { recursive: true, force: true });
+      fs.rmSync(second.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the mirror pinned to the read that failed even when a later pick is refused", async () => {
+    const { dir, file } = tmpStateFile();
+    const writeState = (cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeState(0);
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Accepted a, durable write failed: mirror points at b, file still reads 0.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      // An external rewrite returns the cursor to 0 with new bytes.
+      writeState(1);
+      writeState(0);
+      // The next attempt is REFUSED. It commits nothing, so it must not refresh
+      // the fingerprint the mirror is validated against.
+      harness.pi.setModel = async (model) => {
+        harness.setModels.push(model);
+        return false;
+      };
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"], "the retry targets the rewritten disk cursor");
+      // Now the durable write works: the rewritten file's cursor 0 wins and a
+      // is applied again — b would mean the stale mirror survived the refusal.
+      failing = false;
+      harness.pi.setModel = async (model) => {
+        harness.setModels.push(model);
+      };
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(appliedIds(harness.setModels).at(-1), "p/a");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("shares the degraded mirror with a same-role spawn that falls back", async () => {
+    const { dir, file } = tmpStateFile();
+    const restore = patchRename(() => () => {
+      const err = new Error("denied");
+      err.code = "EACCES";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // main: accept a, durable write fails -> counter mirrors 1.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // same-role spawn: its persisted attempt also fails and falls back to the
+      // in-memory counter, which it advances to 0 and reports b.
+      const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(spawn?.model, "p/b");
+      // Next startup must follow that shared counter back to a. A private copy
+      // of the mirror would still read 1 here and repeat b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let another state file's picks move a degraded file's cursor", async () => {
+    const a = tmpStateFile();
+    const b = tmpStateFile();
+    const writeCursor = (file, cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeCursor(a.file, 0);
+    writeCursor(b.file, 1);
+    // Only file A's replacement fails; B persists normally.
+    const restore = patchRename((original) => (from, to) => {
+      if (String(to) === a.file) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      const pools = { default: ["p/a", "p/b", "p/c"] };
+      const models = makeModels(["p/a", "p/b", "p/c"]);
+
+      mod.default(harness.pi, { pools, persistCounters: true, stateFile: a.file });
+      // A: accept a, write fails -> A's mirror points at b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      // Rebind to B: its own cursor 1 picks b and commits, moving the shared
+      // role counter to 2.
+      mod.configurePools({ pools, persistCounters: true, stateFile: b.file });
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      // Back on A, whose bytes never changed: the mirror still says b, so the
+      // shared counter's 2 must not reach c.
+      mod.configurePools({ pools, persistCounters: true, stateFile: a.file });
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(b.file, "utf8")).counters.default, 2);
+    } finally {
+      restore();
+      fs.rmSync(a.dir, { recursive: true, force: true });
+      fs.rmSync(b.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers when the lock cannot be removed after a committed turn", async () => {
+    const { dir, file } = tmpStateFile();
+    const lockDir = `${file}.lock`;
+    const originalRm = nodeFs.rmSync;
+    let failedOnce = false;
+    nodeFs.rmSync = (target, options) => {
+      if (!failedOnce && String(target) === lockDir) {
+        failedOnce = true;
+        const err = new Error("still open");
+        err.code = "EPERM";
+        throw err;
+      }
+      return originalRm(target, options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // First turn commits, then fails to delete its own lock directory.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(failedOnce, true, "the release failure was exercised");
+      const started = Date.now();
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 2_000, `the next turn waited ${elapsed}ms for a lock this process owns`);
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+    } finally {
+      nodeFs.rmSync = originalRm;
+      syncBuiltinESMExports();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honours the degraded cursor when persistence recovers before a same-role spawn", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // Accept a while the durable write fails: the mark mirrors b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // Persistence recovers BEFORE the spawn: the spawn's own write will
+      // succeed, so it must still read the mirror rather than the stale file.
+      failing = false;
+      const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(spawn?.model, "p/b");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
+      assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("advances the degraded mirror when a startup falls back on a read failure", async () => {
+    const { dir, file } = tmpStateFile();
+    fs.writeFileSync(file, `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`, "utf8");
+    let renameFails = true;
+    let readFails = false;
+    const restoreRename = patchRename((original) => (from, to) => {
+      if (renameFails) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    const originalRead = nodeFs.readFileSync;
+    nodeFs.readFileSync = (target, options) => {
+      if (readFails && String(target) === file) {
+        const err = new Error("io error");
+        err.code = "EIO";
+        throw err;
+      }
+      return originalRead(target, options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // 1: accepted a, durable write fails -> mirror points at b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // 2: the state read fails, so this startup falls back to memory and
+      // applies b; the mirror must follow it to a.
+      readFails = true;
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // 3: persistence recovers; the unchanged file still matches the mark, so
+      // the mirrored a is next — not b again.
+      readFails = false;
+      renameFails = false;
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restoreRename();
+      nodeFs.readFileSync = originalRead;
+      syncBuiltinESMExports();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes the v1 backup without following an existing symlink", async (t) => {
+    const { dir, file } = tmpStateFile();
+    const victim = path.join(dir, "victim.txt");
+    const backup = `${file}.v1.bak`;
+    fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: 7 } }), "utf8");
+    fs.writeFileSync(victim, "do not overwrite me", "utf8");
+    try {
+      fs.symlinkSync(victim, backup);
+    } catch {
+      t.skip("this platform/filesystem does not allow creating symlinks");
+      return;
+    }
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(fs.readFileSync(victim, "utf8"), "do not overwrite me", "the symlink target is untouched");
+      assert.equal(fs.lstatSync(backup).isSymbolicLink(), false, "the backup entry is a regular file now");
+      assert.equal(JSON.parse(fs.readFileSync(backup, "utf8")).version, 1, "the backup holds the v1 bytes");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a queued spawn writing to the state file it was queued for", async () => {
+    const first = tmpStateFile();
+    const second = tmpStateFile();
+    const gate = deferred();
+    try {
+      const harness = makeHarness();
+      harness.pi.setModel = async () => {
+        await gate.promise;
+        return undefined;
+      };
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: first.file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      // A factory rebind lands while the spawn waits in the role queue.
+      mod.configurePools({
+        pools: { slow: ["p/x", "p/y", "p/z"] },
+        persistCounters: true,
+        stateFile: second.file,
+      });
+      gate.resolve();
+      await startup;
+      const result = await spawn;
+      assert.equal(result?.model, "p/b", "the queued spawn still uses the pool it captured");
+      // The startup committed the slot b (cursor 1); the queued spawn then
+      // consumed b and wrapped its captured file to 0. Had it followed the
+      // rebind, this file would still read 1 and the new file would exist.
+      assert.equal(JSON.parse(fs.readFileSync(first.file, "utf8")).counters.slow, 0);
+      assert.equal(fs.existsSync(second.file), false, "the rebound state file is not touched by the old pool");
+    } finally {
+      fs.rmSync(first.dir, { recursive: true, force: true });
+      fs.rmSync(second.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a transient rename and commits once from the same temp file", async () => {
+    const { dir, file } = tmpStateFile();
+    const temps = [];
+    let attempts = 0;
+    const restore = patchRename((original) => (from, to) => {
+      attempts += 1;
+      temps.push(String(from));
+      if (attempts <= 2) {
+        const err = new Error("sharing violation");
+        err.code = "EPERM";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      if (process.platform === "win32") {
+        assert.equal(attempts, 3, "two transient failures then a commit");
+        assert.equal(new Set(temps).size, 1, "every retry renames the same temp file");
+        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+      } else {
+        // The retry is Windows-only by design: elsewhere the first failure is final.
+        assert.equal(attempts, 1);
+        assert.deepEqual(mod.getCounters(), { default: 1 });
+      }
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the live bytes untouched and removes the temp when the rename never succeeds", async () => {
+    const { dir, file } = tmpStateFile();
+    const before = `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`;
+    fs.writeFileSync(file, before);
+    let attempts = 0;
+    const restore = patchRename(() => () => {
+      attempts += 1;
+      const err = new Error("still locked");
+      err.code = "EPERM";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(fs.readFileSync(file, "utf8"), before, "the live state file is never replaced or unlinked");
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")),
+        [],
+        "the temp file is cleaned up",
+      );
+      assert.equal(harness.setModels.length, 1);
+      if (process.platform === "win32") assert.equal(attempts, 5, "one attempt plus the four bounded retries");
+      else assert.equal(attempts, 1);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
