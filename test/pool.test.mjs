@@ -1453,6 +1453,41 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("honours the degraded cursor when persistence recovers before a same-role spawn", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // Accept a while the durable write fails: the mark mirrors b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // Persistence recovers BEFORE the spawn: the spawn's own write will
+      // succeed, so it must still read the mirror rather than the stale file.
+      failing = false;
+      const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(spawn?.model, "p/b");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
+      assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("publishes the v1 backup without following an existing symlink", async (t) => {
     const { dir, file } = tmpStateFile();
     const victim = path.join(dir, "victim.txt");
