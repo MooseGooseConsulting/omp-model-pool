@@ -294,17 +294,24 @@ export async function createFreeGateway({
       return;
     }
     slot.statuses.push(upstream.status);
-    finish();
     if (!upstream.ok) {
       log(`[smoke-relay] ${selectorByRoute.get(`${provider}\u0000${parsed.model}`)} → upstream HTTP ${upstream.status}`);
+      finish();
       return respondJson(res, upstream.status, "smoke relay: the provider rejected the admitted request");
     }
-    if (res.writableEnded || res.destroyed) return;
+    if (res.writableEnded || res.destroyed) {
+      finish();
+      return;
+    }
 
-    // Pipe the SSE stream and the content type straight through.
+    // Pipe the SSE stream and the content type straight through. The upstream
+    // deadline stays armed until the body is fully consumed: a provider that
+    // sends headers promptly and then stalls would otherwise never be aborted,
+    // and the run would sit until the harness's process timeout instead.
     const contentType = upstream.headers?.get?.("content-type");
     res.writeHead(200, { "cache-control": "no-store", "content-type": contentType ?? "text/event-stream" });
     if (upstream.body === null || upstream.body === undefined) {
+      finish();
       res.end();
       return;
     }
@@ -320,8 +327,13 @@ export async function createFreeGateway({
       if (!res.writableEnded && !res.destroyed) res.end();
     } catch {
       // A broken stream after the headers is not classifiable as a provider
-      // skip; the transcript and exit code decide. Make sure the socket ends.
+      // skip; the transcript and exit code decide. A body that stalled past the
+      // deadline is recorded so the caller can treat it as a timeout.
+      if (deadlineHit) slot.statuses.push("timeout");
       if (!res.writableEnded && !res.destroyed) res.end();
+    } finally {
+      // Only now can the controller and its timer be retired.
+      finish();
     }
   }
 

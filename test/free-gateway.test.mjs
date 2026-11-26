@@ -449,6 +449,64 @@ test("the upstream deadline aborts the request and answers 504", async () => {
   );
 });
 
+test("a body that stalls after the headers is still aborted by the deadline", async () => {
+  const calls = [];
+  await withGateway(
+    {
+      routes: SMOKE_SELECTORS,
+      providerKeys: { kilo: REAL_KILO_KEY },
+      fetchImpl: stalledBodyUpstream(calls),
+      upstreamTimeoutMs: 120,
+    },
+    async (gateway) => {
+      // Without a live deadline this promise never settles: the stub sends
+      // headers and then nothing, forever. Race it so a regression fails fast
+      // instead of hanging the suite.
+      const response = await Promise.race([
+        postJson({
+          port: gateway.port,
+          urlPath: "/kilo/v1/chat/completions",
+          bearer: gateway.bearer,
+          body: CHAT_BODY,
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("relay never ended the stalled stream")), 3000)),
+      ]);
+      assert.equal(response.status, 200, "headers reached the client before the stall");
+      assert.equal(response.text, "");
+      assert.equal(calls.length, 1, "the deadline never produces a second attempt");
+      assert.equal(
+        gateway.snapshot().bySelector[`kilo/${SMOKE_MODEL}`].statuses.at(-1),
+        "timeout",
+        "the stalled body is recorded as a timeout so the caller can skip it",
+      );
+    },
+  );
+});
+
+/** Headers immediately, then a body that never emits or closes until aborted. */
+function stalledBodyUpstream(calls) {
+  return (input, init = {}) => {
+    calls.push({ input, init });
+    const { signal } = init;
+    const body = new ReadableStream({
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => {
+            try {
+              controller.error(abortError());
+            } catch {
+              // Already terminated; nothing to signal.
+            }
+          },
+          { once: true },
+        );
+      },
+    });
+    return Promise.resolve(new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }));
+  };
+}
+
 test("a client disconnect cancels the in-flight upstream request", async () => {
   const calls = [];
   await withGateway(

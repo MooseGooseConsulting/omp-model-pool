@@ -580,7 +580,9 @@ describe("doctor diagnosis (inline registries)", () => {
       delete process.env[key];
     }
     inlineTmpDirs = [];
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cmd-"));
+    // Keep the outer suite's `tmpDir` intact: these tests never use it, and the
+    // outer afterEach is the only thing that removes it.
+    inlineTmpDirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cmd-")));
   });
 
   afterEach(() => {
