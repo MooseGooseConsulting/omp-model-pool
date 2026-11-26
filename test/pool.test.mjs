@@ -1226,7 +1226,13 @@ describe("main-session acceptance gate", () => {
       // 0, but the bytes are new. Equality on the cursor would call this
       // "unchanged" and let this process apply b again.
       writeState(1);
-      writeState(0);
+      // Same cursor, different bytes: the rewrite must be detectable from the
+      // file content itself, not from filesystem timestamp resolution.
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: 0 }, rewritten: true }, null, 2)}\n`,
+        "utf8",
+      );
       failing = false;
       await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
       assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
@@ -1357,6 +1363,92 @@ describe("main-session acceptance gate", () => {
       assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
     } finally {
       restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let another state file's picks move a degraded file's cursor", async () => {
+    const a = tmpStateFile();
+    const b = tmpStateFile();
+    const writeCursor = (file, cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeCursor(a.file, 0);
+    writeCursor(b.file, 1);
+    // Only file A's replacement fails; B persists normally.
+    const restore = patchRename((original) => (from, to) => {
+      if (String(to) === a.file) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      const pools = { default: ["p/a", "p/b", "p/c"] };
+      const models = makeModels(["p/a", "p/b", "p/c"]);
+
+      mod.default(harness.pi, { pools, persistCounters: true, stateFile: a.file });
+      // A: accept a, write fails -> A's mirror points at b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      // Rebind to B: its own cursor 1 picks b and commits, moving the shared
+      // role counter to 2.
+      mod.configurePools({ pools, persistCounters: true, stateFile: b.file });
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      // Back on A, whose bytes never changed: the mirror still says b, so the
+      // shared counter's 2 must not reach c.
+      mod.configurePools({ pools, persistCounters: true, stateFile: a.file });
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(b.file, "utf8")).counters.default, 2);
+    } finally {
+      restore();
+      fs.rmSync(a.dir, { recursive: true, force: true });
+      fs.rmSync(b.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers when the lock cannot be removed after a committed turn", async () => {
+    const { dir, file } = tmpStateFile();
+    const lockDir = `${file}.lock`;
+    const originalRm = nodeFs.rmSync;
+    let failedOnce = false;
+    nodeFs.rmSync = (target, options) => {
+      if (!failedOnce && String(target) === lockDir) {
+        failedOnce = true;
+        const err = new Error("still open");
+        err.code = "EPERM";
+        throw err;
+      }
+      return originalRm(target, options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // First turn commits, then fails to delete its own lock directory.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(failedOnce, true, "the release failure was exercised");
+      const started = Date.now();
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 2_000, `the next turn waited ${elapsed}ms for a lock this process owns`);
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+    } finally {
+      nodeFs.rmSync = originalRm;
+      syncBuiltinESMExports();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

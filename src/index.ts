@@ -354,6 +354,12 @@ const counters: Record<string, number> = Object.create(null);
 interface DegradedCursor {
   /** Fingerprint of the state file read when the write failed; "" when unset. */
   fileFingerprint: string;
+  /**
+   * Cursor to resume from while that exact file state still holds. Scoped to
+   * the (file, role) pair: a role that also rotates over another state file
+   * must not carry that file's position into this one.
+   */
+  localCursor: number;
 }
 
 const persistDegraded = new Map<string, DegradedCursor>();
@@ -843,6 +849,38 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Lock tokens this process created but could not delete on release.
+ *
+ * The abandoned-lock reclaimer deliberately refuses to touch a lock whose owner
+ * is alive, and that owner is us. Without this ledger a single failed cleanup
+ * would make every later pick for the state file wait out the lock timeout and
+ * then fall back to an unserialized in-memory cursor.
+ */
+const unreleasedLocks = new Set<string>();
+
+/**
+ * Remove a lock this process already released logically but could not delete.
+ * Only a token we recorded ourselves is ever removed, so another holder's lock
+ * can never be stolen here.
+ */
+function reclaimOwnUnreleasedLock(lock: string): boolean {
+  let token: string;
+  try {
+    token = fs.readFileSync(path.join(lock, "owner"), "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!unreleasedLocks.has(token)) return false;
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+  } catch {
+    return false; // keep the ledger entry and retry on the next acquisition
+  }
+  unreleasedLocks.delete(token);
+  return true;
+}
+
+/**
  * Is the lock's recorded owner still running?
  * `true` alive, `false` provably gone (ESRCH), `undefined` unknown/unreadable.
  * Only a provably-gone owner makes a lock reclaimable, so a live-but-slow
@@ -928,6 +966,7 @@ async function withFileLock<T>(file: string, fn: () => T | Promise<T>): Promise<
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (reclaimOwnUnreleasedLock(lock)) continue;
       if (reclaimAbandonedLock(lock)) continue;
       if (Date.now() >= deadline) throw new Error(`timed out waiting for model-pool lock ${lock}`);
       await sleep(20);
@@ -951,7 +990,17 @@ async function withFileLock<T>(file: string, fn: () => T | Promise<T>): Promise<
     // Release only a lock we still own. If ours was reclaimed as abandoned and
     // a new holder took it, deleting that lock would admit a third writer.
     try {
-      if (fs.readFileSync(owner, "utf8").trim() === token) fs.rmSync(lock, { recursive: true, force: true });
+      if (fs.readFileSync(owner, "utf8").trim() === token) {
+        try {
+          fs.rmSync(lock, { recursive: true, force: true });
+        } catch {
+          // The turn committed but the lock could not be removed. The abandoned
+          // reclaimer will not help (our pid is alive), so remember the token:
+          // without this, one failed cleanup jams every later pick for the life
+          // of the process.
+          unreleasedLocks.add(token);
+        }
+      }
     } catch {
       // Unverifiable: leave it for the abandoned-lock reclaimer.
     }
@@ -996,13 +1045,11 @@ async function advancePersisted(
       // same number after a wrap, so a file another process rewrote would look
       // unchanged and this process would apply the slot that process just took.
       //
-      // The mirror itself is the shared counter, not a copy: every local pick
-      // for this role — including a same-role spawn that fell back to the
-      // in-memory path — advances it, so a copy here would go stale and
-      // re-apply a slot this process already handed out.
-      if (read.fingerprint === degraded.fileFingerprint) {
-        const local = counters[roleKey];
-        if (local !== undefined && local !== diskCursor) start = local;
+      // The mirror is the mark's own cursor, not the shared one: the same role
+      // can rotate over another state file (a rebind), and that file's picks
+      // must never move this file's position.
+      if (read.fingerprint === degraded.fileFingerprint && degraded.localCursor !== diskCursor) {
+        start = degraded.localCursor;
       }
     }
     const index = findEligibleIndex(poolLength, eligible, start);
@@ -1676,8 +1723,9 @@ function pickRoundRobin(
   roleKey: string,
   pool: readonly string[],
   eligible: readonly boolean[],
+  start = counters[roleKey] ?? 0,
 ): { picked: string; index: number } | undefined {
-  const index = findEligibleIndex(pool.length, eligible, counters[roleKey] ?? 0);
+  const index = findEligibleIndex(pool.length, eligible, start);
   if (index === undefined) return undefined;
   counters[roleKey] = (index + 1) % pool.length;
   return { picked: pool[index] as string, index };
@@ -1700,9 +1748,21 @@ async function pickForRole(
     const pick = pickRoundRobin(roleKey, pool, availability.eligible);
     return pick === undefined ? undefined : { ...pick, persisted: false };
   }
+  const markKey = degradedKey(persist.stateFile, roleKey);
+  const mark = persistDegraded.get(markKey);
+  const observed: { fileFingerprint: string } = { fileFingerprint: "" };
   try {
-    const picked = await advancePersisted(roleKey, pool.length, availability.eligible, persist.stateFile);
+    const picked = await advancePersisted(
+      roleKey,
+      pool.length,
+      availability.eligible,
+      persist.stateFile,
+      undefined,
+      mark,
+      observed,
+    );
     if (picked === undefined) return undefined;
+    persistDegraded.delete(markKey); // the durable commit succeeded
     if (picked.replacedLegacy) {
       safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(persist.stateFile, picked.backupOk)}`);
     }
@@ -1714,8 +1774,19 @@ async function pickForRole(
       "warn",
       `[model-pool] persisted counter read/write failed; using in-memory counters: ${err instanceof Error ? err.message : String(err)}`,
     );
-    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
-    return pick === undefined ? undefined : { ...pick, persisted: false };
+    // A degraded (file, role) pair continues from its own mirror and advances
+    // it, so a later startup sees the slot this fallback handed out. Pairs
+    // without a mark keep the plain in-memory behaviour.
+    const known = persistDegraded.get(markKey);
+    const pick = pickRoundRobin(roleKey, pool, availability.eligible, known?.localCursor ?? counters[roleKey] ?? 0);
+    if (pick === undefined) return undefined;
+    if (known !== undefined) {
+      persistDegraded.set(markKey, {
+        fileFingerprint: known.fileFingerprint,
+        localCursor: (pick.index + 1) % pool.length,
+      });
+    }
+    return { ...pick, persisted: false };
   }
 }
 
@@ -2107,7 +2178,10 @@ async function runMainSessionRotation(
       // attempt observed so a later startup can tell "still our stale file"
       // from "someone else committed", and say the pick is local.
       counters[roleKey] = (acceptedIndex + 1) % pool.length;
-      persistDegraded.set(markKey, { fileFingerprint: observed.fileFingerprint });
+      persistDegraded.set(markKey, {
+        fileFingerprint: observed.fileFingerprint,
+        localCursor: (acceptedIndex + 1) % pool.length,
+      });
       safeLog(
         pi,
         "warn",
