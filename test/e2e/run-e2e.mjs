@@ -86,6 +86,8 @@ function caseOptions(poolConfig, { overlayExtra = [], providerEnv = {} } = {}) {
 }
 
 async function inIsolatedRoot(label, options, caseFn) {
+  // A case may force provider failures; they must never leak into the next one.
+  fixture.resetFailures();
   let isolated;
   try {
     isolated = createIsolatedEnv({
@@ -483,8 +485,10 @@ async function caseFailoverChain() {
       );
       const fresh = newTranscripts(before, isolated);
       const children = fresh.filter((f) => readTranscript(f).header?.parentSession !== undefined);
+      const parents = fresh.filter((f) => readTranscript(f).header?.parentSession === undefined);
       expect(children.length === 1, "case 2d: exactly one new child transcript", String(children.length));
-      if (children.length !== 1) return;
+      expect(parents.length === 1, "case 2d: exactly one new parent transcript", String(parents.length));
+      if (children.length !== 1 || parents.length !== 1) return;
 
       const child = readTranscript(children[0]);
       expect(
@@ -492,6 +496,12 @@ async function caseFailoverChain() {
         "case 2d: child completed on the next pool entry",
         child.assistantModels.join(", ") || "(none)",
       );
+      // A model identity alone could be an error entry: require the task to have
+      // actually completed with the expected output, like the rotation case does.
+      const done = toolResultTexts(parents[0]).filter(
+        (t) => TASK_RESULT_DONE.test(t) && TASK_OUTPUT_OK.test(t),
+      );
+      expect(done.length === 1, "case 2d: the delegated task completed", `${done.length} completed task-result envelope(s)`);
       const turns = turnRequests(capturesSince(captureStart));
       expect(
         turns.some((c) => c.model === "slow-a"),

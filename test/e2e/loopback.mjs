@@ -142,6 +142,10 @@ export async function startLoopbackFixture({ provider = FIXTURE_PROVIDER, apiKey
     failModel(model, { status = 500, times = Infinity } = {}) {
       state.failModels.set(model, { status, remaining: times });
     },
+    /** Drop every forced failure; called before each case so nothing leaks. */
+    resetFailures() {
+      state.failModels.clear();
+    },
     stats() {
       return {
         chatRequests: state.chatRequests,
@@ -288,8 +292,9 @@ function serveChatCompletion(res, state, body, { provider }) {
   // spawn's failover chain with the real retry machinery.
   const armed = state.failModels.get(model);
   if (armed !== undefined) {
-    if (armed.remaining !== Infinity) armed.remaining -= 1;
-    if (armed.remaining > 0 || armed.remaining === Infinity) {
+    if (armed.remaining > 0) {
+      // `Infinity` fails every attempt; a finite count fails exactly that many.
+      if (armed.remaining !== Infinity) armed.remaining -= 1;
       rejectRequest(res, state, `fixture forced ${armed.status} for ${model}`, armed.status);
       return;
     }

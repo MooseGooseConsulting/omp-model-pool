@@ -165,10 +165,11 @@ function effortSuffixToken(slot: string): string | undefined {
  * that resolves is inspected, and only when its identity agrees with the model
  * the full selector actually applied — a losing alternative never sets effort.
  * For an explicit request on a role alias (`@alias:level`) the request applies
- * even when the alias resolves to an id that already ends in the level; for a
- * literal id the request applies only when the resolved id does not already
- * end in the written suffix or the canonical level, so a model genuinely named
- * `x:free` or `x-high` is left alone. Suffixes hidden inside an alias's own
+ * even when the alias resolves to an id that already ends in the level. For a
+ * literal id the request applies unless the resolved id itself carries the
+ * written suffix (`p/b:high` resolving to a row whose id is `b:high`); a name
+ * that merely ends in the level word (`p/b-high`) is still an explicit request
+ * and gets the setter call. Suffixes hidden inside an alias's own
  * configuration are never inferred. An explicit non-literal `:auto` has no
  * public level — the caller keeps the model's defaults and warns.
  */
