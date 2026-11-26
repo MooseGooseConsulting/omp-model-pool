@@ -459,3 +459,50 @@ export async function selectRoutes(userEnv = process.env, { fetchImpl, timeoutMs
   }
   return { status: "ok", routes: rankFreeRoutes(candidates).slice(0, 3), reason: "" };
 }
+
+/**
+ * What the durable cursor must read after one rotation run.
+ *
+ * The cursor follows the model the host actually accepted, and the host
+ * records that as a `model_change` entry — which it writes *before* any
+ * provider request. So:
+ *
+ * - a transcript with a `model_change` to the expected model means the slot
+ *   was committed, even if the run then died before inference (no assistant
+ *   turn at all);
+ * - a transcript without one means nothing was accepted;
+ * - no transcript means the question is unanswerable, and claiming either
+ *   outcome would be a guess.
+ */
+export function cursorExpectation({ accepted, hadEvidence, previous, poolLength }) {
+  if (!hadEvidence) {
+    return {
+      status: "skip",
+      expected: previous,
+      reason: "the run wrote no transcript, so the durable cursor cannot be judged",
+    };
+  }
+  if (poolLength <= 0) {
+    return { status: "skip", expected: previous, reason: "the pool is empty" };
+  }
+  return {
+    status: "check",
+    expected: accepted ? (previous + 1) % poolLength : previous,
+    reason: accepted
+      ? "the host recorded a model change, so the slot was committed"
+      : "the host recorded no model change, so no slot was consumed",
+  };
+}
+
+/**
+ * Did any of these transcripts record the host accepting `expected`?
+ *
+ * Deliberately independent of assistant turns: a run can accept the model,
+ * record the `model_change`, and die before inference. Callers must pass every
+ * fresh transcript, not only the ones that produced an assistant message.
+ */
+export function acceptedEvidence(transcripts, expected) {
+  return transcripts.some((entry) =>
+    Array.isArray(entry?.modelsApplied) && entry.modelsApplied.includes(expected),
+  );
+}

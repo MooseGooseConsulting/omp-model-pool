@@ -36,7 +36,12 @@ import {
   writeRunManifest,
 } from "./isolated-env.mjs";
 import { findSessionFiles, parseJsonOutput, readTranscript, runOmp } from "./omp-runner.mjs";
-import { resolveProviderCredential, selectRoutes } from "./free-routes.mjs";
+import {
+  acceptedEvidence,
+  cursorExpectation,
+  resolveProviderCredential,
+  selectRoutes,
+} from "./free-routes.mjs";
 import {
   createFreeGateway,
   toSmokeSelector,
@@ -278,18 +283,30 @@ async function runSmokeTrio({ isolated, gateway, smokePin, smokePool }) {
       );
     }
     // The cursor follows the *accepted* pick, not the wire request: OMP commits
-    // the slot as soon as it applies the model, and a provider failure after
-    // that point must not make this check expect a cursor the run correctly
-    // advanced. `modelsApplied` is the host's own record of the change.
-    const accepted = withAssistants.length === 1 && withAssistants[0].modelsApplied.includes(expected);
-    if (accepted) cursor = (cursor + 1) % smokePool.length;
+    // the slot as soon as it applies the model and records that as a
+    // `model_change` entry, which precedes any provider call. Inspecting every
+    // fresh transcript (not only those with an assistant turn) is what keeps a
+    // run that crashed after the change from being judged as "nothing
+    // accepted". No transcript at all is unknown evidence, not a failure.
+    const parsedFresh = fresh.map((file) => readTranscript(file));
+    const accepted = acceptedEvidence(parsedFresh, expected);
+    const expectation = cursorExpectation({
+      accepted,
+      hadEvidence: parsedFresh.length > 0,
+      previous: cursor,
+      poolLength: smokePool.length,
+    });
     const actualCursor = readPersistedCursor(isolated.stateFile);
-    record(
-      `persisted cursor after run ${i + 1}`,
-      actualCursor === cursor ? "pass" : "fail",
-      `expected ${cursor} (${accepted ? "the model change was applied" : "no model change was recorded"}), ` +
-        `got ${actualCursor === undefined ? "unreadable" : actualCursor}`,
-    );
+    if (expectation.status === "skip") {
+      record(`persisted cursor after run ${i + 1}`, "skip", expectation.reason);
+    } else {
+      cursor = expectation.expected;
+      record(
+        `persisted cursor after run ${i + 1}`,
+        actualCursor === cursor ? "pass" : "fail",
+        `expected ${cursor} (${expectation.reason}), got ${actualCursor === undefined ? "unreadable" : actualCursor}`,
+      );
+    }
   }
 
   // --- exact resume of run 2 must not re-rotate -------------------------------
