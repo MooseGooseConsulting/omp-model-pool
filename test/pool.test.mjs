@@ -1329,6 +1329,38 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("shares the degraded mirror with a same-role spawn that falls back", async () => {
+    const { dir, file } = tmpStateFile();
+    const restore = patchRename(() => () => {
+      const err = new Error("denied");
+      err.code = "EACCES";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // main: accept a, durable write fails -> counter mirrors 1.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // same-role spawn: its persisted attempt also fails and falls back to the
+      // in-memory counter, which it advances to 0 and reports b.
+      const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(spawn?.model, "p/b");
+      // Next startup must follow that shared counter back to a. A private copy
+      // of the mirror would still read 1 here and repeat b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("publishes the v1 backup without following an existing symlink", async (t) => {
     const { dir, file } = tmpStateFile();
     const victim = path.join(dir, "victim.txt");

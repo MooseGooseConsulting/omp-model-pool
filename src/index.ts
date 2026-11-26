@@ -354,8 +354,6 @@ const counters: Record<string, number> = Object.create(null);
 interface DegradedCursor {
   /** Fingerprint of the state file read when the write failed; "" when unset. */
   fileFingerprint: string;
-  /** Mirrored cursor to resume from while that exact file state still holds. */
-  localCursor: number;
 }
 
 const persistDegraded = new Map<string, DegradedCursor>();
@@ -997,8 +995,14 @@ async function advancePersisted(
       // us. A cursor comparison is not enough: a two-slot pool returns to the
       // same number after a wrap, so a file another process rewrote would look
       // unchanged and this process would apply the slot that process just took.
-      if (read.fingerprint === degraded.fileFingerprint && degraded.localCursor !== diskCursor) {
-        start = degraded.localCursor;
+      //
+      // The mirror itself is the shared counter, not a copy: every local pick
+      // for this role — including a same-role spawn that fell back to the
+      // in-memory path — advances it, so a copy here would go stale and
+      // re-apply a slot this process already handed out.
+      if (read.fingerprint === degraded.fileFingerprint) {
+        const local = counters[roleKey];
+        if (local !== undefined && local !== diskCursor) start = local;
       }
     }
     const index = findEligibleIndex(poolLength, eligible, start);
@@ -2099,14 +2103,11 @@ async function runMainSessionRotation(
     const message = err instanceof Error ? err.message : String(err);
     if (acceptedIndex >= 0) {
       // Durable commit failed after the host already accepted: never apply
-      // again. Mirror the accepted index in memory, mark the role degraded so
-      // the next startup continues from that mirror instead of re-reading the
-      // stale file, and say the pick is local.
+      // again. Advance the shared in-memory counter, record the file state this
+      // attempt observed so a later startup can tell "still our stale file"
+      // from "someone else committed", and say the pick is local.
       counters[roleKey] = (acceptedIndex + 1) % pool.length;
-      persistDegraded.set(markKey, {
-        fileFingerprint: observed.fileFingerprint,
-        localCursor: (acceptedIndex + 1) % pool.length,
-      });
+      persistDegraded.set(markKey, { fileFingerprint: observed.fileFingerprint });
       safeLog(
         pi,
         "warn",
