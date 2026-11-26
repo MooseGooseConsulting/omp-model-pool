@@ -388,6 +388,52 @@ async function caseRotation() {
 }
 
 // ---------------------------------------------------------------------------
+// Case 1b — the DEFAULT mode: persistCounters is off.
+//
+// In-memory counters are module state, so they are shared by every session in
+// one process and lost when that process exits. Two fresh OS processes must
+// therefore both start at slot 0, and neither may leave a state file behind.
+// Every other real-host case enables persistence, so without this one the
+// shipped default was only ever covered by the fake host.
+// ---------------------------------------------------------------------------
+
+async function caseInMemoryRotation() {
+  const poolConfig = { default: MAIN_POOL };
+  await inIsolatedRoot("case-1b in-memory", caseOptions(poolConfig), async (isolated) => {
+    writeModelsYaml(isolated.agentDir, fixture.port);
+
+    for (const runNo of [1, 2]) {
+      const step = `case 1b run ${runNo}`;
+      const before = new Set(sessionPaths(isolated));
+      const captureStart = fixture.captures.length;
+      await spawnOmp(isolated, [...isolated.ompArgs, "--model", PIN_SELECTOR, "-p", PROMPT], step);
+
+      const fresh = newTranscripts(before, isolated);
+      expect(fresh.length === 1, `${step}: exactly one new transcript`, `${fresh.length} new: ${fresh.join(", ")}`);
+      const transcript = readTranscript(fresh[0]);
+      expect(
+        transcript.assistantModels.length === 1 && transcript.assistantModels[0] === `${PROVIDER}/b`,
+        `${step}: a fresh process starts at slot 0 (${PROVIDER}/b)`,
+        `identities: ${transcript.assistantModels.join(", ") || "(none)"}`,
+      );
+      const turns = turnRequests(capturesSince(captureStart));
+      expect(turns.length === 1, `${step}: exactly one conversation wire request`, describeCaptures(turns));
+      expect(turns.length === 1 && turns[0].model === "b", `${step}: wire model is b`, describeCaptures(turns));
+      expect(
+        turns.length === 1 && turns[0].reasoningEffort === "high",
+        `${step}: slot b:high still requests reasoning_effort high in memory mode`,
+        `wire effort: ${String(turns[0]?.reasoningEffort)}`,
+      );
+      expect(
+        !existsSync(isolated.stateFile),
+        `${step}: persistence off writes no state file`,
+        isolated.stateFile,
+      );
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Case 2 — role-keyed rotation through real delegation, incl. wraparound.
 // ---------------------------------------------------------------------------
 
@@ -811,6 +857,7 @@ async function main() {
 
   try {
     await caseRotation();
+    await caseInMemoryRotation();
     await caseDelegation();
     await caseFailOpenAndStrict();
     await caseMistralRefresh();

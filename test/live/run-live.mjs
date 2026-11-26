@@ -519,13 +519,14 @@ async function main() {
         }
       }
     }
+    // Exit status is committed here, not after the try/finally: an early
+    // `return` inside the body (a failed route selection, an unlisted
+    // selector) used to skip the summary and leave a recorded FAIL with exit
+    // code 0.
+    summarize();
+    process.exitCode = failures === 0 ? 0 : 1;
+    setTimeout(() => process.exit(failures === 0 ? 0 : 1), 250).unref?.();
   }
-
-  summarize();
-  process.exitCode = failures === 0 ? 0 : 1;
-  // Belt and braces: finish fast even if some child socket keeps the loop
-  // alive; by this point every check has committed its result.
-  setTimeout(() => process.exit(failures === 0 ? 0 : 1), 250).unref?.();
 }
 
 main().catch((err) => {

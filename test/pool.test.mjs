@@ -1097,6 +1097,64 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("continues from the in-memory cursor on the next startup when the write keeps failing", async () => {
+    const { dir, file } = tmpStateFile();
+    const restore = patchRename(() => () => {
+      const err = new Error("denied");
+      err.code = "EACCES";
+      throw err;
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Two fresh main sessions in ONE process: the second must not re-read the
+      // stale state file and re-apply the slot the host already took.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b"]);
+      assert.equal(fs.existsSync(file), false);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns to the durable cursor once a write finally succeeds", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      failing = false;
+      // The degraded role continues from the mirror, commits, and clears the mark.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+      // The next startup is back on the file's cursor.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/a"]);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("retries a transient rename and commits once from the same temp file", async () => {
     const { dir, file } = tmpStateFile();
     const temps = [];

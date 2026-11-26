@@ -337,6 +337,18 @@ export interface PoolDiagnosis {
 
 const counters: Record<string, number> = Object.create(null);
 
+/**
+ * Roles whose last durable commit failed in this process.
+ *
+ * A post-acceptance write failure mirrors the accepted cursor in `counters`,
+ * but the state file still holds the old cursor. Without this set the next
+ * startup would select from the stale on-disk value and re-apply the slot the
+ * host already took — with an unwritable state file, every startup would pick
+ * the same model. While a role is degraded, selection is seeded from the
+ * in-memory cursor; a successful commit clears the mark.
+ */
+const persistDegraded = new Set<string>();
+
 /** State file name under the OMP agent dir when no explicit/env path is given. */
 const DEFAULT_STATE_FILE = "model-pool-state.json";
 /** Pool config file name under the OMP agent dir when no explicit/env path is given. */
@@ -440,6 +452,7 @@ export function getCounters(): Record<string, number> {
 /** Reset all round-robin counters (tests; mirrors an OMP restart). */
 export function resetCounters(): void {
   for (const k of Object.keys(counters)) delete counters[k];
+  persistDegraded.clear();
 }
 
 /** Read-only snapshot of where the active configuration came from. */
@@ -904,11 +917,12 @@ async function advancePersisted(
   eligible: readonly boolean[],
   file: string,
   accept?: (index: number) => Promise<boolean>,
+  startCursor?: number,
 ): Promise<{ index: number; replacedLegacy: boolean; backupOk: boolean } | undefined> {
   return withFileLock(file, async () => {
     const read = readPersistedCounters(file);
     const persisted = read.counters;
-    const index = findEligibleIndex(poolLength, eligible, persisted[roleKey] ?? 0);
+    const index = findEligibleIndex(poolLength, eligible, startCursor ?? persisted[roleKey] ?? 0);
     if (index === undefined) return undefined;
     if (accept !== undefined) {
       const accepted = await accept(index);
@@ -1971,8 +1985,13 @@ async function runMainSessionRotation(
         if (ok) acceptedIndex = index;
         return ok;
       },
+      // A role whose durable commit already failed continues from the mirrored
+      // cursor; otherwise every later startup would re-read the stale file and
+      // re-apply the slot the host has already taken.
+      persistDegraded.has(roleKey) ? (counters[roleKey] ?? 0) : undefined,
     );
     if (picked === undefined) return; // nothing eligible, or the host refused: nothing consumed
+    persistDegraded.delete(roleKey); // the durable commit succeeded: back to the file's cursor
     if (picked.replacedLegacy) {
       safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(stateFileAtStart, picked.backupOk)}`);
     }
@@ -1987,8 +2006,11 @@ async function runMainSessionRotation(
     const message = err instanceof Error ? err.message : String(err);
     if (acceptedIndex >= 0) {
       // Durable commit failed after the host already accepted: never apply
-      // again. Mirror the accepted index in memory and say the pick is local.
+      // again. Mirror the accepted index in memory, mark the role degraded so
+      // the next startup continues from that mirror instead of re-reading the
+      // stale file, and say the pick is local.
       counters[roleKey] = (acceptedIndex + 1) % pool.length;
+      persistDegraded.add(roleKey);
       safeLog(
         pi,
         "warn",
