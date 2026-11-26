@@ -235,11 +235,24 @@ unreadable registry from a readable empty one, and performs no writes.
   gets a compatibility warning instead of failing. Commands that mutate state
   require an interactive main session; non-interactive contexts never open
   dialogs or mutate configuration.
-- Core fallback is preserved: the returned single `model` keeps role identity
-  so `retry.fallbackChains` / prewalk / advisor semantics still apply. If the
+- A spawn returns the **whole rotation**, not one model: the picked slot first,
+  then the rest of the eligible pool in cursor order (wrapping, duplicates
+  folded, unavailable entries dropped). `before_subagent_spawn` treats a
+  returned list as the child's attempt order, so a provider error on the chosen
+  model retries the next pool entry instead of the same one. The counter still
+  advances exactly once per child, because the event fires once per spawn. A
+  pool with a single usable entry returns a bare string.
+- Core fallback is preserved: the returned list keeps role identity, so
+  `retry.fallbackChains` / prewalk / advisor semantics still apply on top of the
+  pool chain. `retry.enabled` and `retry.modelFallback` decide whether the host
+  retries at all; with retries off, the chain is accepted but never used. If the
   requirement ever becomes "model must never change mid-instance", verify
   `retry.fallbackChains` + prewalk handoff behavior first — that is a separate
   follow-up, not this extension.
+- There is no cap on pool size: the cursor is an index modulo the pool length and
+  every entry is preserved. Practical limits come from the host — each spawn
+  offers the pool as its retry chain, so a very large pool buys longer failover
+  at the cost of each retry attempt.
 
 ## Counter semantics
 

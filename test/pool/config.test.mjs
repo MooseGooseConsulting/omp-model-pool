@@ -4,7 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const mod = await import("../dist/index.js");
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
+
+
+const mod = await import("../../dist/index.js");
 
 // Every test isolates itself: a fresh temp dir is the OMP agent dir (so the
 // default config path can never be the real ~/.omp), the pool-config env vars
@@ -669,7 +673,7 @@ describe("authenticated membership", () => {
     const models = modelsFrom({ listed: ["p/a"], resolvable: ["p/ghost", "p/a"] });
 
     const picked = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
-    assert.equal(picked.model, "p/a");
+    assert.equal(headOf(picked.model), "p/a");
 
     const report = mod.diagnosePools(models);
     const role = report.roles.find((r) => r.role === "slow");
@@ -732,8 +736,8 @@ describe("authenticated membership", () => {
 
     const first = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
     const second = await handlers.before_subagent_spawn(ROUTE_EV, subCtx(models));
-    assert.equal(first.model, "p/a");
-    assert.equal(second.model, "p/b");
+    assert.equal(headOf(first.model), "p/a");
+    assert.equal(headOf(second.model), "p/b");
   });
 });
 

@@ -13,9 +13,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
+
+
 const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, "..");
-const helper = path.join(here, "helpers", "dispatch-once.mjs");
+const root = path.resolve(here, "..", "..");
+const helper = path.join(here, "..", "helpers", "dispatch-once.mjs");
 
 function tmpStateFile() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mmm-xp-"));
@@ -48,7 +52,7 @@ describe("cross-process rotation (separate OS processes)", () => {
     try {
       const models = ["p/a", "p/b"];
       const runs = [0, 1, 2].map(() => runOnce(file, models, true));
-      assert.deepEqual(runs.map((r) => r.model), ["p/a", "p/b", "p/a"]);
+      assert.deepEqual(runs.map((r) => headOf(r.model)), ["p/a", "p/b", "p/a"]);
       assert.equal(new Set(runs.map((r) => r.pid)).size, 3, "each run must be a distinct process");
       // Stored modulo the pool length (2): three picks land on 1.
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
@@ -61,7 +65,7 @@ describe("cross-process rotation (separate OS processes)", () => {
     const { file, cleanup } = tmpStateFile();
     try {
       const models = ["p/a", "p/b"];
-      const picks = [0, 1, 2].map(() => runOnce(file, models, false).model);
+      const picks = [0, 1, 2].map(() => headOf(runOnce(file, models, false).model));
       assert.deepEqual(picks, ["p/a", "p/a", "p/a"]);
       assert.equal(fs.existsSync(file), false);
     } finally {
@@ -114,7 +118,7 @@ describe("cross-process rotation (separate OS processes)", () => {
       const models = ["p/a", "p/b"];
       // Times out waiting, then fails open to the in-memory counter.
       const run = runOnce(file, models, true);
-      assert.equal(run.model, "p/a");
+      assert.equal(headOf(run.model), "p/a");
       assert.equal(fs.existsSync(lock), true, "live holder's lock is left in place");
       assert.equal(fs.readFileSync(path.join(lock, "owner"), "utf8").split(".")[0], String(holder.pid));
     } finally {

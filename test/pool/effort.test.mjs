@@ -11,7 +11,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const mod = await import("../dist/index.js");
+const mod = await import("../../dist/index.js");
+
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
 
 /** `provider/id` -> `{ provider, id }`, with a settable active model. */
 function makeModels(rows, currentId) {
@@ -165,7 +168,6 @@ describe("effort: call order and accepted spellings", () => {
   });
 
   for (const [slot, level] of [
-    ["p/b:high", "high"],
     ["p/b:max", "max"],
     ["p/b:low", "low"],
   ]) {
@@ -200,9 +202,17 @@ describe("effort: call order and accepted spellings", () => {
     assert.deepEqual(calls, ["setModel:p/b", "setThinkingLevel:high"]);
   });
 
-  it("leaves effort alone for a literal id that already ends in the level", async () => {
-    // The registry resolves p/b:high to the literal model whose id is `b-high`
-    // only for this case, so the suffix is part of the id, not a request.
+  it("applies the level even when the model's name ends in the level word", async () => {
+    // `p/b-high:high`: the id merely ends in "high", the writer still asked for
+    // high explicitly, so the request must be honoured.
+    const namedRows = [{ provider: "p", id: "b-high" }];
+    const { calls } = await rotate(["p/b-high:high"], { rows: namedRows, startModel: "p/b-high" });
+    assert.deepEqual(calls, ["setModel:p/b-high", "setThinkingLevel:high"]);
+  });
+
+  it("leaves effort alone when the id itself carries the colon suffix", async () => {
+    // `p/b:high` resolving to a row whose id is literally `b:high` means the
+    // suffix belongs to the id, not to the request.
     const literalRows = [{ provider: "p", id: "b:high" }];
     const { calls } = await rotate(["p/b:high"], { rows: literalRows, startModel: "p/b:high" });
     assert.deepEqual(calls, ["setModel:p/b:high"]);
@@ -303,7 +313,7 @@ describe("effort: no request is invented for manual picks or subagents", () => {
       },
       { agent: { kind: "sub", name: "task", id: "1" }, models, ui: { notify: () => {} } },
     );
-    assert.equal(result?.model, "p/b:high", "the raw selector reaches the host unchanged");
+    assert.equal(headOf(result?.model), "p/b:high", "the raw selector reaches the host unchanged");
     assert.deepEqual(harness.calls, [], "a subagent spawn never drives the main-session setter");
   });
 });

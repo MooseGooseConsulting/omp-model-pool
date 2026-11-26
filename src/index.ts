@@ -165,10 +165,11 @@ function effortSuffixToken(slot: string): string | undefined {
  * that resolves is inspected, and only when its identity agrees with the model
  * the full selector actually applied — a losing alternative never sets effort.
  * For an explicit request on a role alias (`@alias:level`) the request applies
- * even when the alias resolves to an id that already ends in the level; for a
- * literal id the request applies only when the resolved id does not already
- * end in the written suffix or the canonical level, so a model genuinely named
- * `x:free` or `x-high` is left alone. Suffixes hidden inside an alias's own
+ * even when the alias resolves to an id that already ends in the level. For a
+ * literal id the request applies unless the resolved id itself carries the
+ * written suffix (`p/b:high` resolving to a row whose id is `b:high`); a name
+ * that merely ends in the level word (`p/b-high`) is still an explicit request
+ * and gets the setter call. Suffixes hidden inside an alias's own
  * configuration are never inferred. An explicit non-literal `:auto` has no
  * public level — the caller keeps the model's defaults and warns.
  */
@@ -200,12 +201,11 @@ function resolveExplicitThinking(
   // request on an alias applies even when the alias resolves to an id that
   // already ends in the level.
   if (!first.alternative.startsWith("@")) {
-    if (
-      first.identity.endsWith(`:${token}`) ||
-      (canonical !== undefined && first.identity.endsWith(canonical))
-    ) {
-      return {};
-    }
+    // Only an id that literally carries the suffix (`p/model:high` resolving to
+    // a row whose id is `model:high`) means the writer did not ask for effort.
+    // A name that merely ends in the level word (`p/b-high`) is still an
+    // explicit `:high` request, because nobody types that suffix by accident.
+    if (first.identity.endsWith(`:${token}`)) return {};
   }
   if (canonical !== undefined) return { level: canonical };
   if (token === "auto") return { autoExplicit: true };
@@ -1796,6 +1796,38 @@ function describePick(roleKey: string, picked: string, index: number, total: num
 }
 
 /**
+ * The spawn's model chain: the picked slot first, then the rest of the pool in
+ * rotation order.
+ *
+ * `before_subagent_spawn` treats a returned `model` as the child's
+ * attempt-ordered list, so a single string leaves a failed call with no pool
+ * fallback. Returning the whole eligible rotation means a provider error on the
+ * chosen model retries the next pool entry instead of the same one. The counter
+ * still advances by exactly one: the event fires once per child.
+ *
+ * Duplicate selectors are folded to their first occurrence — the rotation keeps
+ * them as distinct slots, but retrying an identical model adds nothing.
+ */
+function fallbackChain(
+  pool: readonly string[],
+  eligible: readonly boolean[],
+  start: number,
+): string | string[] {
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; offset < pool.length; offset++) {
+    const index = (start + offset) % pool.length;
+    if (eligible[index] !== true) continue;
+    const selector = pool[index];
+    if (selector === undefined || seen.has(selector)) continue;
+    seen.add(selector);
+    chain.push(selector);
+  }
+  if (chain.length === 0) return pool[start] ?? "";
+  return chain.length === 1 ? (chain[0] as string) : chain;
+}
+
+/**
  * Promise the role's latest turn leaves behind, so the next same-role pick can
  * serialize behind it instead of racing its cursor mirroring.
  */
@@ -1999,7 +2031,7 @@ function handleBeforeSubagentSpawn(
           if (pick === undefined) return undefined;
           const note = describePick(roleKey, pick.picked, pick.index, pool.length);
           safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-          return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+          return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
         } catch (err) {
           // A rejected async dispatch fails open, like the sync path.
           safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
@@ -2012,7 +2044,7 @@ function handleBeforeSubagentSpawn(
       if (pick === undefined) return undefined;
       const note = describePick(roleKey, pick.picked, pick.index, pool.length);
       safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-      return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+      return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
     }
     return enqueueRoleTurn(roleKey, async () => {
       try {
@@ -2020,7 +2052,7 @@ function handleBeforeSubagentSpawn(
         if (pick === undefined) return undefined;
         const note = describePick(roleKey, pick.picked, pick.index, pool.length);
         safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-        return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+        return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
       } catch (err) {
         safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;

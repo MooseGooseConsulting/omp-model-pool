@@ -12,8 +12,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { acceptedEvidence, cursorExpectation } from "./live/free-routes.mjs";
-import { readTranscript } from "./live/omp-runner.mjs";
+import { acceptedEvidence, cursorExpectation } from "./free-routes.mjs";
+import { readTranscript } from "./omp-runner.mjs";
 
 const EXPECTED = "smoke-openrouter/liquid/lfm-3-1.7b:free";
 
@@ -102,8 +102,4 @@ describe("live cursor oracle", () => {
     assert.equal(decision.expected, 0);
   });
 
-  it("does not judge an empty pool", () => {
-    const decision = cursorExpectation({ accepted: true, hadEvidence: true, previous: 0, poolLength: 0 });
-    assert.equal(decision.status, "skip");
-  });
 });

@@ -100,6 +100,8 @@ export async function startLoopbackFixture({ provider = FIXTURE_PROVIDER, apiKey
     refusedConnections: 0,
     overrun: false,
     responseCounter: 0,
+    /** model -> { status, remaining }; `Infinity` fails every attempt. */
+    failModels: new Map(),
   };
 
   const server = createServer((req, res) => {
@@ -131,6 +133,18 @@ export async function startLoopbackFixture({ provider = FIXTURE_PROVIDER, apiKey
     /** Queue the next `/v1/models` payload; one entry is consumed per authenticated refresh. */
     enqueueMistralRoster(payload) {
       state.rosterQueue.push(payload);
+    },
+    /**
+     * Fail requests for one model with `status`. `times` defaults to every
+     * attempt; the request is still captured, so a case can prove the host
+     * tried it before falling over to the next pool entry.
+     */
+    failModel(model, { status = 500, times = Infinity } = {}) {
+      state.failModels.set(model, { status, remaining: times });
+    },
+    /** Drop every forced failure; called before each case so nothing leaks. */
+    resetFailures() {
+      state.failModels.clear();
     },
     stats() {
       return {
@@ -272,6 +286,20 @@ function serveChatCompletion(res, state, body, { provider }) {
     hasToolMessage,
   });
   state.chatRequests += 1;
+
+  // A failure armed for this model: the request is already captured, so a case
+  // can prove the host saw the attempt and then moved on. Used to exercise the
+  // spawn's failover chain with the real retry machinery.
+  const armed = state.failModels.get(model);
+  if (armed !== undefined) {
+    if (armed.remaining > 0) {
+      // `Infinity` fails every attempt; a finite count fails exactly that many.
+      if (armed.remaining !== Infinity) armed.remaining -= 1;
+      rejectRequest(res, state, `fixture forced ${armed.status} for ${model}`, armed.status);
+      return;
+    }
+    state.failModels.delete(model);
+  }
 
   const chunks = buildChunks(state, model, tools, hasToolMessage);
   state.responseCounter += 1;

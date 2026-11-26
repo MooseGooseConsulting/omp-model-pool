@@ -13,7 +13,7 @@
 // case's `finally` and the loopback server is closed in the outer `finally`.
 // Nothing credential-like (headers, env values beyond the fixture's dummy
 // key, raw request errors) is ever printed.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -86,6 +86,8 @@ function caseOptions(poolConfig, { overlayExtra = [], providerEnv = {} } = {}) {
 }
 
 async function inIsolatedRoot(label, options, caseFn) {
+  // A case may force provider failures; they must never leak into the next one.
+  fixture.resetFailures();
   let isolated;
   try {
     isolated = createIsolatedEnv({
@@ -431,6 +433,88 @@ async function caseInMemoryRotation() {
       );
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Case 2d — a failing first model must fail over to the next pool entry.
+//
+// Accepting a returned model LIST is not failover: this case forces the pinned
+// host to hit an error on the chosen slot and proves the child completes on the
+// following entry, with the chain supplied by the pool and not by static retry
+// configuration.
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-enable the host's model fallback for one case, and only for that case.
+ *
+ * The shared overlay disables retry so every other case stays deterministic.
+ * The replacement is asserted: if the generated block changes shape, this case
+ * fails loudly instead of silently testing nothing.
+ */
+function enableModelFallback(overlayFile) {
+  const before = readFileSync(overlayFile, "utf8");
+  const after = before.replace(
+    "retry:\n  enabled: false\n  modelFallback: false\n  fallbackChains: {}",
+    "retry:\n  enabled: true\n  modelFallback: true\n  fallbackOn: any\n  maxRetries: 2\n  baseDelayMs: 50",
+  );
+  expect(
+    after !== before,
+    "case 2d: overlay retry block patched",
+    "retry block replaced with modelFallback enabled",
+  );
+  writeFileSync(overlayFile, after, "utf8");
+}
+
+async function caseFailoverChain() {
+  const poolConfig = { slow: SLOW_POOL, enableMainSessionRotation: false, persistCounters: true };
+  await inIsolatedRoot(
+    "case-2d failover",
+    caseOptions(poolConfig, { overlayExtra: ["modelRoles:", "  slow: " + PIN_SELECTOR] }),
+    async (isolated) => {
+      writeModelsYaml(isolated.agentDir, fixture.port);
+      writeScoutAgent(isolated.agentDir);
+      enableModelFallback(isolated.overlayFile);
+      // Every attempt on the first pool entry fails: only a failover to
+      // slow-b can produce a completed child.
+      fixture.failModel("slow-a", { status: 500 });
+
+      const { before, captureStart } = await runDelegationParent(
+        isolated,
+        [{ name: "pool-review", agent: "reviewer" }],
+        "case 2d failover",
+      );
+      const fresh = newTranscripts(before, isolated);
+      const children = fresh.filter((f) => readTranscript(f).header?.parentSession !== undefined);
+      const parents = fresh.filter((f) => readTranscript(f).header?.parentSession === undefined);
+      expect(children.length === 1, "case 2d: exactly one new child transcript", String(children.length));
+      expect(parents.length === 1, "case 2d: exactly one new parent transcript", String(parents.length));
+      if (children.length !== 1 || parents.length !== 1) return;
+
+      const child = readTranscript(children[0]);
+      expect(
+        child.assistantModels.length > 0 && child.assistantModels.at(-1) === PROVIDER + "/slow-b",
+        "case 2d: child completed on the next pool entry",
+        child.assistantModels.join(", ") || "(none)",
+      );
+      // A model identity alone could be an error entry: require the task to have
+      // actually completed with the expected output, like the rotation case does.
+      const done = toolResultTexts(parents[0]).filter(
+        (t) => TASK_RESULT_DONE.test(t) && TASK_OUTPUT_OK.test(t),
+      );
+      expect(done.length === 1, "case 2d: the delegated task completed", `${done.length} completed task-result envelope(s)`);
+      const turns = turnRequests(capturesSince(captureStart));
+      expect(
+        turns.some((c) => c.model === "slow-a"),
+        "case 2d: the first pool entry was attempted",
+        describeCaptures(turns),
+      );
+      expect(
+        turns.some((c) => c.model === "slow-b"),
+        "case 2d: the following pool entry served the turn",
+        describeCaptures(turns),
+      );
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +943,7 @@ async function main() {
     await caseRotation();
     await caseInMemoryRotation();
     await caseDelegation();
+    await caseFailoverChain();
     await caseFailOpenAndStrict();
     await caseMistralRefresh();
 
