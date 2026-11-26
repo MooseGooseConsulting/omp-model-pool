@@ -338,16 +338,32 @@ export interface PoolDiagnosis {
 const counters: Record<string, number> = Object.create(null);
 
 /**
- * Roles whose last durable commit failed in this process.
+ * A role whose last durable commit failed in this process.
  *
  * A post-acceptance write failure mirrors the accepted cursor in `counters`,
- * but the state file still holds the old cursor. Without this set the next
+ * but the state file still holds the old cursor. Without this mark the next
  * startup would select from the stale on-disk value and re-apply the slot the
  * host already took — with an unwritable state file, every startup would pick
- * the same model. While a role is degraded, selection is seeded from the
- * in-memory cursor; a successful commit clears the mark.
+ * the same model.
+ *
+ * `diskCursor` is the value that was read while the write failed. The mirror is
+ * used only while the file still holds exactly that value, so a slot another
+ * process committed in the meantime always wins; the mark is keyed by state
+ * file as well as role, so a rebind to a different file starts clean.
  */
-const persistDegraded = new Set<string>();
+interface DegradedCursor {
+  /** Fingerprint of the state file read when the write failed; "" when unset. */
+  fileFingerprint: string;
+  /** Mirrored cursor to resume from while that exact file state still holds. */
+  localCursor: number;
+}
+
+const persistDegraded = new Map<string, DegradedCursor>();
+
+/** Marks are per (state file, role): a rebind must not inherit another file's mirror. */
+function degradedKey(file: string, roleKey: string): string {
+  return `${file}\u0000${roleKey}`;
+}
 
 /** State file name under the OMP agent dir when no explicit/env path is given. */
 const DEFAULT_STATE_FILE = "model-pool-state.json";
@@ -729,20 +745,54 @@ function parseState(raw: string): StateRead {
  * interpret throws, so the caller fails open and leaves it untouched; a
  * recognized legacy file is reported so the caller can replace it.
  */
-function readPersistedCounters(file: string): { counters: Record<string, number>; legacy: boolean } {
+function readPersistedCounters(file: string): {
+  counters: Record<string, number>;
+  legacy: boolean;
+  /**
+   * Identity of the exact bytes this read observed, `"missing"` when the file
+   * does not exist. A cursor value alone cannot identify a state file across
+   * time: a two-slot pool returns to the same number after a full wrap, so an
+   * equality check on the cursor would treat a rewritten file as unchanged.
+   */
+  fingerprint: string;
+} {
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return { counters: Object.create(null), legacy: false };
+      return { counters: Object.create(null), legacy: false, fingerprint: "missing" };
     }
     throw err;
   }
   const parsed = parseState(raw);
   if (parsed.kind === "invalid") throw new Error(`invalid model-pool state at ${file}`);
-  if (parsed.kind === "legacy-v1") return { counters: Object.create(null), legacy: true };
-  return { counters: parsed.counters, legacy: false };
+  const fingerprint = stateFingerprint(file, raw);
+  if (parsed.kind === "legacy-v1") {
+    return { counters: Object.create(null), legacy: true, fingerprint: `v1:${fingerprint}` };
+  }
+  return { counters: parsed.counters, legacy: false, fingerprint };
+}
+
+/**
+ * Identity of one observed state file: its content hash plus the stat fields a
+ * rewrite always changes.
+ *
+ * Content alone cannot detect an ABA rewrite — a two-slot pool rewrote twice
+ * ends on the same counters and the same bytes — so the modification time and
+ * size are part of the identity. A file that was absent reads as `missing`,
+ * which can never equal a present file even at the same cursor.
+ */
+function stateFingerprint(file: string, raw: string): string {
+  let stat = "nostat";
+  try {
+    const info = fs.statSync(file);
+    stat = `${info.mtimeMs}:${info.size}`;
+  } catch {
+    // The bytes were readable a moment ago; an unstatable file is still
+    // distinguishable by content alone.
+  }
+  return `${stat}:${fingerprintText(raw)}`;
 }
 
 /**
@@ -917,12 +967,24 @@ async function advancePersisted(
   eligible: readonly boolean[],
   file: string,
   accept?: (index: number) => Promise<boolean>,
-  startCursor?: number,
+  degraded?: DegradedCursor,
 ): Promise<{ index: number; replacedLegacy: boolean; backupOk: boolean } | undefined> {
   return withFileLock(file, async () => {
     const read = readPersistedCounters(file);
     const persisted = read.counters;
-    const index = findEligibleIndex(poolLength, eligible, startCursor ?? persisted[roleKey] ?? 0);
+    const diskCursor = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
+    let start = diskCursor;
+    if (degraded !== undefined) {
+      // Only a file whose bytes still match the read that failed is stale for
+      // us. A cursor comparison is not enough: a two-slot pool returns to the
+      // same number after a wrap, so a file another process rewrote would look
+      // unchanged and this process would apply the slot that process just took.
+      if (read.fingerprint === degraded.fileFingerprint && degraded.localCursor !== diskCursor) {
+        start = degraded.localCursor;
+      }
+      degraded.fileFingerprint = read.fingerprint; // the state this attempt observed
+    }
+    const index = findEligibleIndex(poolLength, eligible, start);
     if (index === undefined) return undefined;
     if (accept !== undefined) {
       const accepted = await accept(index);
@@ -1974,6 +2036,8 @@ async function runMainSessionRotation(
   // Set only once the model is actually accepted, so a durable-write failure
   // after acceptance is distinguishable from a read/lock failure before it.
   let acceptedIndex = -1;
+  const markKey = degradedKey(stateFileAtStart, roleKey);
+  const mark: DegradedCursor = persistDegraded.get(markKey) ?? { fileFingerprint: "", localCursor: -1 };
   try {
     const picked = await advancePersisted(
       roleKey,
@@ -1986,12 +2050,12 @@ async function runMainSessionRotation(
         return ok;
       },
       // A role whose durable commit already failed continues from the mirrored
-      // cursor; otherwise every later startup would re-read the stale file and
-      // re-apply the slot the host has already taken.
-      persistDegraded.has(roleKey) ? (counters[roleKey] ?? 0) : undefined,
+      // cursor — but only while the file still holds the value that was stale
+      // for us. A slot committed by another process always wins.
+      mark,
     );
     if (picked === undefined) return; // nothing eligible, or the host refused: nothing consumed
-    persistDegraded.delete(roleKey); // the durable commit succeeded: back to the file's cursor
+    persistDegraded.delete(markKey); // the durable commit succeeded: back to the file's cursor
     if (picked.replacedLegacy) {
       safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(stateFileAtStart, picked.backupOk)}`);
     }
@@ -2010,7 +2074,10 @@ async function runMainSessionRotation(
       // the next startup continues from that mirror instead of re-reading the
       // stale file, and say the pick is local.
       counters[roleKey] = (acceptedIndex + 1) % pool.length;
-      persistDegraded.add(roleKey);
+      persistDegraded.set(markKey, {
+        fileFingerprint: mark.fileFingerprint,
+        localCursor: (acceptedIndex + 1) % pool.length,
+      });
       safeLog(
         pi,
         "warn",

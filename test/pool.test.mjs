@@ -1155,6 +1155,126 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("defers to a slot another process committed while this one was degraded", async () => {
+    const { dir, file } = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Two failed commits: a was applied (mirror -> b), then b (mirror -> a).
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      // Another process now commits slot b for itself: the file moves to 1.
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: 1 } }, null, 2)}\n`,
+        "utf8",
+      );
+      failing = false;
+      // The mirror says "a" but the durable cursor says "b"; the durable write
+      // wins, or this process would apply a slot someone else already took.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/b"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 0);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects a rewritten state file whose cursor wrapped back to the same value", async () => {
+    const { dir, file } = tmpStateFile();
+    const writeState = (cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeState(0);
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // One failed commit: a was applied, mirror points at b, disk still says 0.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      // Another process commits a, then b: a full wrap puts the cursor back on
+      // 0, but the bytes are new. Equality on the cursor would call this
+      // "unchanged" and let this process apply b again.
+      writeState(1);
+      writeState(0);
+      failing = false;
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not carry a degraded mirror across a rebind to another state file", async () => {
+    const first = tmpStateFile();
+    const second = tmpStateFile();
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: first.file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      failing = false;
+      // Rebind to a different file: its own cursor is 0, so the first pick must
+      // be slot 0 again rather than the mirror from the previous file.
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: second.file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(second.file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(first.dir, { recursive: true, force: true });
+      fs.rmSync(second.dir, { recursive: true, force: true });
+    }
+  });
+
   it("retries a transient rename and commits once from the same temp file", async () => {
     const { dir, file } = tmpStateFile();
     const temps = [];
