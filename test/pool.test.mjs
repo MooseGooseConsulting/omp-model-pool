@@ -1275,6 +1275,75 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("publishes the v1 backup without following an existing symlink", async (t) => {
+    const { dir, file } = tmpStateFile();
+    const victim = path.join(dir, "victim.txt");
+    const backup = `${file}.v1.bak`;
+    fs.writeFileSync(file, JSON.stringify({ version: 1, counters: { slow: 7 } }), "utf8");
+    fs.writeFileSync(victim, "do not overwrite me", "utf8");
+    try {
+      fs.symlinkSync(victim, backup);
+    } catch {
+      t.skip("this platform/filesystem does not allow creating symlinks");
+      return;
+    }
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(fs.readFileSync(victim, "utf8"), "do not overwrite me", "the symlink target is untouched");
+      assert.equal(fs.lstatSync(backup).isSymbolicLink(), false, "the backup entry is a regular file now");
+      assert.equal(JSON.parse(fs.readFileSync(backup, "utf8")).version, 1, "the backup holds the v1 bytes");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a queued spawn writing to the state file it was queued for", async () => {
+    const first = tmpStateFile();
+    const second = tmpStateFile();
+    const gate = deferred();
+    try {
+      const harness = makeHarness();
+      harness.pi.setModel = async () => {
+        await gate.promise;
+        return undefined;
+      };
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: first.file,
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      // A factory rebind lands while the spawn waits in the role queue.
+      mod.configurePools({
+        pools: { slow: ["p/x", "p/y", "p/z"] },
+        persistCounters: true,
+        stateFile: second.file,
+      });
+      gate.resolve();
+      await startup;
+      const result = await spawn;
+      assert.equal(result?.model, "p/b", "the queued spawn still uses the pool it captured");
+      // The startup committed the slot b (cursor 1); the queued spawn then
+      // consumed b and wrapped its captured file to 0. Had it followed the
+      // rebind, this file would still read 1 and the new file would exist.
+      assert.equal(JSON.parse(fs.readFileSync(first.file, "utf8")).counters.slow, 0);
+      assert.equal(fs.existsSync(second.file), false, "the rebound state file is not touched by the old pool");
+    } finally {
+      fs.rmSync(first.dir, { recursive: true, force: true });
+      fs.rmSync(second.dir, { recursive: true, force: true });
+    }
+  });
+
   it("retries a transient rename and commits once from the same temp file", async () => {
     const { dir, file } = tmpStateFile();
     const temps = [];

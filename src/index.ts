@@ -804,11 +804,24 @@ function stateFingerprint(file: string, raw: string): string {
  * does not exist. Best-effort: failure never blocks the fresh write.
  */
 function copyLegacyStateAside(file: string): boolean {
+  const backup = `${file}.v1.bak`;
+  // Publish from an exclusive temp file in the same directory and rename it
+  // over the backup entry. A plain copy to `backup` would follow an existing
+  // symlink there and overwrite whatever it points at, while a rename replaces
+  // the directory entry itself.
+  const tmp = `${backup}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.copyFileSync(file, `${file}.v1.bak`);
+    fs.copyFileSync(file, tmp, fs.constants.COPYFILE_EXCL);
+    fs.renameSync(tmp, backup);
     return true;
   } catch {
     return false;
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort temp cleanup, same as the state writer.
+    }
   }
 }
 
@@ -1673,16 +1686,17 @@ async function pickForRole(
   roleKey: string,
   pool: readonly string[],
   availability: PoolAvailability,
+  persist: { enabled: boolean; stateFile: string },
 ): Promise<{ picked: string; index: number; persisted: boolean } | undefined> {
-  if (!activeConfig.persistCounters) {
+  if (!persist.enabled) {
     const pick = pickRoundRobin(roleKey, pool, availability.eligible);
     return pick === undefined ? undefined : { ...pick, persisted: false };
   }
   try {
-    const picked = await advancePersisted(roleKey, pool.length, availability.eligible, activeConfig.stateFile);
+    const picked = await advancePersisted(roleKey, pool.length, availability.eligible, persist.stateFile);
     if (picked === undefined) return undefined;
     if (picked.replacedLegacy) {
-      safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(activeConfig.stateFile, picked.backupOk)}`);
+      safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(persist.stateFile, picked.backupOk)}`);
     }
     counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
     return { picked: pool[picked.index] as string, index: picked.index, persisted: true };
@@ -1891,13 +1905,18 @@ function handleBeforeSubagentSpawn(
       return undefined;
     }
 
-    if (activeConfig.persistCounters) {
+    // Persistence mode and state path belong to the pool captured above. A
+    // factory rebind that lands while this spawn waits in the role queue must
+    // not write the old pool's cursor into the new state file.
+    const persistAtSpawn = { enabled: activeConfig.persistCounters, stateFile: activeConfig.stateFile };
+
+    if (persistAtSpawn.enabled) {
       // A persisted pick is one serialized turn: selection, persistence and the
       // in-memory mirror cannot interleave with the main session's startup
       // pick for the same role.
       return enqueueRoleTurn(roleKey, async () => {
         try {
-          const pick = await pickForRole(pi, roleKey, pool, availability);
+          const pick = await pickForRole(pi, roleKey, pool, availability, persistAtSpawn);
           if (pick === undefined) return undefined;
           const note = describePick(roleKey, pick.picked, pick.index, pool.length);
           safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);

@@ -535,7 +535,10 @@ test("a client disconnect cancels the in-flight upstream request", async () => {
         req.on("error", () => resolveDone()); // expected: our own destroy
         req.end(payload);
         (async () => {
-          while (calls.length === 0) await sleep(5); // wait for admission
+          // Bounded: if the relay rejects the request locally, `calls` never
+          // fills and this loop would hang instead of failing the assertion.
+          const deadline = Date.now() + 2000;
+          while (calls.length === 0 && Date.now() < deadline) await sleep(5);
           await sleep(20);
           req.destroy();
           resolveDone();

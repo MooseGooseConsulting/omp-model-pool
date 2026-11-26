@@ -277,15 +277,18 @@ async function runSmokeTrio({ isolated, gateway, smokePin, smokePool }) {
         `ran on ${publicSelectorFromSmokeIdentity(expected)} with ${admitted} admitted request(s); upstream: ${upstream}`,
       );
     }
-    // The persisted cursor advances exactly when a wire request went out:
-    // every accepted pick precedes an admitted request, and nothing else may
-    // move it.
-    if (admitted >= 1) cursor = (cursor + 1) % smokePool.length;
+    // The cursor follows the *accepted* pick, not the wire request: OMP commits
+    // the slot as soon as it applies the model, and a provider failure after
+    // that point must not make this check expect a cursor the run correctly
+    // advanced. `modelsApplied` is the host's own record of the change.
+    const accepted = withAssistants.length === 1 && withAssistants[0].modelsApplied.includes(expected);
+    if (accepted) cursor = (cursor + 1) % smokePool.length;
     const actualCursor = readPersistedCursor(isolated.stateFile);
     record(
       `persisted cursor after run ${i + 1}`,
       actualCursor === cursor ? "pass" : "fail",
-      `expected ${cursor}, got ${actualCursor === undefined ? "unreadable" : actualCursor}`,
+      `expected ${cursor} (${accepted ? "the model change was applied" : "no model change was recorded"}), ` +
+        `got ${actualCursor === undefined ? "unreadable" : actualCursor}`,
     );
   }
 
@@ -299,6 +302,9 @@ async function runSmokeTrio({ isolated, gateway, smokePin, smokePool }) {
 
 async function runResumePhase({ isolated, gateway, smokePool, cursorValue, transcriptFile }) {
   const expected = smokePool[1];
+  // Snapshot before the resume runs: a no-op resume that exits 0 must not
+  // inherit the qualifying turns already in the file.
+  const before = existsSync(transcriptFile) ? readTranscript(transcriptFile) : undefined;
   const countsBefore = gateway.snapshot();
   const res = await runOmp(
     [...isolated.ompArgs, "--resume", transcriptFile, "-p", PROMPT],
@@ -312,18 +318,32 @@ async function runResumePhase({ isolated, gateway, smokePool, cursorValue, trans
     countsBefore.bySelector[publicExpected]?.statuses.length ?? 0,
   );
   const transcript = existsSync(transcriptFile) ? readTranscript(transcriptFile) : undefined;
-  const complete =
-    res.code === 0 &&
-    transcript !== undefined &&
-    transcript.userTurns >= 2 &&
-    transcript.assistantModels.length >= 2;
+  const addedUser = before === undefined || transcript === undefined ? 0 : transcript.userTurns - before.userTurns;
+  const addedAssistant =
+    before === undefined || transcript === undefined
+      ? 0
+      : transcript.assistantModels.length - before.assistantModels.length;
+  const complete = res.code === 0 && addedUser === 1 && addedAssistant === 1;
   const last = complete ? transcript.assistantModels[transcript.assistantModels.length - 1] : undefined;
   const providerProblem = firstSkippableUpstreamProblem(newStatuses);
-  if (last === expected) {
+  if (last === expected && admitted >= 1) {
     record(
       "exact resume does not re-rotate",
       "pass",
-      `resumed turn ran on the restored ${publicSelectorFromSmokeIdentity(expected)}`,
+      `resumed turn added one assistant turn on the restored ${publicSelectorFromSmokeIdentity(expected)} ` +
+        `(${addedUser} user / ${addedAssistant} assistant turn(s) added)`,
+    );
+  } else if (last === expected) {
+    record(
+      "exact resume does not re-rotate",
+      "fail",
+      "the resumed transcript changed but no wire request reached the expected model",
+    );
+  } else if (complete) {
+    record(
+      "exact resume does not re-rotate",
+      "fail",
+      `resume ran on ${last ?? "(nothing)"}; a rotation would have applied ${publicSelectorFromSmokeIdentity(smokePool[0])}`,
     );
   } else if (providerProblem !== "" && admitted >= 1) {
     record("exact resume does not re-rotate", "skip", `${providerProblem}; wire request observed`);
@@ -341,7 +361,8 @@ async function runResumePhase({ isolated, gateway, smokePool, cursorValue, trans
     record(
       "exact resume does not re-rotate",
       "fail",
-      `resume ran on ${last ?? "(nothing)"}; a rotation would have applied ${publicSelectorFromSmokeIdentity(smokePool[0])}`,
+      `the resume added ${addedUser} user / ${addedAssistant} assistant turn(s), expected exactly one of each ` +
+        `(exit ${res.code ?? "null"})`,
     );
   }
   const actualCursor = readPersistedCursor(isolated.stateFile);
