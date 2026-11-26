@@ -206,4 +206,39 @@ describe("mistral-live extension", () => {
     assert.equal(result[0].contextWindow, 256000);
     assert.equal(result[0].reasoning, true);
   });
+
+  it("falls back to AbortController when AbortSignal.timeout is unavailable", async () => {
+    const originalTimeout = AbortSignal.timeout;
+    Object.defineProperty(AbortSignal, "timeout", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      let seenSignal;
+      const result = await mod.fetchMistralLiveModels("sk-live-fallback", {
+        timeoutMs: 5000,
+        fetch: async (_url, init) => {
+          seenSignal = init.signal;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: [{ id: "mistral-small-latest", capabilities: { completion_chat: true } }],
+            }),
+          };
+        },
+      });
+      assert.ok(seenSignal instanceof AbortSignal);
+      assert.equal(seenSignal.aborted, false);
+      assert.equal(result.length, 1);
+      assert.equal(result[0].id, "mistral-small-latest");
+    } finally {
+      Object.defineProperty(AbortSignal, "timeout", {
+        value: originalTimeout,
+        configurable: true,
+        writable: true,
+      });
+    }
+  });
 });

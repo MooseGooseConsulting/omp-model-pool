@@ -1,15 +1,5 @@
 // mistral-live — authoritative live model discovery for Mistral on oh-my-pi.
-//
-// In oh-my-pi's built-in Mistral provider, static bundled models are merged with
-// live `/v1/models` results without `dynamicModelsAuthoritative: true`, leaving
-// retired static model IDs in the catalog (which fail at runtime with HTTP 400
-// `invalid_model`).
-//
-// Registering `mistral` with `fetchDynamicModels` opts into oh-my-pi's
-// authoritative dynamic model manager (`staticModels: []`,
-// `dynamicModelsAuthoritative: true`, 24 h SQLite cache) while leaving existing
-// authentication untouched and automatically surfacing newly released chat
-// models on refresh.
+// See README.md ("Included extension: mistral-live") for behavior and env vars.
 
 // ---------------------------------------------------------------------------
 // Minimal structural types (kept local so the package stays zero-dependency).
@@ -255,21 +245,45 @@ export async function fetchMistralLiveModels(
   }
 
   const endpoint = `${baseUrl}/models`;
-  const response = await fetchFn(endpoint, {
+  let signal: AbortSignal | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    signal = AbortSignal.timeout(timeoutMs);
+  } else if (typeof AbortController !== "undefined") {
+    const controller = new AbortController();
+    signal = controller.signal;
+    timer = setTimeout(() => controller.abort(new Error("mistral-live: request timed out")), timeoutMs);
+    timer.unref?.();
+  }
+
+  const init: {
+    method: string;
+    headers: Record<string, string>;
+    signal?: AbortSignal;
+  } = {
     method: "GET",
     headers: {
       Authorization: `Bearer ${key}`,
       Accept: "application/json",
     },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-
-  if (!response.ok) {
-    throw new Error(`mistral-live: GET /models failed with HTTP ${response.status}`);
+  };
+  if (signal !== undefined) {
+    init.signal = signal;
   }
 
-  const payload = await response.json();
-  return parseMistralModelsPayload(payload);
+  let response: Awaited<ReturnType<FetchLike>>;
+  try {
+    response = await fetchFn(endpoint, init);
+    if (!response.ok) {
+      throw new Error(`mistral-live: GET /models failed with HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    return parseMistralModelsPayload(payload);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
