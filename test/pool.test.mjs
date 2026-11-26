@@ -1275,6 +1275,60 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("keeps the mirror pinned to the read that failed even when a later pick is refused", async () => {
+    const { dir, file } = tmpStateFile();
+    const writeState = (cursor) =>
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ version: 2, counters: { default: cursor } }, null, 2)}\n`,
+        "utf8",
+      );
+    writeState(0);
+    let failing = true;
+    const restore = patchRename((original) => (from, to) => {
+      if (failing) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      // Accepted a, durable write failed: mirror points at b, file still reads 0.
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a"]);
+      // An external rewrite returns the cursor to 0 with new bytes.
+      writeState(1);
+      writeState(0);
+      // The next attempt is REFUSED. It commits nothing, so it must not refresh
+      // the fingerprint the mirror is validated against.
+      harness.pi.setModel = async (model) => {
+        harness.setModels.push(model);
+        return false;
+      };
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/a"], "the retry targets the rewritten disk cursor");
+      // Now the durable write works: the rewritten file's cursor 0 wins and a
+      // is applied again — b would mean the stale mirror survived the refusal.
+      failing = false;
+      harness.pi.setModel = async (model) => {
+        harness.setModels.push(model);
+      };
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(appliedIds(harness.setModels).at(-1), "p/a");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("publishes the v1 backup without following an existing symlink", async (t) => {
     const { dir, file } = tmpStateFile();
     const victim = path.join(dir, "victim.txt");

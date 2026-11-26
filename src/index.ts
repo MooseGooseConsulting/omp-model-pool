@@ -981,11 +981,16 @@ async function advancePersisted(
   file: string,
   accept?: (index: number) => Promise<boolean>,
   degraded?: DegradedCursor,
+  observed?: { fileFingerprint: string },
 ): Promise<{ index: number; replacedLegacy: boolean; backupOk: boolean } | undefined> {
   return withFileLock(file, async () => {
     const read = readPersistedCounters(file);
     const persisted = read.counters;
     const diskCursor = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
+    // Report what this attempt saw without touching the stored mark: a refused
+    // or empty pick commits nothing, so it must not rewrite the fingerprint
+    // that the mirror is validated against.
+    if (observed !== undefined) observed.fileFingerprint = read.fingerprint;
     let start = diskCursor;
     if (degraded !== undefined) {
       // Only a file whose bytes still match the read that failed is stale for
@@ -995,7 +1000,6 @@ async function advancePersisted(
       if (read.fingerprint === degraded.fileFingerprint && degraded.localCursor !== diskCursor) {
         start = degraded.localCursor;
       }
-      degraded.fileFingerprint = read.fingerprint; // the state this attempt observed
     }
     const index = findEligibleIndex(poolLength, eligible, start);
     if (index === undefined) return undefined;
@@ -2056,7 +2060,12 @@ async function runMainSessionRotation(
   // after acceptance is distinguishable from a read/lock failure before it.
   let acceptedIndex = -1;
   const markKey = degradedKey(stateFileAtStart, roleKey);
-  const mark: DegradedCursor = persistDegraded.get(markKey) ?? { fileFingerprint: "", localCursor: -1 };
+  const mark: DegradedCursor | undefined = persistDegraded.get(markKey);
+  // This attempt's own observation. It is deliberately separate from `mark`: a
+  // refused or empty pick commits nothing, so it must not refresh the
+  // fingerprint the mirror is validated against — doing that would let a stale
+  // local cursor outlive an external rewrite.
+  const observed: { fileFingerprint: string } = { fileFingerprint: "" };
   try {
     const picked = await advancePersisted(
       roleKey,
@@ -2072,6 +2081,7 @@ async function runMainSessionRotation(
       // cursor — but only while the file still holds the value that was stale
       // for us. A slot committed by another process always wins.
       mark,
+      observed,
     );
     if (picked === undefined) return; // nothing eligible, or the host refused: nothing consumed
     persistDegraded.delete(markKey); // the durable commit succeeded: back to the file's cursor
@@ -2094,7 +2104,7 @@ async function runMainSessionRotation(
       // stale file, and say the pick is local.
       counters[roleKey] = (acceptedIndex + 1) % pool.length;
       persistDegraded.set(markKey, {
-        fileFingerprint: mark.fileFingerprint,
+        fileFingerprint: observed.fileFingerprint,
         localCursor: (acceptedIndex + 1) % pool.length,
       });
       safeLog(
