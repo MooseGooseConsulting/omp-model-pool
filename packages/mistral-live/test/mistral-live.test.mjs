@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-const mod = await import("../../dist/mistral-live.js");
+const mod = await import("../dist/mistral-live.js");
 
 function makeHost() {
   const registered = [];

@@ -4,8 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const mod = await import("../../dist/index.js");
-import * as fakeHost from "../helpers/fake-host.mjs";
+const mod = await import("../dist/index.js");
+import * as fakeHost from "./helpers/fake-host.mjs";
 import nodeFs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 

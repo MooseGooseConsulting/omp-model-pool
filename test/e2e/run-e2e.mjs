@@ -34,6 +34,9 @@ import {
 } from "./loopback.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+/** The pool extension lives in its own package; the integration suite stays at the root. */
+const POOL_PACKAGE = path.join(repoRoot, "packages", "model-pool");
+const MISTRAL_PACKAGE = path.join(repoRoot, "packages", "mistral-live");
 /** One OMP process may not outlive this; the loopback answers in milliseconds. */
 const PROCESS_TIMEOUT_MS = 20_000;
 
@@ -92,7 +95,7 @@ async function inIsolatedRoot(label, options, caseFn) {
   try {
     isolated = createIsolatedEnv({
       poolConfig: options.poolConfig,
-      repoRoot,
+      repoRoot: POOL_PACKAGE,
       label,
       providerEnv: rootEnv(options.providerEnv),
       overlayExtra: options.overlayExtra,
@@ -782,7 +785,7 @@ async function caseFailOpenAndStrict() {
 // Case 3 — mistral-live discovery through `omp models refresh mistral`.
 // ---------------------------------------------------------------------------
 
-const MISTRAL_EXT = path.join(repoRoot, "src", "mistral-live.ts");
+const MISTRAL_EXT = path.join(MISTRAL_PACKAGE, "src", "mistral-live.ts");
 const MISTRAL_A = "mistral-e2e-chat-a";
 const MISTRAL_B = "mistral-e2e-chat-b";
 

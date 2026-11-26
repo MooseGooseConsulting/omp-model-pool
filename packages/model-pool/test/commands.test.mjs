@@ -11,13 +11,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { createFakeHost } from "../helpers/fake-host.mjs";
+import { createFakeHost } from "./helpers/fake-host.mjs";
 
 /** The spawn's first model: the chain is an array once the pool has alternatives. */
 const headOf = (model) => (Array.isArray(model) ? model[0] : model);
 
 
-const mod = await import("../../dist/index.js");
+const mod = await import("../dist/index.js");
 
 // `getPools()` returns a null-prototype object, which strict deepEqual would
 // reject against a plain object literal. Normalize both snapshots to plain

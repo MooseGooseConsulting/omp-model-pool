@@ -50,6 +50,8 @@ import {
 } from "./free-gateway.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+/** The pool extension package; the live harness itself stays at the root. */
+const POOL_PACKAGE = path.join(repoRoot, "packages", "model-pool");
 const PROMPT = "Reply with exactly: OK";
 const OMP_RUN_TIMEOUT_MS = 240_000;
 /** Credential env overrides that may exist in the invoking environment, never in the sandbox. */
@@ -131,7 +133,7 @@ async function checkMistralLive() {
     record("mistral live discovery", "skip", "no credential for mistral");
     return;
   }
-  const distFile = path.join(repoRoot, "dist", "mistral-live.js");
+  const distFile = path.join(repoRoot, "packages", "mistral-live", "dist", "mistral-live.js");
   let fetchMistralLiveModels;
   try {
     ({ fetchMistralLiveModels } = await import(pathToFileURL(distFile).href));
@@ -409,7 +411,7 @@ async function main() {
     isolated = createIsolatedEnv(
       {
         poolConfig: { pools: {}, persistCounters: true, enableMainSessionRotation: true, mainSessionRole: "default" },
-        repoRoot,
+        repoRoot: POOL_PACKAGE,
         label: "free-smoke",
       },
     );

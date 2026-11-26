@@ -1,11 +1,32 @@
-# omp-model-pool
+# omp extensions
 
-Round-robin model rotation: every new subagent spawn takes the next model in
-its role's pool.
+Two independent [oh-my-pi](https://github.com/can1357/oh-my-pi) extensions in one
+repo. They share no code and install separately:
 
-Standalone [oh-my-pi](https://github.com/can1357/oh-my-pi) extension that
-cycles the model **by role** on every new subagent spawn. The agent definition
-never changes; only the model it runs on rotates.
+| Package | Extension | What it does |
+|---|---|---|
+| [`packages/model-pool`](packages/model-pool) | `omp-model-pool` | Round-robin model rotation: every new subagent spawn takes the next model in its role's pool (plus opt-in main-session rotation). |
+| [`packages/mistral-live`](packages/mistral-live) | `omp-mistral-live` | Authoritative live Mistral discovery: OMP treats the live `/v1/models` chat roster as the catalog instead of retired bundled ids. |
+
+The rest of this README documents the rotation extension; discovery is described
+in its own package README.
+
+## Install
+
+Install each package you want:
+
+```bash
+omp install packages/model-pool
+omp install packages/mistral-live
+# or, for a dev checkout:
+omp --extension ./packages/model-pool/src/index.ts
+```
+
+Each package declares its own manifest entry — `omp.extensions: ["./src/index.ts"]`
+for the pool, `["./src/mistral-live.ts"]` for discovery — so no OMP fork is
+required. Distribute each via npm or a Git/marketplace entry.
+
+## The rotation extension
 
 Every child resolving via `@slow` gets `slow[0]`, then `slow[1]`, then
 `slow[2]`, then wraps — regardless of whether the agent was `reviewer`,
@@ -16,26 +37,12 @@ Authoritative event reference:
 (`before_subagent_spawn → { model, block, reason, note }`).
 The `omp.sh` site docs omit this event; the GitHub doc wins on conflict.
 
-## Install
-
-Dev / local link:
-
-```bash
-omp --extension ./omp-model-pool
-# or
-omp plugin link ./omp-model-pool
-```
-
-The manifest entry is `omp.extensions: ["./src/index.ts", "./src/mistral-live.ts"]` in
-`package.json`; no OMP fork is required. Distribute via npm or a
-Git/marketplace entry.
-
 ## Included extension: `mistral-live`
 
-`./src/mistral-live.ts` registers Mistral with `fetchDynamicModels` so OMP treats
-Mistral's live `GET /v1/models` chat roster (`capabilities.completion_chat === true`)
-as authoritative instead of merging retired static bundled IDs that fail at runtime
-with `HTTP 400 invalid_model`.
+`packages/mistral-live/src/mistral-live.ts` registers Mistral with
+`fetchDynamicModels` so OMP treats Mistral's live `GET /v1/models` chat roster
+(`capabilities.completion_chat === true`) as authoritative instead of merging
+retired static bundled IDs that fail at runtime with `HTTP 400 invalid_model`.
 
 - **Zero hardcoded model IDs:** newly released Mistral chat models appear
   automatically on refresh; retired IDs disappear automatically.
@@ -114,7 +121,7 @@ omp --extension ./omp-model-pool
 
 With no source configured the extension loads, reads nothing, and rotates
 nothing. To give it a persistent home, either point `OMP_MODEL_POOL_CONFIG` at
-a file, copy `model-pool.example.json` to `<OMP agent dir>/model-pool.json`, or
+a file, copy packages/model-pool/model-pool.example.json to `<OMP agent dir>/model-pool.json`, or
 just open `/model-pool` and add a model to a role: the first confirmed edit
 creates the profile-scoped default file in the nested shape. Loading the
 extension, running `status`/`doctor`, or opening the editor never creates a
@@ -469,7 +476,7 @@ another route.
 ## API (tests / hosts)
 
 ```ts
-import pool, { configurePools, resetCounters, getCounters, getPools, resolveStateFilePath } from "./src/index.ts";
+import pool, { configurePools, resetCounters, getCounters, getPools, resolveStateFilePath } from "./packages/model-pool/src/index.ts";
 configurePools({ pools: { slow: ["p/a", "p/b"] }, strict: false, persistCounters: false });
 resetCounters(); // mirrors an OMP restart (in-memory counters only)
 ```

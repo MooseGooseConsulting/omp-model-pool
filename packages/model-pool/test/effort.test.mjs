@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const mod = await import("../../dist/index.js");
+const mod = await import("../dist/index.js");
 
 /** The spawn's first model: the chain is an array once the pool has alternatives. */
 const headOf = (model) => (Array.isArray(model) ? model[0] : model);

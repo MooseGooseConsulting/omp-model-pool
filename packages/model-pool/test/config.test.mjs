@@ -8,7 +8,7 @@ import * as path from "node:path";
 const headOf = (model) => (Array.isArray(model) ? model[0] : model);
 
 
-const mod = await import("../../dist/index.js");
+const mod = await import("../dist/index.js");
 
 // Every test isolates itself: a fresh temp dir is the OMP agent dir (so the
 // default config path can never be the real ~/.omp), the pool-config env vars
