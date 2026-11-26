@@ -87,7 +87,9 @@ if (gated) {
 } else {
   for (let i = 0; i < iterations; i++) {
     const result = await subagentHandler(event, ctx);
-    picks.push(result?.model ?? null);
+    // The handler returns the spawn's failover chain; the process report keeps
+    // the first entry, which is the model this pick actually starts on.
+    picks.push(Array.isArray(result?.model) ? (result.model[0] ?? null) : (result?.model ?? null));
   }
 }
 

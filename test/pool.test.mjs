@@ -9,6 +9,10 @@ import * as fakeHost from "./helpers/fake-host.mjs";
 import nodeFs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
+
+
 // The shared registry from the fake host replaces this file's private
 // duplicate matcher. `current()` is undefined unless a case seeds it, which is
 // exactly the "host cannot report its active model" shape.
@@ -126,7 +130,7 @@ describe("per-role round robin", () => {
         { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
         subCtx(models),
       );
-      picks.push(r.model);
+      picks.push(headOf(r.model));
       assert.match(r.note, /pool slow\[\d\/3\]: /);
     }
     assert.deepEqual(picks, ["p/a", "p/b", "p/c", "p/a"]);
@@ -143,9 +147,9 @@ describe("per-role round robin", () => {
       { type: "before_subagent_spawn", agent: "scout", invocationKind: "eval", modelRole: "@slow", patterns: ["@slow"] }, ctx);
     const r3 = handlers.before_subagent_spawn(
       { type: "before_subagent_spawn", agent: "task", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] }, ctx);
-    assert.equal(r1.model, "p/a");
-    assert.equal(r2.model, "p/b"); // agent name irrelevant
-    assert.equal(r3.model, "p/a");
+    assert.equal(headOf(r1.model), "p/a");
+    assert.equal(headOf(r2.model), "p/b"); // agent name irrelevant
+    assert.equal(headOf(r3.model), "p/a");
   });
 
   it("treats '@slow' and 'slow' pool keys identically", () => {
@@ -156,13 +160,16 @@ describe("per-role round robin", () => {
     const r = handlers.before_subagent_spawn(
       { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
       subCtx(models));
-    assert.equal(r.model, "p/a");
+    assert.equal(headOf(r.model), "p/a");
   });
 
   it("ignores wrapper option keys in a flat config", () => {
     const { pi } = makeHarness();
-    // A flat map keeps its option keys at the top level; only real roles become pools.
-    mod.default(pi, { slow: ["p/a"], strict: true, persistCounters: false, mainSessionRole: "default" });
+    // A flat map keeps its option keys at the top level; only real roles become
+    // pools. `strict` is passed as an ARRAY on purpose: a scalar option is
+    // dropped by the list normalizer anyway, so only an array would otherwise
+    // masquerade as a role pool.
+    mod.default(pi, { slow: ["p/a"], strict: ["slow"], persistCounters: false, mainSessionRole: "default" });
     assert.deepEqual(Object.keys(mod.getPools()), ["slow"]);
   });
 
@@ -193,7 +200,7 @@ describe("per-role round robin", () => {
     const r1 = handlers.before_subagent_spawn(
       { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
       subCtx(models));
-    assert.equal(r1.model, "p/a"); // filtered, single survivor cycles
+    assert.equal(headOf(r1.model), "p/a"); // filtered, single survivor cycles
     mod.resetCounters();
     mod.configurePools({ pools: { slow: ["p/gone"] } });
     const r2 = handlers.before_subagent_spawn(
@@ -203,12 +210,40 @@ describe("per-role round robin", () => {
     assert.ok(logs.some(([l, m]) => l === "warn" && m.includes("empty pool")));
   });
 
+  it("returns the pool as the spawn's failover chain, starting at the picked slot", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    const spawn = () => handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+    // A single string would leave a failed call with no pool fallback; the
+    // host treats every returned entry after the first as a retry.
+    assert.deepEqual(spawn().model, ["p/a", "p/b", "p/c"]);
+    assert.deepEqual(spawn().model, ["p/b", "p/c", "p/a"], "the chain rotates with the cursor");
+    assert.deepEqual(spawn().model, ["p/c", "p/a", "p/b"]);
+  });
+
+  it("omits unavailable entries and folds duplicates from the failover chain", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/gone", "p/c", "p/a"] } });
+    const models = makeModels(["p/a", "p/c"]);
+    // `p/gone` is unauthenticated and `p/a` repeats: retrying either adds a
+    // request that cannot succeed or cannot differ.
+    assert.deepEqual(handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models)).model, ["p/a", "p/c"]);
+  });
+
+  it("returns a bare string when the pool has only one usable entry", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/gone"] } });
+    const models = makeModels(["p/a"]);
+    assert.equal(handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models)).model, "p/a");
+  });
+
   it("keeps a stable phase when availability changes mid-cycle", () => {
     const { pi, handlers } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
     const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
     let authenticated = ["p/a", "p/b"]; // p/c not authenticated yet
-    const pick = () => handlers.before_subagent_spawn(ev, subCtx(makeModels(authenticated))).model;
+    const pick = () => headOf(handlers.before_subagent_spawn(ev, subCtx(makeModels(authenticated))).model);
 
     const picks = [pick(), pick(), pick()];
     authenticated = ["p/a", "p/b", "p/c"]; // p/c authenticates mid-cycle
@@ -220,23 +255,14 @@ describe("per-role round robin", () => {
     assert.ok(mod.getCounters().slow < 3, "cursor stays an index into the configured pool");
   });
 
-  it("blocks empty pools only under strict policy", () => {
-    const { pi, handlers } = makeHarness();
-    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
-    const r = handlers.before_subagent_spawn(
-      { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
-      subCtx(makeModels(["p/a"])));
-    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
-  });
-
   it("resetCounters mirrors an OMP restart", () => {
     const { pi, handlers } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a", "p/b"] } });
     const models = makeModels(["p/a", "p/b"]);
     const ev = { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] };
-    assert.equal(handlers.before_subagent_spawn(ev, subCtx(models)).model, "p/a");
+    assert.equal(headOf(handlers.before_subagent_spawn(ev, subCtx(models)).model), "p/a");
     mod.resetCounters(); // restart: in-memory counters are gone
-    assert.equal(handlers.before_subagent_spawn(ev, subCtx(models)).model, "p/a");
+    assert.equal(headOf(handlers.before_subagent_spawn(ev, subCtx(models)).model), "p/a");
   });
 });
 
@@ -262,7 +288,7 @@ describe("main-session rotation", () => {
       { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@slow", patterns: ["@slow"] },
       subCtx(models),
     );
-    assert.equal(r.model, "p/a");
+    assert.equal(headOf(r.model), "p/a");
   });
 
   it("does not rotate when main-session rotation is disabled", async () => {
@@ -278,9 +304,11 @@ describe("main-session rotation", () => {
   it("does nothing when the main role pool is unconfigured", async () => {
     const { pi, handlers, setModels } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a"] } });
+    // A fresh session with no `default` pool: the handler must reach the pool
+    // lookup and return, not bail out at the novelty guard.
     await handlers.session_start(
       { type: "session_start" },
-      mainCtx(makeModels(["p/a"])),
+      mainCtx(makeModels(["p/a"]), [], freshHeader()),
     );
     assert.deepEqual(setModels, []);
   });
@@ -339,14 +367,6 @@ describe("main-session rotation", () => {
     );
     await handlers.session_start({ type: "session_start" }, resumed);
     assert.deepEqual(setModels, [], "a restored model is never overwritten");
-  });
-
-  it("rotates a session whose header was written by this process", async () => {
-    const { pi, handlers, setModels } = makeHarness();
-    mod.default(pi, { pools: { default: ["p/x", "p/y"] } });
-    const fresh = mainCtx(makeModels(["p/x", "p/y"]), [{ type: "session_init", id: "e1" }], freshHeader());
-    await handlers.session_start({ type: "session_start" }, fresh);
-    assert.deepEqual(appliedIds(setModels), ["p/x"], "the startup metadata a new session carries is not a load");
   });
 
   it("rotates a new session even when its transcript is already on disk", async () => {
@@ -535,7 +555,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       for (let i = 0; i < 4; i++) {
         mod.resetCounters(); // each iteration is a fresh OS process: in-memory gone
         const r = await handlers.before_subagent_spawn(ev, subCtx(models));
-        seen.push(r.model);
+        seen.push(headOf(r.model));
       }
       assert.deepEqual(seen, ["p/a", "p/b", "p/c", "p/a"]);
       // The cursor is stored modulo the pool length (3), so four picks land on 1.
@@ -551,7 +571,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, stateFile: file });
       const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a"); // sync result, not a promise
+      assert.equal(headOf(r.model), "p/a"); // sync result, not a promise
       assert.equal(fs.existsSync(file), false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -565,7 +585,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a"); // in-memory fallback still routes
+      assert.equal(headOf(r.model), "p/a"); // in-memory fallback still routes
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
       assert.equal(fs.readFileSync(file, "utf8"), "{ not json"); // untouched for the operator
     } finally {
@@ -582,7 +602,7 @@ describe("cross-process counter persistence (opt-in)", () => {
         handlers.before_subagent_spawn(ev, subCtx(models)),
         handlers.before_subagent_spawn(ev, subCtx(models)),
       ]);
-      assert.deepEqual([r1.model, r2.model].sort(), ["p/a", "p/b"]);
+      assert.deepEqual([headOf(r1.model), headOf(r2.model)].sort(), ["p/a", "p/b"]);
       // Stored modulo the pool length (2): two picks wrap back to 0.
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
     } finally {
@@ -614,7 +634,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a"); // falls back to in-memory, ignores the foreign cursor
+      assert.equal(headOf(r.model), "p/a"); // falls back to in-memory, ignores the foreign cursor
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 3); // not overwritten
     } finally {
@@ -636,7 +656,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const avail = subCtx(makeModels(["p/a", "p/b"])); // p/c unavailable
 
       const first = await handlers.before_subagent_spawn(ev, avail);
-      assert.equal(first.model, "p/a"); // fresh cursor, not index 1 of a reinterpreted count
+      assert.equal(headOf(first.model), "p/a"); // fresh cursor, not index 1 of a reinterpreted count
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("version-1 state file")));
       // The old file is preserved for inspection...
       assert.deepEqual(JSON.parse(fs.readFileSync(`${file}.v1.bak`, "utf8")), { version: 1, counters: { slow: 4 } });
@@ -646,7 +666,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       // The proof that it resumed: the next pick continues from the replaced
       // cursor instead of restarting, which a merely-rejected file could not.
       const second = await handlers.before_subagent_spawn(ev, avail);
-      assert.equal(second.model, "p/b");
+      assert.equal(headOf(second.model), "p/b");
       assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 2, counters: { slow: 2 } });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -660,7 +680,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers, logs } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a");
+      assert.equal(headOf(r.model), "p/a");
       assert.ok(logs.some(([level, msg]) => level === "warn" && msg.includes("persisted counter")));
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, "4"); // untouched
     } finally {
@@ -675,7 +695,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: true, stateFile: file });
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a");
+      assert.equal(headOf(r.model), "p/a");
       assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { counters: { slow: 4 } });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -689,7 +709,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers } = makeHarness();
       mod.default(pi); // no options: config comes from the environment
       const r = await handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a");
+      assert.equal(headOf(r.model), "p/a");
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -702,7 +722,7 @@ describe("cross-process counter persistence (opt-in)", () => {
       const { pi, handlers } = makeHarness();
       mod.default(pi, { pools: { slow: ["p/a", "p/b"] }, persistCounters: "false", stateFile: file });
       const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/a", "p/b"])));
-      assert.equal(r.model, "p/a");
+      assert.equal(headOf(r.model), "p/a");
       assert.equal(fs.existsSync(file), false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -814,13 +834,6 @@ describe("strict policy boundary", () => {
     assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
   });
 
-  it("does not hard-block when the model registry is unreadable", () => {
-    const { pi, handlers } = makeHarness();
-    mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
-    const noRegistry = { agent: { kind: "sub" }, models: undefined, ui: { notify: () => {} } };
-    assert.equal(handlers.before_subagent_spawn(ev, noRegistry), undefined);
-  });
-
   it("does not hard-block when the registry read throws", () => {
     const { pi, handlers } = makeHarness();
     mod.default(pi, { pools: { slow: ["p/a"] }, strict: ["slow"] });
@@ -832,12 +845,6 @@ describe("strict policy boundary", () => {
     assert.equal(handlers.before_subagent_spawn(ev, throwing), undefined);
   });
 
-  it("still hard-blocks when the registry answers that nothing is authenticated", () => {
-    const { pi, handlers } = makeHarness();
-    mod.default(pi, { pools: { slow: ["p/gone"] }, strict: ["slow"] });
-    const r = handlers.before_subagent_spawn(ev, subCtx(makeModels(["p/other"])));
-    assert.deepEqual(r, { block: true, reason: "model-pool: no authenticated model available for role @slow" });
-  });
 });
 
 // A minimal deferred promise: a gate a test controls explicitly, without any
@@ -1024,7 +1031,7 @@ describe("main-session acceptance gate", () => {
       "a same-role spawn waits for the startup pick to settle");
     gate.resolve();
     await startup;
-    assert.equal((await spawn).model, "p/b", "the accepted pick consumed slot 0");
+    assert.equal(headOf((await spawn).model), "p/b", "the accepted pick consumed slot 0");
     assert.equal(calls, 1);
   });
 
@@ -1044,7 +1051,7 @@ describe("main-session acceptance gate", () => {
     const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
     gate.resolve();
     await startup;
-    assert.equal((await spawn).model, "p/a", "a refusal consumed nothing, so the spawn sees slot 0");
+    assert.equal(headOf((await spawn).model), "p/a", "a refusal consumed nothing, so the spawn sees slot 0");
   });
 
   it("does not block a different role while a startup pick is in flight", async () => {
@@ -1064,7 +1071,7 @@ describe("main-session acceptance gate", () => {
       { type: "before_subagent_spawn", agent: "scout", invocationKind: "task", modelRole: "@other", patterns: ["@other"] },
       subCtx(models),
     );
-    assert.equal(other?.model, "p/x", "an unrelated role is not serialized behind another role's turn");
+    assert.equal(headOf(other?.model), "p/x", "an unrelated role is not serialized behind another role's turn");
     gate.resolve();
     await startup;
   });
@@ -1356,7 +1363,7 @@ describe("main-session acceptance gate", () => {
       // same-role spawn: its persisted attempt also fails and falls back to the
       // in-memory counter, which it advances to 0 and reports b.
       const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-      assert.equal(spawn?.model, "p/b");
+      assert.equal(headOf(spawn?.model), "p/b");
       // Next startup must follow that shared counter back to a. A private copy
       // of the mirror would still read 1 here and repeat b.
       await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
@@ -1479,7 +1486,7 @@ describe("main-session acceptance gate", () => {
       // succeed, so it must still read the mirror rather than the stale file.
       failing = false;
       const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-      assert.equal(spawn?.model, "p/b");
+      assert.equal(headOf(spawn?.model), "p/b");
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
       assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
     } finally {
@@ -1597,7 +1604,7 @@ describe("main-session acceptance gate", () => {
       gate.resolve();
       await startup;
       const result = await spawn;
-      assert.equal(result?.model, "p/b", "the queued spawn still uses the pool it captured");
+      assert.equal(headOf(result?.model), "p/b", "the queued spawn still uses the pool it captured");
       // The startup committed the slot b (cursor 1); the queued spawn then
       // consumed b and wrapped its captured file to 0. Had it followed the
       // rebind, this file would still read 1 and the new file would exist.

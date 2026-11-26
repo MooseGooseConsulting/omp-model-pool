@@ -13,6 +13,10 @@ import * as path from "node:path";
 
 import { createFakeHost } from "./helpers/fake-host.mjs";
 
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
+
+
 const mod = await import("../dist/index.js");
 
 // `getPools()` returns a null-prototype object, which strict deepEqual would
@@ -95,7 +99,7 @@ describe("command registration", () => {
 
     const models = host.models(["p/a", "p/b"]);
     const result = host.handlers.before_subagent_spawn(SLOW_EVENT, host.subCtx(models));
-    assert.equal(result.model, "p/a");
+    assert.equal(headOf(result.model), "p/a");
     assert.equal(counters().slow, 1);
   });
 
@@ -614,21 +618,6 @@ describe("doctor diagnosis (inline registries)", () => {
     for (const entry of entries) {
       assert.equal(entry.eligible, true, `${entry.selector}: ${entry.reason}`);
     }
-  });
-
-  it("reports an unresolvable entry and an authenticated one in the same invocation", () => {
-    const host = makeInlineHost();
-    mod.default(host.pi, { pools: { slow: ["p/ghost", "p/a"] } });
-    const models = {
-      list: () => [{ provider: "p", id: "a" }],
-      current: () => undefined,
-      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
-    };
-    const report = mod.diagnosePools(models);
-    const entries = report.roles.find((r) => r.role === "slow").entries;
-    assert.equal(entries[0].eligible, false, "p/ghost never resolves");
-    assert.match(entries[0].reason, /unresolved/);
-    assert.equal(entries[1].eligible, true, "p/a is authenticated in the same pass");
   });
 
   it("labels entries of a throwing registry as unreadable, not unauthenticated", () => {

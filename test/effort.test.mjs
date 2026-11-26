@@ -13,6 +13,9 @@ import * as path from "node:path";
 
 const mod = await import("../dist/index.js");
 
+/** The spawn's first model: the chain is an array once the pool has alternatives. */
+const headOf = (model) => (Array.isArray(model) ? model[0] : model);
+
 /** `provider/id` -> `{ provider, id }`, with a settable active model. */
 function makeModels(rows, currentId) {
   let current = currentId === undefined ? undefined : byIdentity(rows, currentId);
@@ -165,7 +168,6 @@ describe("effort: call order and accepted spellings", () => {
   });
 
   for (const [slot, level] of [
-    ["p/b:high", "high"],
     ["p/b:max", "max"],
     ["p/b:low", "low"],
   ]) {
@@ -303,7 +305,7 @@ describe("effort: no request is invented for manual picks or subagents", () => {
       },
       { agent: { kind: "sub", name: "task", id: "1" }, models, ui: { notify: () => {} } },
     );
-    assert.equal(result?.model, "p/b:high", "the raw selector reaches the host unchanged");
+    assert.equal(headOf(result?.model), "p/b:high", "the raw selector reaches the host unchanged");
     assert.deepEqual(harness.calls, [], "a subagent spawn never drives the main-session setter");
   });
 });

@@ -1796,6 +1796,38 @@ function describePick(roleKey: string, picked: string, index: number, total: num
 }
 
 /**
+ * The spawn's model chain: the picked slot first, then the rest of the pool in
+ * rotation order.
+ *
+ * `before_subagent_spawn` treats a returned `model` as the child's
+ * attempt-ordered list, so a single string leaves a failed call with no pool
+ * fallback. Returning the whole eligible rotation means a provider error on the
+ * chosen model retries the next pool entry instead of the same one. The counter
+ * still advances by exactly one: the event fires once per child.
+ *
+ * Duplicate selectors are folded to their first occurrence — the rotation keeps
+ * them as distinct slots, but retrying an identical model adds nothing.
+ */
+function fallbackChain(
+  pool: readonly string[],
+  eligible: readonly boolean[],
+  start: number,
+): string | string[] {
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; offset < pool.length; offset++) {
+    const index = (start + offset) % pool.length;
+    if (eligible[index] !== true) continue;
+    const selector = pool[index];
+    if (selector === undefined || seen.has(selector)) continue;
+    seen.add(selector);
+    chain.push(selector);
+  }
+  if (chain.length === 0) return pool[start] ?? "";
+  return chain.length === 1 ? (chain[0] as string) : chain;
+}
+
+/**
  * Promise the role's latest turn leaves behind, so the next same-role pick can
  * serialize behind it instead of racing its cursor mirroring.
  */
@@ -1999,7 +2031,7 @@ function handleBeforeSubagentSpawn(
           if (pick === undefined) return undefined;
           const note = describePick(roleKey, pick.picked, pick.index, pool.length);
           safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-          return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+          return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
         } catch (err) {
           // A rejected async dispatch fails open, like the sync path.
           safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
@@ -2012,7 +2044,7 @@ function handleBeforeSubagentSpawn(
       if (pick === undefined) return undefined;
       const note = describePick(roleKey, pick.picked, pick.index, pool.length);
       safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-      return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+      return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
     }
     return enqueueRoleTurn(roleKey, async () => {
       try {
@@ -2020,7 +2052,7 @@ function handleBeforeSubagentSpawn(
         if (pick === undefined) return undefined;
         const note = describePick(roleKey, pick.picked, pick.index, pool.length);
         safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-        return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+        return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
       } catch (err) {
         safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;

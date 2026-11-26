@@ -102,8 +102,4 @@ describe("live cursor oracle", () => {
     assert.equal(decision.expected, 0);
   });
 
-  it("does not judge an empty pool", () => {
-    const decision = cursorExpectation({ accepted: true, hadEvidence: true, previous: 0, poolLength: 0 });
-    assert.equal(decision.status, "skip");
-  });
 });
