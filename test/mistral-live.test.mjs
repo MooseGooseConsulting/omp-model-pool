@@ -49,18 +49,30 @@ describe("mistral-live extension", () => {
     assert.match(logs[0], /registerProvider/);
   });
 
-  it("normalizes custom baseUrl and falls back on invalid baseUrl", () => {
+  it("normalizes custom baseUrl, rejects non-loopback HTTP, and preserves query strings on /models", () => {
     const host1 = makeHost();
     mod.default(host1.pi, { env: { OMP_MISTRAL_LIVE_BASE_URL: "https://proxy.example.com/v1///" } });
     assert.equal(host1.registered[0].config.baseUrl, "https://proxy.example.com/v1");
 
+    // Non-loopback plain HTTP must be rejected to protect Bearer tokens in transit.
     const host2 = makeHost();
-    mod.default(host2.pi, { env: { OMP_MISTRAL_LIVE_BASE_URL: "ftp://invalid.example.com" } });
+    mod.default(host2.pi, { env: { OMP_MISTRAL_LIVE_BASE_URL: "http://proxy.example.com/v1" } });
     assert.equal(host2.registered[0].config.baseUrl, "https://api.mistral.ai/v1");
     assert.ok(host2.logs.some(([level]) => level === "warn"));
+
+    // Loopback HTTP is allowed for local development proxies.
+    const host3 = makeHost();
+    mod.default(host3.pi, { env: { OMP_MISTRAL_LIVE_BASE_URL: "http://127.0.0.1:4000/v1/" } });
+    assert.equal(host3.registered[0].config.baseUrl, "http://127.0.0.1:4000/v1");
+
+    // Query strings stay attached after `/models` is appended to the pathname.
+    assert.equal(
+      mod.buildModelsEndpointUrl("https://proxy.example.com/v1?api-version=2026-01"),
+      "https://proxy.example.com/v1/models?api-version=2026-01",
+    );
   });
 
-  it("filters out non-chat models, maps capabilities, and deduplicates IDs", () => {
+  it("filters out non-chat models, maps capabilities + numeric string context, and deduplicates IDs", () => {
     const payload = {
       object: "list",
       data: [
@@ -74,7 +86,7 @@ describe("mistral-live extension", () => {
           id: "mistral-large-latest",
           name: "mistral-large-latest",
           aliases: ["mistral-large-4-0", "mistral-large-2512"],
-          max_context_length: 1000000,
+          max_context_length: "512000",
           capabilities: { completion_chat: true, vision: true, reasoning: true },
         },
         {
@@ -95,11 +107,6 @@ describe("mistral-live extension", () => {
           id: "custom-gateway-model",
           // No capabilities object (OpenAI-compatible gateway) — must be kept.
         },
-        {
-          // Malformed entry — must be skipped.
-          id: "",
-          capabilities: { completion_chat: true },
-        },
       ],
     };
 
@@ -119,8 +126,9 @@ describe("mistral-live extension", () => {
       defaultLevel: "medium",
     });
 
-    // Alias of mistral-large-4-0 also gets the low/medium/high effort ladder.
+    // Alias of mistral-large-4-0 gets the low/medium/high effort ladder and numeric string context.
     const latest = models[1];
+    assert.equal(latest.contextWindow, 512000);
     assert.deepEqual(latest.thinking, {
       mode: "effort",
       efforts: ["low", "medium", "high"],
@@ -132,6 +140,17 @@ describe("mistral-live extension", () => {
     assert.deepEqual(gateway.input, ["text"]);
     assert.equal(gateway.contextWindow, mod.DEFAULT_CONTEXT_WINDOW);
     assert.equal("thinking" in gateway, false);
+  });
+
+  it("rejects malformed model rows instead of publishing an empty catalog", () => {
+    assert.throws(
+      () => mod.parseMistralModelsPayload({ data: [null, { name: "missing-id" }] }),
+      /malformed model entry/,
+    );
+    assert.throws(
+      () => mod.parseMistralModelsPayload({ data: [{ id: "   ", capabilities: { completion_chat: true } }] }),
+      /malformed model entry/,
+    );
   });
 
   it("throws on missing apiKey, HTTP error, or malformed payload so cache fallback works", async () => {

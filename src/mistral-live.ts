@@ -96,8 +96,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function toPositiveInteger(value: unknown, fallback: number): number {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return Math.floor(value);
+  let num: number;
+  if (typeof value === "number") {
+    num = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    num = Number(value.trim());
+  } else {
+    return fallback;
+  }
+  if (Number.isFinite(num) && num > 0) {
+    return Math.floor(num);
   }
   return fallback;
 }
@@ -108,8 +116,15 @@ function isDisabledFlag(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes";
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return lower === "localhost" || lower === "127.0.0.1" || lower === "::1" || lower === "[::1]";
+}
+
 /**
- * Validate and normalize an HTTP(S) base URL, stripping trailing slashes.
+ * Validate and normalize a base URL, stripping trailing path slashes.
+ * Requires `https:` except for loopback hosts (`localhost`, `127.0.0.1`, `::1`)
+ * so the Mistral Bearer token is never transmitted in plaintext over a network.
  * Returns `undefined` if invalid.
  */
 export function normalizeBaseUrl(raw: string | undefined): string | undefined {
@@ -122,11 +137,28 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
   } catch {
     return undefined;
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+  if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
     return undefined;
   }
-  // Strip trailing slashes from the serialized URL (preserve path prefix like `/v1`).
-  return parsed.toString().replace(/\/+$/, "");
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return undefined;
+  }
+  parsed.hash = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  const serialized = parsed.toString();
+  return parsed.pathname === "/" && !parsed.search ? serialized.replace(/\/+$/, "") : serialized;
+}
+
+/**
+ * Build the `/models` endpoint URL from a normalized base URL without
+ * corrupting query parameters (e.g. `?api-version=...`).
+ */
+export function buildModelsEndpointUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl);
+  parsed.hash = "";
+  const cleanPath = parsed.pathname.replace(/\/+$/, "");
+  parsed.pathname = `${cleanPath}/models`;
+  return parsed.toString();
 }
 
 function isMistralLarge4Family(id: string, record: MistralApiModelRecord): boolean {
@@ -199,8 +231,9 @@ export function mapMistralApiModel(record: unknown): ProviderModelConfigLike | n
 
 /**
  * Parse a Mistral `/v1/models` JSON payload into deduplicated chat models.
- * Throws if the payload does not contain a `data` array so oh-my-pi's cache
- * fallback is preserved rather than treating a malformed payload as an empty catalog.
+ * Throws if the payload does not contain a `data` array or contains malformed
+ * model rows (not an object or missing a non-empty string `id`) so oh-my-pi's
+ * cache fallback is preserved rather than publishing a corrupted/empty catalog.
  */
 export function parseMistralModelsPayload(payload: unknown): ProviderModelConfigLike[] {
   if (!isRecord(payload) || !Array.isArray(payload.data)) {
@@ -209,6 +242,9 @@ export function parseMistralModelsPayload(payload: unknown): ProviderModelConfig
   const seen = new Set<string>();
   const models: ProviderModelConfigLike[] = [];
   for (const item of payload.data) {
+    if (!isRecord(item) || typeof item.id !== "string" || item.id.trim() === "") {
+      throw new Error("mistral-live: malformed model entry in /models response");
+    }
     const mapped = mapMistralApiModel(item);
     if (!mapped || seen.has(mapped.id)) continue;
     seen.add(mapped.id);
@@ -244,7 +280,7 @@ export async function fetchMistralLiveModels(
     throw new Error("mistral-live: global fetch is unavailable");
   }
 
-  const endpoint = `${baseUrl}/models`;
+  const endpoint = buildModelsEndpointUrl(baseUrl);
   let signal: AbortSignal | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
