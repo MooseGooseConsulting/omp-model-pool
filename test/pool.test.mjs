@@ -1488,6 +1488,58 @@ describe("main-session acceptance gate", () => {
     }
   });
 
+  it("advances the degraded mirror when a startup falls back on a read failure", async () => {
+    const { dir, file } = tmpStateFile();
+    fs.writeFileSync(file, `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`, "utf8");
+    let renameFails = true;
+    let readFails = false;
+    const restoreRename = patchRename((original) => (from, to) => {
+      if (renameFails) {
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      }
+      return original(from, to);
+    });
+    const originalRead = nodeFs.readFileSync;
+    nodeFs.readFileSync = (target, options) => {
+      if (readFails && String(target) === file) {
+        const err = new Error("io error");
+        err.code = "EIO";
+        throw err;
+      }
+      return originalRead(target, options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { default: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      // 1: accepted a, durable write fails -> mirror points at b.
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // 2: the state read fails, so this startup falls back to memory and
+      // applies b; the mirror must follow it to a.
+      readFails = true;
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      // 3: persistence recovers; the unchanged file still matches the mark, so
+      // the mirrored a is next — not b again.
+      readFails = false;
+      renameFails = false;
+      await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      assert.deepEqual(appliedIds(harness.setModels), ["p/a", "p/b", "p/a"]);
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+    } finally {
+      restoreRename();
+      nodeFs.readFileSync = originalRead;
+      syncBuiltinESMExports();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("publishes the v1 backup without following an existing symlink", async (t) => {
     const { dir, file } = tmpStateFile();
     const victim = path.join(dir, "victim.txt");

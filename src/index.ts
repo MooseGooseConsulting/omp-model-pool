@@ -2101,6 +2101,7 @@ async function rotateMainInMemory(
   roleKey: string,
   pool: readonly string[],
   eligible: readonly boolean[],
+  markKey?: string,
 ): Promise<void> {
   const index = findEligibleIndex(pool.length, eligible, counters[roleKey] ?? 0);
   if (index === undefined) return;
@@ -2108,6 +2109,16 @@ async function rotateMainInMemory(
   const accepted = await acceptMainSessionModel(pi, ctx, roleKey, slot, index, pool.length);
   if (!accepted) return; // Refusal consumes nothing.
   counters[roleKey] = (index + 1) % pool.length;
+  if (markKey !== undefined) {
+    // Same (file, role) already degraded: keep its mirror in step with the slot
+    // this fallback consumed, or a later successful startup would resume from
+    // the mark's older cursor and repeat a model the host already ran.
+    // The fingerprint is left alone: this attempt read nothing.
+    const known = persistDegraded.get(markKey);
+    if (known !== undefined) {
+      persistDegraded.set(markKey, { fileFingerprint: known.fileFingerprint, localCursor: counters[roleKey] ?? 0 });
+    }
+  }
   safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${slot} index=${index} total=${pool.length} persisted=false`);
 }
 
@@ -2196,7 +2207,7 @@ async function runMainSessionRotation(
       "warn",
       `[model-pool] persisted counter read/lock failed; using in-memory counters (this local fallback is not serialized across processes): ${message}`,
     );
-    await rotateMainInMemory(pi, ctx, roleKey, pool, eligible);
+    await rotateMainInMemory(pi, ctx, roleKey, pool, eligible, markKey);
   }
 }
 
