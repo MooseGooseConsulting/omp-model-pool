@@ -36,3 +36,17 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npm test
+      - name: Fetch pinned OMP binary for E2E
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 24
+        run: |
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$RUNNER_TEMP/omp-linux-x64" \
+            "https://github.com/can1357/oh-my-pi/releases/download/v19.2.1/omp-linux-x64"
+          echo "e8b937f9bf023baa147bdd300ad5421af0a6ef8b1f350c47a9a93d5fca94feca  $RUNNER_TEMP/omp-linux-x64" > "$RUNNER_TEMP/omp-linux-x64.sha256"
+          cd "$RUNNER_TEMP" && sha256sum --check --strict "omp-linux-x64.sha256"
+          chmod +x "$RUNNER_TEMP/omp-linux-x64"
+      - name: E2E against real OMP (loopback fixture)
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 24
+        run: npm run test:e2e
+        env:
+          OMP_BIN: ${{ runner.temp }}/omp-linux-x64

@@ -94,6 +94,124 @@ interface SessionStartEvent {
   [key: string]: unknown;
 }
 
+/**
+ * Thinking levels the host's public thinking setter understands. Private to
+ * this module: the host clamps any level to the selected model's own ladder,
+ * so this extension never needs more than the literal names.
+ */
+type ThinkingLevelLike = "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The levels, in the order OMP documents them. */
+const THINKING_LEVELS: readonly ThinkingLevelLike[] = [
+  "inherit",
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
+ * Map an explicit suffix token to a thinking level: an exact spelling first,
+ * then a case-sensitive unique prefix of at least two characters. Unknown or
+ * ambiguous tokens (one letter, several partial matches) are not levels.
+ */
+function canonicalThinkingLevel(token: string): ThinkingLevelLike | undefined {
+  if ((THINKING_LEVELS as readonly string[]).includes(token)) return token as ThinkingLevelLike;
+  if (token.length < 2) return undefined;
+  const matches = THINKING_LEVELS.filter((level) => level.startsWith(token));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Route slugs after `@` in a selector: slash-separated alphanumeric/hyphen words. */
+const ROUTE_PATTERN = "[A-Za-z0-9-]+(?:/[A-Za-z0-9-]+)*";
+
+/**
+ * The thinking-effort token of one slot, recognizing plain `id:high` plus both
+ * route spellings `id:high@upstream` and `id@upstream:high`, with
+ * slash-separated alphanumeric/hyphen route slugs. `undefined` when the slot
+ * carries no effort-shaped suffix at all; the literal selector is never
+ * rewritten for resolution.
+ */
+function effortSuffixToken(slot: string): string | undefined {
+  const viaColon = slot.match(new RegExp(`^(.+?):([A-Za-z][A-Za-z0-9]*)@(${ROUTE_PATTERN})$`));
+  if (viaColon !== null) {
+    const [, literal, token, route] = viaColon;
+    if (literal !== undefined && token !== undefined && route !== undefined) return token;
+  }
+  const viaRoute = slot.match(new RegExp(`^(.+?)@(${ROUTE_PATTERN}):([A-Za-z][A-Za-z0-9]*)$`));
+  if (viaRoute !== null) {
+    const [, literal, route, token] = viaRoute;
+    if (literal !== undefined && route !== undefined && token !== undefined) return token;
+  }
+  // Plain `id:high` — the route-bearing forms above take precedence, and
+  // whether the token is a real level or part of a literal id is decided by
+  // the caller's resolution checks.
+  const plain = slot.match(/^(.+?):([A-Za-z][A-Za-z0-9]*)$/);
+  if (plain !== null) {
+    const [, literal, token] = plain;
+    if (literal !== undefined && token !== undefined) return token;
+  }
+  return undefined;
+}
+
+/**
+ * Decide whether an accepted slot carries an explicit thinking request, and at
+ * which level.
+ *
+ * A slot may be a comma-separated fallback list; only the first alternative
+ * that resolves is inspected, and only when its identity agrees with the model
+ * the full selector actually applied — a losing alternative never sets effort.
+ * For an explicit request on a role alias (`@alias:level`) the request applies
+ * even when the alias resolves to an id that already ends in the level; for a
+ * literal id the request applies only when the resolved id does not already
+ * end in the written suffix or the canonical level, so a model genuinely named
+ * `x:free` or `x-high` is left alone. Suffixes hidden inside an alias's own
+ * configuration are never inferred. An explicit non-literal `:auto` has no
+ * public level — the caller keeps the model's defaults and warns.
+ */
+function resolveExplicitThinking(
+  models: ModelsQuery | undefined,
+  slot: string,
+  appliedIdentity: string,
+): { level?: ThinkingLevelLike; autoExplicit?: true } {
+  if (models === undefined) return {};
+  let first: { alternative: string; identity: string } | undefined;
+  for (const alternative of slot.split(",").map((part) => part.trim())) {
+    if (alternative.length === 0) continue;
+    let resolved: ModelLike | undefined;
+    try {
+      resolved = models.resolve(alternative);
+    } catch {
+      resolved = undefined;
+    }
+    const identity = resolved === undefined || resolved === null ? "" : modelIdentity(resolved);
+    if (identity.length === 0) continue; // unresolvable or identity-less: keep looking
+    first = { alternative, identity };
+    break;
+  }
+  if (first === undefined || first.identity !== appliedIdentity) return {};
+  const token = effortSuffixToken(first.alternative);
+  if (token === undefined) return {};
+  const canonical = canonicalThinkingLevel(token);
+  // A `@role` alias selector is never mistaken for a literal id: an explicit
+  // request on an alias applies even when the alias resolves to an id that
+  // already ends in the level.
+  if (!first.alternative.startsWith("@")) {
+    if (
+      first.identity.endsWith(`:${token}`) ||
+      (canonical !== undefined && first.identity.endsWith(canonical))
+    ) {
+      return {};
+    }
+  }
+  if (canonical !== undefined) return { level: canonical };
+  if (token === "auto") return { autoExplicit: true };
+  return {};
+}
+
 interface ExtensionContextLike {
   agent?: { kind?: unknown; name?: unknown; id?: unknown };
   models?: ModelsQuery;
@@ -139,6 +257,13 @@ interface ExtensionApiLike {
    * rather than assumed.
    */
   setModel?(model: ModelLike): void | Promise<unknown>;
+  /**
+   * Set the live session's thinking level through OMP's public setter. OMP
+   * clamps any level to the selected model's own ladder. Optional: a host
+   * without this surface still rotates; it just cannot apply an explicit
+   * effort request.
+   */
+  setThinkingLevel?(level: ThinkingLevelLike): void;
   logger?: {
     info?: (...args: unknown[]) => void;
     warn?: (...args: unknown[]) => void;
@@ -250,10 +375,12 @@ let configSource: ConfigSourceInfo = {
 let configRevision = 0;
 
 /**
- * Signature of the last environment/default source applied by the factory.
- * Re-binding the extension to a child session re-runs the factory with no
- * options; when the backing source is unchanged we must keep any runtime edits
- * rather than resetting to the on-disk document.
+ * Signature of the last applied environment/default source: set by the
+ * factory's load (and conflict reload) and by a successful file-backed save,
+ * which records what it just wrote. Re-binding the extension to a child
+ * session re-runs the factory with no options; when the backing source is
+ * unchanged we must keep any runtime edits rather than resetting to the
+ * on-disk document.
  */
 let loadedSignature: string | undefined;
 
@@ -443,13 +570,52 @@ function existingMode(file: string): number {
   }
 }
 
+/**
+ * Blocking backoff buffer for the synchronous rename retry, allocated once.
+ * `Atomics.wait` is the only primitive that sleeps synchronously on the main
+ * thread, and the atomic write path is synchronous by design, so the retry
+ * cannot use `setTimeout`.
+ */
+let renameRetryBuffer: Int32Array | undefined;
+
+/**
+ * Blocking sleep used only while retrying a transient sharing violation.
+ * Bounded to the retry schedule (at most 150 ms total), and never invoked for
+ * a genuine failure.
+ */
+function syncWait(ms: number): void {
+  const buffer = (renameRetryBuffer ??= new Int32Array(new SharedArrayBuffer(4)));
+  Atomics.wait(buffer, 0, 0, ms);
+}
+
+/** Backoff schedule for Windows sharing violations on the rename itself. */
+const RENAME_RETRY_DELAYS_MS: readonly number[] = [10, 20, 40, 80];
+
 /** Write `contents` via an exclusive temp file and an atomic rename. */
 function writeFileAtomicSync(file: string, contents: string, mode = 0o600): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(tmp, contents, { mode, flag: "wx" });
-    fs.renameSync(tmp, file);
+    // Only the rename can collide with another process that holds the
+    // destination open without a sharing mode (antivirus, indexers, a
+    // concurrent reader mid-write). Windows reports that transiently as
+    // EPERM/EBUSY, so those two errors alone are retried on a short bounded
+    // backoff. Everything else is fatal: the destination is never unlinked to
+    // force the rename, and the temp file is never rewritten — its bytes are
+    // intact, so a later retry commits the same content. Lock-reclaim renames
+    // are unrelated and get no retry.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(tmp, file);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        const retryDelay = process.platform === "win32" ? RENAME_RETRY_DELAYS_MS[attempt] : undefined;
+        if (retryDelay === undefined || (code !== "EPERM" && code !== "EBUSY")) throw err;
+        syncWait(retryDelay);
+      }
+    }
   } finally {
     try {
       fs.rmSync(tmp, { force: true });
@@ -567,19 +733,29 @@ function readPersistedCounters(file: string): { counters: Record<string, number>
 }
 
 /**
- * Move a recognized legacy state file aside before fresh state is written over
- * it, so the operator's file stays inspectable. Best-effort: if the backup
- * cannot be made, the fresh write still restores persistence.
+ * Copy a recognized legacy state file to a sidecar `.v1.bak` before the fresh
+ * v2 write replaces it, so the operator's cursor stays inspectable. The live
+ * file is only ever copied, never moved elsewhere: if the backup fails the v1
+ * bytes are still exactly where they were. Returns whether the backup was
+ * actually written, so the caller can say so instead of claiming a backup that
+ * does not exist. Best-effort: failure never blocks the fresh write.
  */
-function quarantineLegacyState(file: string): string {
-  const backup = `${file}.v1.bak`;
+function copyLegacyStateAside(file: string): boolean {
   try {
-    fs.rmSync(backup, { force: true });
-    fs.renameSync(file, backup);
+    fs.copyFileSync(file, `${file}.v1.bak`);
+    return true;
   } catch {
-    // Best-effort only.
+    return false;
   }
-  return backup;
+}
+
+/** One-line phrasing of a legacy replacement, honest about the backup. */
+function describeLegacyReplacement(file: string, backupOk: boolean): string {
+  return backupOk
+    ? `replaced a version-1 state file at ${file} (cursor semantics changed); ` +
+        `the old file is kept at ${file}.v1.bak and rotation continued from a fresh cursor`
+    : `replaced a version-1 state file at ${file} (cursor semantics changed); ` +
+        `a copy of the old file could not be written to ${file}.v1.bak and rotation continued from a fresh cursor`;
 }
 
 /** Write the state via a unique temp file + atomic rename (mode 0600). */
@@ -606,7 +782,9 @@ function lockOwnerAlive(lock: string): boolean | undefined {
     return undefined;
   }
   const pid = Number.parseInt(raw.trim().split(".")[0] ?? "", 10);
-  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return undefined;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  // Our own pid is trivially alive: the recorded holder is this process.
+  if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
     return true;
@@ -660,9 +838,11 @@ function reclaimAbandonedLock(lock: string): boolean {
 /**
  * Run `fn` while holding an atomic-directory lock on `<file>.lock`; abandoned
  * locks are reclaimed. Shared by the counter state file and the pool config
- * file, so two writers on the same path never interleave.
+ * file, so two writers on the same path never interleave. `fn` may await —
+ * notably the startup acceptance turn's host call — and the lock is held until
+ * that promise settles, never released while the host is still mutating.
  */
-async function withFileLock<T>(file: string, fn: () => T): Promise<T> {
+async function withFileLock<T>(file: string, fn: () => T | Promise<T>): Promise<T> {
   const lock = `${file}.lock`;
   const owner = path.join(lock, "owner");
   const token = `${process.pid}.${Date.now()}.${randomUUID()}`;
@@ -692,7 +872,7 @@ async function withFileLock<T>(file: string, fn: () => T): Promise<T> {
     throw err;
   }
   try {
-    return fn();
+    return await fn();
   } finally {
     // Release only a lock we still own. If ours was reclaimed as abandoned and
     // a new holder took it, deleting that lock would admit a third writer.
@@ -709,26 +889,40 @@ async function withFileLock<T>(file: string, fn: () => T): Promise<T> {
  * The cursor indexes the configured pool and is stored modulo its length, so a
  * shared file keeps one meaning across processes. Nothing eligible means no
  * write, so the cursor is not consumed.
+ *
+ * When `accept` is given, the index is selected under the file lock and the
+ * host is asked to accept it there, with the lock still held — so the host
+ * call fully settles before the durable commit, and a refusal leaves the file
+ * byte-identical: no pick, no write, no migration, no fallback. After
+ * acceptance a recognized legacy file is copied (never moved) to `.v1.bak` and
+ * the fresh cursor is written atomically; the result reports whether that
+ * backup actually succeeded.
  */
-function advancePersisted(
+async function advancePersisted(
   roleKey: string,
   poolLength: number,
-  eligible: boolean[],
+  eligible: readonly boolean[],
   file: string,
-): Promise<{ index: number; replacedLegacy: boolean } | undefined> {
-  return withFileLock(file, () => {
+  accept?: (index: number) => Promise<boolean>,
+): Promise<{ index: number; replacedLegacy: boolean; backupOk: boolean } | undefined> {
+  return withFileLock(file, async () => {
     const read = readPersistedCounters(file);
-    if (read.legacy) quarantineLegacyState(file);
     const persisted = read.counters;
-    const start = poolLength === 0 ? 0 : (persisted[roleKey] ?? 0) % poolLength;
-    for (let offset = 0; offset < poolLength; offset++) {
-      const index = (start + offset) % poolLength;
-      if (eligible[index] !== true) continue;
-      persisted[roleKey] = (index + 1) % poolLength;
-      writeStateAtomic(file, persisted);
-      return { index, replacedLegacy: read.legacy };
+    const index = findEligibleIndex(poolLength, eligible, persisted[roleKey] ?? 0);
+    if (index === undefined) return undefined;
+    if (accept !== undefined) {
+      const accepted = await accept(index);
+      if (accepted !== true) return undefined;
     }
-    return undefined;
+    let replacedLegacy = false;
+    let backupOk = false;
+    if (read.legacy) {
+      replacedLegacy = true;
+      backupOk = copyLegacyStateAside(file);
+    }
+    persisted[roleKey] = (index + 1) % poolLength;
+    writeStateAtomic(file, persisted);
+    return { index, replacedLegacy, backupOk };
   });
 }
 
@@ -960,8 +1154,8 @@ function optionsSignature(normalized: ReturnType<typeof normalizeConfig>): strin
 }
 
 /** Signature that decides whether a re-bind must reload the environment source. */
-function sourceSignature(loaded: LoadedConfig): string {
-  return `${loaded.source.kind}:${loaded.source.path ?? ""}:${loaded.source.writable ? "w" : "r"}:${loaded.fingerprint ?? ""}`;
+function sourceSignature(source: ConfigSourceInfo, fingerprint?: string): string {
+  return `${source.kind}:${source.path ?? ""}:${source.writable ? "w" : "r"}:${fingerprint ?? ""}`;
 }
 
 /** Apply a loaded source to the active configuration and record its provenance. */
@@ -1144,9 +1338,22 @@ export async function savePoolEdit(
       const text = `${JSON.stringify(doc, null, 2)}\n`;
       writeFileAtomicSync(file, text, existingMode(file));
       configFingerprint = fingerprintText(text);
+      // The document just written is authoritative: its shape governs the next
+      // edit, and a signature for the new provenance/fingerprint is recorded so
+      // a factory re-bind compares against what we saved, never what we loaded.
+      configShape = detectShape(doc);
       if (configSource.kind === "none") {
         configSource = { kind: "default-file", path: file, writable: true, label: file };
+      } else if (configSource.kind === "file-env" && configSource.note === "missing file will be created on the first saved edit") {
+        // The file now exists, so the note would go stale and mislead status.
+        configSource = {
+          kind: "file-env",
+          path: file,
+          writable: true,
+          label: configSource.label,
+        };
       }
+      loadedSignature = sourceSignature(configSource, configFingerprint);
       // Commit the in-memory change inside the lock, so a second save that
       // passed the pre-lock revision check sees the bumped revision and refuses
       // instead of overwriting this write.
@@ -1157,7 +1364,7 @@ export async function savePoolEdit(
     if (fingerprintConflict) {
       const loaded = loadConfigWithSource();
       configureLoaded(loaded);
-      loadedSignature = sourceSignature(loaded);
+      loadedSignature = sourceSignature(loaded.source, loaded.fingerprint);
     }
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
@@ -1165,35 +1372,80 @@ export async function savePoolEdit(
 }
 
 /**
+ * One authenticated-registry snapshot per invocation. `readable` is false when
+ * `list()` threw, carrying the error for the operator note; otherwise
+ * `identities` is the set of nonempty model identities in that one listing.
+ */
+type RegistrySnapshot = { readable: true; identities: Set<string> } | { readable: false; error: string };
+
+/**
+ * Read the model registry once and build the set of nonempty authenticated
+ * identities. Shared by `filterAvailable`, `diagnosePools` and
+ * `applyModelToSession`, so all three judge membership from the same one
+ * snapshot rule.
+ */
+function authenticatedIdentitySet(models: ModelsQuery): RegistrySnapshot {
+  try {
+    const listed = models.list() ?? [];
+    const identities = new Set<string>();
+    for (const m of listed) {
+      const id = modelIdentity(m);
+      if (id.length > 0) identities.add(id);
+    }
+    return { readable: true, identities };
+  } catch (err) {
+    return { readable: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Diagnose every configured pool entry against the live registry. Read-only:
  * it never writes, never advances a counter and never acquires a lock. It is
  * the same membership rule the router uses, so `doctor` cannot disagree with a
- * spawn about whether an entry is usable.
+ * spawn about whether an entry is usable. One registry snapshot per
+ * invocation: every entry in the report is judged against the same listing.
  */
 export function diagnosePools(models: ModelsQuery | undefined): {
   registryReadable: boolean;
   registryNote: string;
   roles: PoolDiagnosis[];
 } {
+  const snapshot = models === undefined ? undefined : authenticatedIdentitySet(models);
   let registryReadable = false;
   let registryNote = "model registry unavailable";
-  if (models !== undefined) {
-    try {
-      const listed = models.list() ?? [];
+  if (snapshot !== undefined) {
+    if (snapshot.readable) {
       registryReadable = true;
       registryNote =
-        listed.length === 0
+        snapshot.identities.size === 0
           ? "registry readable, no authenticated models"
-          : `registry readable, ${listed.length} authenticated model(s)`;
-    } catch (err) {
-      registryNote = `registry read failed: ${err instanceof Error ? err.message : String(err)}`;
+          : `registry readable, ${snapshot.identities.size} authenticated model(s)`;
+    } else {
+      registryNote = `registry read failed: ${snapshot.error}`;
     }
   }
 
   const roles: PoolDiagnosis[] = [];
   for (const [role, pool] of Object.entries(activeConfig.pools)) {
     const entries: PoolEntryDiagnosis[] = pool.map((selector) => {
-      if (models === undefined) return { selector, eligible: false, reason: "registry unavailable" };
+      if (models === undefined || snapshot === undefined) {
+        return { selector, eligible: false, reason: "registry unavailable" };
+      }
+      if (!snapshot.readable) {
+        let resolved: ModelLike | undefined;
+        try {
+          resolved = models.resolve(selector);
+        } catch {
+          resolved = undefined;
+        }
+        if (resolved === undefined || resolved === null) {
+          return { selector, eligible: false, reason: "unresolved" };
+        }
+        if (modelIdentity(resolved).length === 0) {
+          return { selector, eligible: false, reason: "resolved without an identity" };
+        }
+        return { selector, eligible: false, reason: "registry unreadable" };
+      }
       let resolved: ModelLike | undefined;
       try {
         resolved = models.resolve(selector);
@@ -1205,8 +1457,7 @@ export function diagnosePools(models: ModelsQuery | undefined): {
       }
       const id = modelIdentity(resolved);
       if (id.length === 0) return { selector, eligible: false, reason: "resolved without an identity" };
-      const availability = filterAvailable([selector], models);
-      return availability.eligible[0] === true
+      return snapshot.identities.has(id)
         ? { selector, eligible: true, reason: `authenticated as ${id}` }
         : { selector, eligible: false, reason: `not authenticated (${id} is not in the registry list)` };
     });
@@ -1273,17 +1524,8 @@ interface PoolAvailability {
 function filterAvailable(selectors: string[], models: ModelsQuery | undefined): PoolAvailability {
   const eligible = selectors.map(() => false);
   if (models === undefined) return { eligible, count: 0, registryReadable: false };
-  let listed: ModelLike[];
-  try {
-    listed = models.list() ?? [];
-  } catch {
-    return { eligible, count: 0, registryReadable: false };
-  }
-  const identities = new Set<string>();
-  for (const m of listed) {
-    const id = modelIdentity(m);
-    if (id.length > 0) identities.add(id);
-  }
+  const snapshot = authenticatedIdentitySet(models);
+  if (!snapshot.readable) return { eligible, count: 0, registryReadable: false };
   let count = 0;
   for (let i = 0; i < selectors.length; i++) {
     const selector = selectors[i] as string;
@@ -1299,11 +1541,32 @@ function filterAvailable(selectors: string[], models: ModelsQuery | undefined): 
     // authenticated list. A selector that resolves but is not listed is not
     // authenticated, and a readable-but-empty list authenticates nothing; an
     // unreadable registry is the separate, fail-open case handled above.
-    if (id.length === 0 || !identities.has(id)) continue;
+    if (id.length === 0 || !snapshot.identities.has(id)) continue;
     eligible[i] = true;
     count++;
   }
   return { eligible, count, registryReadable: true };
+}
+
+/**
+ * First eligible pool index at or after `cursor`, wrapping modulo the pool
+ * length. Shared by the in-memory and the persisted cursor scans so both
+ * rotate identically; `undefined` when nothing is eligible (the cursor is not
+ * consumed).
+ */
+function findEligibleIndex(
+  poolLength: number,
+  eligible: readonly boolean[],
+  cursor: number,
+): number | undefined {
+  if (poolLength === 0) return undefined;
+  const start = cursor % poolLength;
+  for (let offset = 0; offset < poolLength; offset++) {
+    const index = (start + offset) % poolLength;
+    if (eligible[index] !== true) continue;
+    return index;
+  }
+  return undefined;
 }
 
 /**
@@ -1314,27 +1577,25 @@ function filterAvailable(selectors: string[], models: ModelsQuery | undefined): 
  */
 function pickRoundRobin(
   roleKey: string,
-  pool: string[],
-  eligible: boolean[],
+  pool: readonly string[],
+  eligible: readonly boolean[],
 ): { picked: string; index: number } | undefined {
-  const start = pool.length === 0 ? 0 : (counters[roleKey] ?? 0) % pool.length;
-  for (let offset = 0; offset < pool.length; offset++) {
-    const index = (start + offset) % pool.length;
-    if (eligible[index] !== true) continue;
-    counters[roleKey] = (index + 1) % pool.length;
-    return { picked: pool[index] as string, index };
-  }
-  return undefined;
+  const index = findEligibleIndex(pool.length, eligible, counters[roleKey] ?? 0);
+  if (index === undefined) return undefined;
+  counters[roleKey] = (index + 1) % pool.length;
+  return { picked: pool[index] as string, index };
 }
 
 /**
  * Pick for a role, honoring `persistCounters`. A persistence failure logs and
  * falls back to the in-memory counter (fail open) rather than aborting a spawn.
+ * Callers keep this inside the role's turn, so `advancePersisted`'s lock is
+ * never contended in-process.
  */
 async function pickForRole(
   pi: ExtensionApiLike,
   roleKey: string,
-  pool: string[],
+  pool: readonly string[],
   availability: PoolAvailability,
 ): Promise<{ picked: string; index: number; persisted: boolean } | undefined> {
   if (!activeConfig.persistCounters) {
@@ -1345,12 +1606,7 @@ async function pickForRole(
     const picked = await advancePersisted(roleKey, pool.length, availability.eligible, activeConfig.stateFile);
     if (picked === undefined) return undefined;
     if (picked.replacedLegacy) {
-      safeLog(
-        pi,
-        "warn",
-        `[model-pool] replaced a version-1 state file at ${activeConfig.stateFile} (cursor semantics changed); ` +
-          `the old file is kept at ${activeConfig.stateFile}.v1.bak and rotation continued from a fresh cursor`,
-      );
+      safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(activeConfig.stateFile, picked.backupOk)}`);
     }
     counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
     return { picked: pool[picked.index] as string, index: picked.index, persisted: true };
@@ -1368,6 +1624,45 @@ async function pickForRole(
 /** Human-readable routing note surfaced in the task UI. */
 function describePick(roleKey: string, picked: string, index: number, total: number): string {
   return `pool ${roleKey}[${index + 1}/${total}]: ${picked}`;
+}
+
+/**
+ * Promise the role's latest turn leaves behind, so the next same-role pick can
+ * serialize behind it instead of racing its cursor mirroring.
+ */
+const roleTurns: Record<string, Promise<void>> = Object.create(null);
+
+/**
+ * Run one asynchronous pick turn for a role, serialized behind the role's
+ * previous unfinished turn. Used for every persisted pick and every async
+ * startup pick; a caller whose work is synchronous only queues when a
+ * same-role tail already exists.
+ *
+ * The tail is registered before any host code runs (the turn body starts in a
+ * microtask), a follow-up turn proceeds past a rejected predecessor, and the
+ * tail deletes itself on completion — but only if a newer turn has not
+ * already replaced it.
+ */
+function enqueueRoleTurn<T>(roleKey: string, turn: () => Promise<T>): Promise<T> {
+  const previous = roleTurns[roleKey];
+  // A rejected predecessor must not stall the queue: proceed past it.
+  const predecessor = previous?.then(
+    () => undefined,
+    () => undefined,
+  );
+  // The turn body starts in a microtask, so the tail is registered before any
+  // host code runs — even when there was no previous turn to await.
+  const started = predecessor ? predecessor.then(() => turn()) : Promise.resolve().then(() => turn());
+  const tail: Promise<void> = started.then(
+    () => undefined,
+    () => undefined,
+  );
+  const removeTail = (): void => {
+    if (roleTurns[roleKey] === tail) delete roleTurns[roleKey];
+  };
+  void tail.then(removeTail, removeTail);
+  roleTurns[roleKey] = tail;
+  return started;
 }
 
 /**
@@ -1521,18 +1816,42 @@ function handleBeforeSubagentSpawn(
     }
 
     if (activeConfig.persistCounters) {
-      return pickForRole(pi, roleKey, pool, availability).then((pick) => {
-        if (pick === undefined) return undefined;
-        const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-        return { model: pick.picked, note };
+      // A persisted pick is one serialized turn: selection, persistence and the
+      // in-memory mirror cannot interleave with the main session's startup
+      // pick for the same role.
+      return enqueueRoleTurn(roleKey, async () => {
+        try {
+          const pick = await pickForRole(pi, roleKey, pool, availability);
+          if (pick === undefined) return undefined;
+          const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+          safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
+          return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+        } catch (err) {
+          // A rejected async dispatch fails open, like the sync path.
+          safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
+          return undefined;
+        }
       });
     }
-    const pick = pickRoundRobin(roleKey, pool, availability.eligible);
-    if (pick === undefined) return undefined;
-    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-    safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-    return { model: pick.picked, note };
+    if (roleTurns[roleKey] === undefined) {
+      const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+      if (pick === undefined) return undefined;
+      const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+      safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
+      return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+    }
+    return enqueueRoleTurn(roleKey, async () => {
+      try {
+        const pick = pickRoundRobin(roleKey, pool, availability.eligible);
+        if (pick === undefined) return undefined;
+        const note = describePick(roleKey, pick.picked, pick.index, pool.length);
+        safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
+        return { model: pick.picked, note } satisfies BeforeSubagentSpawnResult;
+      } catch (err) {
+        safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+      }
+    });
   } catch (err) {
     // Fail open: a router error must never break the task call.
     try {
@@ -1567,39 +1886,25 @@ async function handleSessionStart(
     const pool = activeConfig.pools[roleKey];
     if (pool === undefined || pool.length === 0) return;
 
+    // Persistence mode and state path are captured before the rotation turn is
+    // awaited, so a re-bind that lands mid-turn cannot quietly move this
+    // session's write target after the fact.
+    const persistAtStart = activeConfig.persistCounters;
+    const stateFileAtStart = activeConfig.stateFile;
+
     const availability = filterAvailable(pool, ctx.models);
     if (availability.count === 0) {
       safeLog(pi, "warn", `[model-pool] main session: empty pool for role=${roleKey} registryReadable=${availability.registryReadable}; leaving model unchanged`);
       return;
     }
-    const pick = await pickForRole(pi, roleKey, pool, availability);
-    if (pick === undefined) return;
-    const note = describePick(roleKey, pick.picked, pick.index, pool.length);
-    safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-    // Applying the pick is a separate step from choosing it, and shares the
-    // same host boundary the manual picker uses. A refusal, an unresolvable
-    // selector, or a host that keeps a different model is never reported as a
-    // successful rotation.
-    const result = await applyModelToSession(pi, ctx, pick.picked);
-    if (!result.ok) {
-      safeLog(pi, "warn", describeApplyFailure("main session", pick.picked, result));
-      return;
-    }
-    if (result.confirmed) {
-      safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
-      notifyUser(ctx, `model-pool: ${note}`, "info");
-    } else {
-      safeLog(
-        pi,
-        "warn",
-        `[model-pool] main session: requested ${result.id} but the host did not confirm the active model`,
-      );
-      notifyUser(
-        ctx,
-        `model-pool: requested ${result.id}, but the host did not confirm the active model`,
-        "warning",
-      );
-    }
+
+    // The whole startup pick — persisted selection, in-memory fallback,
+    // host acceptance and cursor mirroring — is one serialized turn, so a
+    // same-role dispatch that arrives while the host call is in flight cannot
+    // race the cursor.
+    await enqueueRoleTurn(roleKey, () =>
+      runMainSessionRotation(pi, ctx, roleKey, pool, availability.eligible, persistAtStart, stateFileAtStart),
+    );
   } catch (err) {
     try {
       safeLog(pi, "warn", `[model-pool] session_start error; leaving model unchanged: ${err instanceof Error ? err.message : String(err)}`);
@@ -1607,6 +1912,175 @@ async function handleSessionStart(
       // ignore
     }
   }
+}
+
+/**
+ * The in-memory portion of a main-session startup rotation: peek the next
+ * eligible slot, put it past the host, and only then consume it — so a
+ * refusal, unresolved lookup or observed mismatch leaves the cursor where it
+ * was. Runs inside the role's turn, so the cursor cannot advance underneath
+ * it.
+ */
+async function rotateMainInMemory(
+  pi: ExtensionApiLike,
+  ctx: ExtensionContextLike,
+  roleKey: string,
+  pool: readonly string[],
+  eligible: readonly boolean[],
+): Promise<void> {
+  const index = findEligibleIndex(pool.length, eligible, counters[roleKey] ?? 0);
+  if (index === undefined) return;
+  const slot = pool[index] as string;
+  const accepted = await acceptMainSessionModel(pi, ctx, roleKey, slot, index, pool.length);
+  if (!accepted) return; // Refusal consumes nothing.
+  counters[roleKey] = (index + 1) % pool.length;
+  safeLog(pi, "info", `[model-pool] main session role=${roleKey} picked=${slot} index=${index} total=${pool.length} persisted=false`);
+}
+
+/**
+ * The main-session startup rotation turn: persisted selection, host acceptance
+ * and durable commit under the state-file lock, with the in-memory fallback
+ * for read/lock failures inside the same turn. `persistAtStart` and
+ * `stateFileAtStart` were captured before the turn was enqueued, so a re-bind
+ * that lands while the host call is in flight cannot move the write target.
+ */
+async function runMainSessionRotation(
+  pi: ExtensionApiLike,
+  ctx: ExtensionContextLike,
+  roleKey: string,
+  pool: readonly string[],
+  eligible: readonly boolean[],
+  persistAtStart: boolean,
+  stateFileAtStart: string,
+): Promise<void> {
+  if (!persistAtStart) {
+    await rotateMainInMemory(pi, ctx, roleKey, pool, eligible);
+    return;
+  }
+  // Set only once the model is actually accepted, so a durable-write failure
+  // after acceptance is distinguishable from a read/lock failure before it.
+  let acceptedIndex = -1;
+  try {
+    const picked = await advancePersisted(
+      roleKey,
+      pool.length,
+      eligible,
+      stateFileAtStart,
+      async (index) => {
+        const ok = await acceptMainSessionModel(pi, ctx, roleKey, pool[index] as string, index, pool.length);
+        if (ok) acceptedIndex = index;
+        return ok;
+      },
+    );
+    if (picked === undefined) return; // nothing eligible, or the host refused: nothing consumed
+    if (picked.replacedLegacy) {
+      safeLog(pi, "warn", `[model-pool] ${describeLegacyReplacement(stateFileAtStart, picked.backupOk)}`);
+    }
+    counters[roleKey] = (picked.index + 1) % pool.length; // mirror for diagnostics/tests
+    safeLog(
+      pi,
+      "info",
+      `[model-pool] main session role=${roleKey} picked=${pool[picked.index] as string} index=${picked.index} total=${pool.length} persisted=true`,
+    );
+    return;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (acceptedIndex >= 0) {
+      // Durable commit failed after the host already accepted: never apply
+      // again. Mirror the accepted index in memory and say the pick is local.
+      counters[roleKey] = (acceptedIndex + 1) % pool.length;
+      safeLog(
+        pi,
+        "warn",
+        `[model-pool] main session: the host accepted ${pool[acceptedIndex] as string} but the pick could not be written to ${stateFileAtStart} (${message}); the rotation continues from the in-memory cursor only`,
+      );
+      return;
+    }
+    // Read/lock failure before acceptance: fall back to the in-memory cursor,
+    // which is not serialized across processes — never claim a durable pick.
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] persisted counter read/lock failed; using in-memory counters (this local fallback is not serialized across processes): ${message}`,
+    );
+    await rotateMainInMemory(pi, ctx, roleKey, pool, eligible);
+  }
+}
+
+/**
+ * The main-session startup acceptance closure: resolve, authenticate, apply
+ * and confirm one slot on the live session, then apply its explicit thinking
+ * request. All refusal/mismatch diagnostics are emitted here, so both the
+ * durable and the in-memory fallback path report identically. Returns whether
+ * the host accepted the model; a host throw is caught here and never retried.
+ */
+async function acceptMainSessionModel(
+  pi: ExtensionApiLike,
+  ctx: ExtensionContextLike,
+  roleKey: string,
+  slot: string,
+  index: number,
+  total: number,
+): Promise<boolean> {
+  const note = describePick(roleKey, slot, index, total);
+  let result: ApplyModelResult;
+  try {
+    result = await applyModelToSession(pi, ctx, slot);
+  } catch (err) {
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] main session: applying ${slot} threw; leaving model unchanged: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+  if (!result.ok) {
+    safeLog(pi, "warn", describeApplyFailure("main session", slot, result));
+    return false;
+  }
+  // The model is accepted, so it is consumed however the effort request ends.
+  const explicit = resolveExplicitThinking(ctx.models, slot, result.id);
+  if (explicit.autoExplicit === true) {
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] main session: ${slot} requests :auto, but the host's public thinking setter cannot select auto; keeping the model's default level`,
+    );
+  } else if (explicit.level !== undefined) {
+    if (typeof pi.setThinkingLevel === "function") {
+      try {
+        pi.setThinkingLevel(explicit.level);
+      } catch (err) {
+        safeLog(
+          pi,
+          "warn",
+          `[model-pool] main session: model applied, but the thinking level ${explicit.level} was not applied (the setter threw: ${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+    } else {
+      safeLog(
+        pi,
+        "warn",
+        `[model-pool] main session: model applied, but the host exposes no setThinkingLevel; thinking level ${explicit.level} was not applied`,
+      );
+    }
+  }
+  if (result.confirmed) {
+    safeLog(pi, "info", `[model-pool] main session applied ${result.id}`);
+    notifyUser(ctx, `model-pool: ${note}`, "info");
+  } else {
+    safeLog(
+      pi,
+      "warn",
+      `[model-pool] main session: requested ${result.id} but the host did not confirm the active model`,
+    );
+    notifyUser(
+      ctx,
+      `model-pool: requested ${result.id}, but the host did not confirm the active model`,
+      "warning",
+    );
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,15 +2136,12 @@ async function applyModelToSession(
     return { ok: false, code: "unresolved", detail: `could not resolve ${selector}` };
   }
 
-  let listed: ModelLike[];
-  try {
-    listed = models.list() ?? [];
-  } catch {
+  const snapshot = authenticatedIdentitySet(models);
+  if (!snapshot.readable) {
     return { ok: false, code: "registry-unreadable", detail: "the model registry could not be read" };
   }
   const id = modelIdentity(resolved);
-  const authenticated = new Set(listed.map(modelIdentity).filter((value) => value.length > 0));
-  if (!authenticated.has(id)) {
+  if (!snapshot.identities.has(id)) {
     return { ok: false, code: "unauthenticated", detail: `${selector} is not authenticated` };
   }
 
@@ -1994,6 +2465,9 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
 
   for (;;) {
     if (role.length === 0) {
+      // The role chooser is open — through Back, a cancelled dialog or a
+      // completed deletion — so the next role entry announces a fresh summary.
+      announcedRole = "";
       const pools = getPools();
       const items: { label: string; description?: string; value: string }[] = Object.keys(pools).map((name) => {
         const count = pools[name]?.length ?? 0;
@@ -2091,11 +2565,18 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
         if (!ok) continue;
       }
       const outcome = await savePoolEdit(role, remaining.length === 0 ? null : remaining, revision);
-      reportEditOutcome(
-        ctx,
-        outcome,
-        remaining.length === 0 ? `deleted @${role}` : `removed slot ${index + 1} from @${role}`,
-      );
+      if (
+        reportEditOutcome(
+          ctx,
+          outcome,
+          remaining.length === 0 ? `deleted @${role}` : `removed slot ${index + 1} from @${role}`,
+        ) &&
+        remaining.length === 0
+      ) {
+        // The last slot is gone, so the pool no longer exists; a declined
+        // confirmation or a failed save leaves the editor in the role.
+        role = "";
+      }
       continue;
     }
 
@@ -2124,8 +2605,11 @@ async function runPoolEditor(ctx: ExtensionContextLike, initialRole?: string): P
       );
       if (!ok) continue;
       const outcome = await savePoolEdit(role, null, revision);
-      reportEditOutcome(ctx, outcome, `deleted @${role}`);
-      role = "";
+      if (reportEditOutcome(ctx, outcome, `deleted @${role}`)) {
+        // A declined confirmation or a failed save leaves the editor in the
+        // role; a successful delete has no pool left to edit.
+        role = "";
+      }
       continue;
     }
   }
@@ -2311,7 +2795,7 @@ export default function modelPoolExtension(pi: ExtensionApiLike, options?: Model
     }
   } else {
     const loaded = loadConfigWithSource();
-    const signature = sourceSignature(loaded);
+    const signature = sourceSignature(loaded.source, loaded.fingerprint);
     if (signature !== loadedSignature) {
       configureLoaded(loaded);
       loadedSignature = signature;

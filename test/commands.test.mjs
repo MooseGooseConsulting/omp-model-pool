@@ -469,3 +469,206 @@ describe("/model-pool status, doctor, help", () => {
     assert.deepEqual(counters(), beforeCounters);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Self-contained host: the errors show the shared helper is broken, so these
+// tests build everything inline (per the assignment).
+// ---------------------------------------------------------------------------
+function parseSelector(spec) {
+  const slash = spec.indexOf("/");
+  return slash >= 0
+    ? { provider: spec.slice(0, slash), id: spec.slice(slash + 1) }
+    : { provider: "", id: spec };
+}
+
+function makeInlineHost(available, currentSpec) {
+  const parsed = (available ?? []).map(parseSelector);
+  let current = currentSpec !== undefined && currentSpec !== null ? parseSelector(currentSpec) : undefined;
+
+  const models = {
+    list: () => parsed.map((m) => ({ ...m })),
+    current: () => (current ? { ...current } : undefined),
+    resolve: (spec) => find(spec),
+    setCurrent: (spec) => {
+      current = spec === undefined || spec === null ? undefined : find(spec);
+    },
+  };
+
+  function find(spec) {
+    const text = String(spec).trim();
+    if (text.startsWith("@")) return undefined;
+    return (
+      parsed.find((m) => `${m.provider}/${m.id}` === text || m.id === text) ?? undefined
+    );
+  }
+
+  const calls = { select: [], input: [], confirm: [] };
+  const notified = [];
+  const logs = [];
+  const setModels = [];
+  const queues = { select: [], input: [], confirm: [] };
+
+  const ui = {
+    select: async (title, opts) => {
+      calls.select.push([title, opts]);
+      if (queues.select.length === 0) return undefined;
+      const next = queues.select.shift();
+      return typeof next === "function" ? next(title, opts) : next;
+    },
+    input: async (title, placeholder) => {
+      calls.input.push([title, placeholder]);
+      if (queues.input.length === 0) return undefined;
+      const next = queues.input.shift();
+      return typeof next === "function" ? next(title, placeholder) : next;
+    },
+    confirm: async (title, message) => {
+      calls.confirm.push([title, message]);
+      if (queues.confirm.length === 0) return false;
+      const next = queues.confirm.shift();
+      return typeof next === "function" ? next(title, message) : next;
+    },
+    notify: (message, type) => {
+      notified.push([message, type]);
+    },
+  };
+
+  const pi = {
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+    registerCommand: (name, opts) => {
+      command.registered = true;
+      command.name = name;
+      command.options = opts;
+    },
+    setModel: async (model) => {
+      setModels.push(model);
+      return true;
+    },
+    logger: {
+      info: (...args) => logs.push(["info", args.join(" ")]),
+      warn: (...args) => logs.push(["warn", args.join(" ")]),
+      error: (...args) => logs.push(["error", args.join(" ")]),
+      debug: (...args) => logs.push(["debug", args.join(" ")]),
+    },
+  };
+
+  const handlers = {};
+  const command = { registered: false, name: undefined, options: undefined };
+  return { pi, models, ui, calls, notified, logs, setModels, handlers, command, queues };
+}
+
+const savedEnvKeys = [
+  "OMP_MODEL_POOLS_JSON",
+  "OMP_MODEL_POOL_CONFIG",
+  "OMP_MODEL_POOL_STATE",
+  "PI_CODING_AGENT_DIR",
+  "OMP_PROFILE",
+  "PI_PROFILE",
+  "PI_CONFIG_DIR",
+];
+let inlineSavedEnv = {};
+let inlineTmpDirs = [];
+
+describe("doctor diagnosis (inline registries)", () => {
+  // These hooks belong to this block only: file-level hooks would clobber the
+  // shared `tmpDir` and env the earlier command suites depend on.
+  beforeEach(() => {
+    inlineSavedEnv = {};
+    for (const key of savedEnvKeys) {
+      inlineSavedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    inlineTmpDirs = [];
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cmd-"));
+  });
+
+  afterEach(() => {
+    for (const key of savedEnvKeys) {
+      if (inlineSavedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = inlineSavedEnv[key];
+    }
+    for (const dir of inlineTmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("judges every entry against one snapshot and reads the registry once", () => {
+    const host = makeInlineHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
+    let listCalls = 0;
+    const models = {
+      list: () => {
+        listCalls += 1;
+        return listCalls === 1
+          ? [{ provider: "p", id: "a" }, { provider: "p", id: "b" }, { provider: "p", id: "c" }]
+          : [];
+      },
+      current: () => undefined,
+      resolve: (spec) => (["p/a", "p/b", "p/c"].includes(String(spec)) ? { provider: "p", id: String(spec).slice(2) } : undefined),
+    };
+    const report = mod.diagnosePools(models);
+    assert.equal(listCalls, 1, "one registry listing per diagnosePools invocation");
+    const entries = report.roles.find((r) => r.role === "slow").entries;
+    assert.equal(entries.length, 3);
+    for (const entry of entries) {
+      assert.equal(entry.eligible, true, `${entry.selector}: ${entry.reason}`);
+    }
+  });
+
+  it("reports an unresolvable entry and an authenticated one in the same invocation", () => {
+    const host = makeInlineHost();
+    mod.default(host.pi, { pools: { slow: ["p/ghost", "p/a"] } });
+    const models = {
+      list: () => [{ provider: "p", id: "a" }],
+      current: () => undefined,
+      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
+    };
+    const report = mod.diagnosePools(models);
+    const entries = report.roles.find((r) => r.role === "slow").entries;
+    assert.equal(entries[0].eligible, false, "p/ghost never resolves");
+    assert.match(entries[0].reason, /unresolved/);
+    assert.equal(entries[1].eligible, true, "p/a is authenticated in the same pass");
+  });
+
+  it("labels entries of a throwing registry as unreadable, not unauthenticated", () => {
+    const host = makeInlineHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const report = mod.diagnosePools({
+      list: () => {
+        throw new Error("registry down");
+      },
+      current: () => undefined,
+      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
+    });
+    assert.equal(report.registryReadable, false);
+    const entries = report.roles.find((r) => r.role === "slow").entries;
+    assert.equal(entries[0].eligible, false);
+    assert.match(entries[0].reason, /registry unreadable/);
+    assert.ok(!entries[0].reason.includes("not authenticated"));
+  });
+
+  it("reports a readable but empty registry as unauthenticated", () => {
+    const host = makeInlineHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const models = {
+      list: () => [],
+      current: () => undefined,
+      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
+    };
+    const report = mod.diagnosePools(models);
+    assert.equal(report.registryReadable, true);
+    const entries = report.roles.find((r) => r.role === "slow").entries;
+    assert.equal(entries[0].eligible, false);
+    assert.match(entries[0].reason, /not authenticated/);
+  });
+
+  it("preserves absent-registry reporting when no registry is passed", () => {
+    const host = makeInlineHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const report = mod.diagnosePools(undefined);
+    assert.equal(report.registryReadable, false);
+    assert.match(report.registryNote, /unavailable/);
+    const entries = report.roles.find((r) => r.role === "slow").entries;
+    assert.equal(entries[0].eligible, false);
+    assert.match(entries[0].reason, /registry unavailable/);
+  });
+});

@@ -4,20 +4,72 @@
 // and these checks spend real provider turns, so they run only when asked
 // (`npm run test:live`).
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, constants, accessSync } from "node:fs";
 import path from "node:path";
 
-/** Resolve the OMP binary: explicit override, then PATH, then the bun global bin. */
+/**
+ * Resolve the OMP binary: explicit override, then PATH, then the bun global bin.
+ *
+ * OMP_BIN wins outright. A relative OMP_BIN containing a path separator is
+ * resolved against `process.cwd()` (the parent's cwd) with `path.resolve` so a
+ * later `cwd` change in `runOmp` cannot redirect it. A bare name like "omp" is
+ * returned as-is and resolved by the OS at spawn time.
+ *
+ * Never invokes cmd or a shell.
+ */
 export function resolveOmpBin() {
   const override = process.env.OMP_BIN;
-  if (override && override.length > 0) return override;
-  const bunBin = path.join(
-    process.env.USERPROFILE ?? process.env.HOME ?? "",
-    ".bun",
-    "bin",
-    process.platform === "win32" ? "omp.exe" : "omp",
-  );
-  return existsSync(bunBin) ? bunBin : "omp";
+  if (override && override.length > 0) {
+    if (override.includes("/") || override.includes("\\")) {
+      return path.isAbsolute(override) ? override : path.resolve(override);
+    }
+    return override;
+  }
+
+  // Scan PATH in order for an executable `omp` binary.
+  const exeName = process.platform === "win32" ? "omp.exe" : "omp";
+  const segments = splitPathList(process.env.PATH ?? process.env.Path ?? "");
+  for (const dir of segments) {
+    const candidate = path.join(dir, exeName);
+    if (isExecutableFile(candidate, exeName)) return candidate;
+  }
+
+  // Fall back to the Bun global install: ~/.bun/bin/omp[.exe].
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  if (home) {
+    const bunBin = path.join(home, ".bun", "bin", exeName);
+    if (isExecutableFile(bunBin, exeName)) return bunBin;
+  }
+
+  // Nothing found: return the bare name so the existing spawn-error path
+  // reports the diagnostic.
+  return "omp";
+}
+
+/**
+ * True only when `candidate` exists, is a regular file, and passes the
+ * executable-access check for this platform (X_OK on POSIX; existence on
+ * Windows, where there is no executable bit).
+ */
+function isExecutableFile(candidate, exeName) {
+  if (!existsSync(candidate)) return false;
+  if (process.platform !== "win32" && !exeName.endsWith(".exe")) {
+    try {
+      accessSync(candidate, constants.X_OK);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Split a PATH-style string into trimmed, non-empty entries. */
+function splitPathList(value) {
+  const sep = process.platform === "win32" ? ";" : ":";
+  return value
+    .split(sep)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 /**
