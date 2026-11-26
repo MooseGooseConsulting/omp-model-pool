@@ -19,7 +19,8 @@
   },
   "omp": {
     "extensions": [
-      "./src/index.ts"
+      "./src/index.ts",
+      "./src/mistral-live.ts"
     ]
   },
   "license": "MIT",
