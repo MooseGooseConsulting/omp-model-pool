@@ -277,7 +277,7 @@ function serveMistralRoster(req, res, state, apiKey) {
 function redactAuthorization(header) {
   if (typeof header !== "string") return undefined;
   const space = header.indexOf(" ");
-  const scheme = space === -1 ? header : header.slice(0, space);
+  const scheme = space === -1 ? "<redacted>" : header.slice(0, space);
   return scheme + ":len" + header.length;
 }
 
