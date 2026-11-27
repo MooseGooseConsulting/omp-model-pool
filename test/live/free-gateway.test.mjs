@@ -179,6 +179,9 @@ test("concrete free ids: shape, :free marker, no alias or URL or pin", () => {
   assert.equal(isConcreteFreeCatalogId("z-ai/glm-4.5-air:free"), true);
   assert.equal(isConcreteFreeCatalogId("meta-llama/llama-3.3-70b-instruct:free"), true);
   assert.equal(isConcreteFreeCatalogId("inclusionai/ling-3.2-flash:free"), true);
+  assert.equal(isConcreteFreeCatalogId("owner./model:free"), false);
+  assert.equal(isConcreteFreeCatalogId("owner/model.:free"), false);
+  assert.equal(isConcreteFreeCatalogId("owner.with.dot/model.1:free"), true);
 
   assert.equal(isConcreteFreeCatalogId("kilo-auto/free"), false); // routing alias, no :free
   assert.equal(isConcreteFreeCatalogId("reflection/beam-free"), false);
