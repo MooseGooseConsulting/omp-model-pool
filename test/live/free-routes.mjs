@@ -136,7 +136,7 @@ export function isConcreteFreeCatalogId(id) {
   // braces so a catalog change cannot quietly revive them).
   if (ROUTING_ALIAS_OWNERS.has(segments[0])) return false;
   return segments.every(
-    (segment) => segment.length >= 1 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment) && segment !== ".",
+    (segment) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment) && !segment.endsWith("."),
   );
 }
 
