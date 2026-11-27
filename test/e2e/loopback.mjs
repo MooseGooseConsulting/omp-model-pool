@@ -300,6 +300,8 @@ function serveChatCompletion(res, state, body, { provider }) {
     hasToolMessage,
     outcome: forced ? "error" : "ok",
     status: forced ? armed.status : 200,
+    // Wall-clock arrival: diagnostics only; assertions stay on shapes.
+    at: Date.now(),
   });
 
   if (forced) {

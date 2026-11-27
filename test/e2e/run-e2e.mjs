@@ -292,13 +292,17 @@ function capturesSince(index) {
 }
 
 function describeCaptures(window) {
+  const first = window[0]?.at;
   return window
     .map((c) => {
       const effort = c.reasoningEffort !== undefined ? `@effort=${String(c.reasoningEffort)}` : "";
       const tools = c.tools.length > 0 ? ` [${c.tools.join(",")}]` : "";
       // Injected fixture failures are part of the story a failing detail tells.
       const outcome = c.outcome === "error" ? ` !${String(c.status)}` : "";
-      return `${c.model}${effort}${tools}${outcome}`;
+      // +Nms since the first capture in the window: timing diagnostics for
+      // per-chain-step cost, never part of an assertion.
+      const at = first !== undefined && c.at !== undefined ? ` +${c.at - first}ms` : "";
+      return `${c.model}${effort}${tools}${outcome}${at}`;
     })
     .join("; ");
 }
@@ -464,19 +468,22 @@ async function caseInMemoryRotation() {
  * Re-enable the host's model fallback for one case, and only for that case.
  *
  * The shared overlay disables retry so every other case stays deterministic.
- * `maxRetries` is 0 deliberately: `enabled`/`modelFallback` must still drive
- * the real chain consult immediately, but the host's own same-model retry
- * loops must not stack extra attempts on top of the pool's failover — with
- * the loopback answering in milliseconds that is what keeps the whole chain
- * inside the 20-second per-process ceiling (PROCESS_TIMEOUT_MS is not raised).
- * The replacement is asserted: if the generated block changes shape, this case
- * fails loudly instead of silently testing nothing.
+ * Failure injection uses HTTP 400 hard errors deliberately: per OMP's retry
+ * policy, a non-retryable error consults the fallback chain immediately and
+ * never loops same-model retries, so every chain step costs one request and
+ * the whole walk stays far inside the 20-second per-process ceiling
+ * (PROCESS_TIMEOUT_MS is not raised). `maxRetries`/`baseDelayMs` are written
+ * as belt-and-braces intent — measured fact: numeric leaves in a `--config`
+ * overlay are dropped by omp/19.2.1 (`omp config get retry.maxRetries`
+ * reports the default even with them set), so they must not be load-bearing.
+ * The replacement is asserted: if the generated block changes shape, this
+ * case fails loudly instead of silently testing nothing.
  */
 function enableModelFallback(overlayFile, label) {
   const before = readFileSync(overlayFile, "utf8");
   const after = before.replace(
     "retry:\n  enabled: false\n  modelFallback: false\n  fallbackChains: {}",
-    "retry:\n  enabled: true\n  modelFallback: true\n  fallbackOn: any\n  maxRetries: 0\n  baseDelayMs: 50",
+    "retry:\n  enabled: true\n  modelFallback: true\n  fallbackOn: any\n  maxRetries: 1\n  baseDelayMs: 10",
   );
   expect(
     after !== before,
@@ -501,7 +508,7 @@ async function caseFailoverChain() {
       // satisfies with slow-b. Forced-failure counts are asserted as "one or
       // more": the host's own per-model retry count is its business, not this
       // suite's claim.
-      fixture.failModel("slow-a", { status: 500 });
+      fixture.failModel("slow-a", { status: 400 });
 
       const { before, captureStart } = await runDelegationParent(
         isolated,
@@ -537,7 +544,7 @@ async function caseFailoverChain() {
       // host's thinking-ladder probes are tool-less, so every non-pin
       // conversation request in the window is the child's attempt chain.
       const attempts = turnRequests(capturesSince(captureStart)).filter((c) => c.model !== "pin");
-      const forced = attempts.filter((c) => c.model === "slow-a" && c.outcome === "error" && c.status === 500);
+      const forced = attempts.filter((c) => c.model === "slow-a" && c.outcome === "error" && c.status === 400);
       expect(
         forced.length >= 1,
         "case 2d: one or more forced slow-a failures",
@@ -612,7 +619,7 @@ async function runBoundedScenario({ label, maxFallbacks, forced, childIdentity, 
   await inIsolatedRoot(`case-2e bounded ${label}`, caseOptions(poolConfig, { overlayExtra: BOUNDED_SLOW_OVERLAY }), async (isolated) => {
     writeModelsYaml(isolated.agentDir, fixture.port);
     enableModelFallback(isolated.overlayFile, step);
-    for (const model of forced) fixture.failModel(model, { status: 500 });
+    for (const model of forced) fixture.failModel(model, { status: 400 });
 
     const { before, captureStart } = await runDelegationParent(isolated, [{ name: "pool-review", agent: "reviewer" }], step);
     const fresh = newTranscripts(before, isolated);
@@ -662,7 +669,7 @@ async function runBoundedScenario({ label, maxFallbacks, forced, childIdentity, 
       describeCaptures(attempts),
     );
     for (const model of forced) {
-      const failures = attempts.filter((c) => c.model === model && c.outcome === "error" && c.status === 500);
+      const failures = attempts.filter((c) => c.model === model && c.outcome === "error" && c.status === 400);
       expect(
         failures.length >= 1,
         `${step}: one or more forced ${model} failures`,
@@ -775,11 +782,20 @@ async function runDelegationParent(isolated, plan, label) {
   const before = new Set(sessionPaths(isolated));
   const captureStart = fixture.captures.length;
   const rejectionStart = fixture.rejections.length;
-  await spawnOmp(
-    isolated,
-    [...withToolsValue(isolated.ompArgs, "task"), "--model", PIN_SELECTOR, "--thinking", "low", "-p", DELEGATE_PROMPT],
-    label,
-  );
+  try {
+    await spawnOmp(
+      isolated,
+      [...withToolsValue(isolated.ompArgs, "task"), "--model", PIN_SELECTOR, "--thinking", "low", "-p", DELEGATE_PROMPT],
+      label,
+    );
+  } catch (error) {
+    // On a timeout the partial wire window is the evidence: which chain step
+    // the host reached, and how long each step cost. Never part of pass logic.
+    if (error instanceof Error && "detail" in error) {
+      error.detail = `${error.detail}\nwire window: ${describeCaptures(capturesSince(captureStart)) || "(empty)"}`;
+    }
+    throw error;
+  }
   return { before, captureStart, rejectionStart };
 }
 
