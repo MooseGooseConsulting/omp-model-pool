@@ -86,7 +86,7 @@ function spawnGated(stateFile, models) {
     return error;
   };
   const serve = () => {
-    for (const w of pending.splice(0)) w();
+    for (const w of pending.splice(0)) w.pump();
   };
   child.on("message", (message) => {
     inbox.push(message);
@@ -98,18 +98,32 @@ function spawnGated(stateFile, models) {
     fail(`gated child exited (code ${code}, signal ${signal}) before the test finished`);
   });
   const wait = (type) => new Promise((resolve, reject) => {
+    // One entry per live wait: `pump` re-pumps the inbox on each serve,
+    // `reject` is what `fail` settles with. The entry object identity is
+    // what timeout cleanup splices out — never the closure inside it, so
+    // `indexOf` can never miss and splice(-1) can never drop another waiter.
+    const entry = {
+      pump: () => {},
+      reject: () => {},
+    };
     let timer;
     const next = () => {
       const message = inbox.shift();
       if (message === undefined) {
         timer = setTimeout(() => {
-          pending.splice(pending.indexOf(next), 1);
+          const at = pending.indexOf(entry);
+          if (at !== -1) pending.splice(at, 1);
           reject(new Error(`timed out after ${GATED_WAIT_MS}ms waiting for ${JSON.stringify(type)} from the gated child`));
         }, GATED_WAIT_MS);
-        pending.push(() => {
+        entry.pump = () => {
           clearTimeout(timer);
           next();
-        });
+        };
+        entry.reject = (error) => {
+          clearTimeout(timer);
+          reject(error);
+        };
+        pending.push(entry);
         return;
       }
       clearTimeout(timer);
