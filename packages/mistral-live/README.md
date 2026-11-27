@@ -42,6 +42,7 @@ mirror is not what it does.
 Mistral's plans carry two separate monthly allowances — Vibe and API — and the
 [subscription documentation](https://docs.mistral.ai/admin/billing-usage/subscriptions)
 states that usage through non-Mistral products such as third-party coding
+tools counts toward the **API** allowance. As of 2026-11 that split is not yet
 enforced: keys minted by the Vibe browser sign-in (`vibe --setup`)
 bill against the Vibe allowance no matter which client sends them — verified
 experimentally against `/v1/billing/budget`. Per Mistral's notice, third-party
