@@ -14,9 +14,5 @@
     "test:e2e": "node test/e2e/run-e2e.mjs",
     "test:live": "npm run build && node test/live/run-live.mjs"
   },
-  "license": "MIT",
-  "devDependencies": {
-    "@types/node": "^26.6.6",
-    "typescript": "^7.0.2"
-  }
+  "license": "MIT"
 }

@@ -19,7 +19,8 @@ at runtime with `HTTP 400 invalid_model`. This extension registers Mistral with
 ## Install
 
 ```bash
-omp install packages/mistral-live
+omp install ./packages/mistral-live
+# or, from the package dir: `omp install .`
 # or for a dev checkout
 omp --extension ./packages/mistral-live/src/mistral-live.ts
 ```
@@ -28,8 +29,13 @@ omp --extension ./packages/mistral-live/src/mistral-live.ts
 
 | Variable | Effect |
 |---|---|
-| `OMP_MISTRAL_LIVE_BASE_URL` | Point discovery at a Mistral-compatible endpoint |
+| `OMP_MISTRAL_LIVE_BASE_URL` | Replace the Mistral API base URL for **both** discovery and inference: `/v1/models` and every chat completion go to this host — it replaces the provider endpoint, not just the catalog source |
 | `OMP_MISTRAL_LIVE_DISABLE=1` | Disable discovery without uninstalling |
+
+`OMP_MISTRAL_LIVE_BASE_URL` overrides the endpoint OMP talks to, so inference
+requests are sent there too. Point it at a Mistral-compatible gateway only when
+that gateway serves both `/v1/models` and `/v1/chat/completions`; a catalog-only
+mirror is not what it does.
 
 ## Test
 

@@ -4,7 +4,9 @@
 // processes simultaneously so the shared state file's lock is contended for
 // real (an in-process Promise.all cannot do that: acquire, read-modify-write
 // and release are synchronous, so the first caller finishes before the second
-// starts).
+// starts). The gated startup cases go further: the first child is held inside
+// its own main-session pick — lock still held — while a second child actually
+// contends for the file, observed over IPC instead of sleeps.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
@@ -46,6 +48,114 @@ function runAsync(stateFile, models, persist, iterations = 1) {
   });
 }
 
+// How long a gated child may take to report before the test declares failure.
+// The happy path never waits this out: every step is synchronized by a real
+// IPC message, so the ceiling only bounds a hung or crashed child.
+const GATED_WAIT_MS = 15_000;
+
+const SEED_STATE = `${JSON.stringify({ version: 2, counters: { slow: 0 } })}\n`;
+
+function stderrNote(stderr) {
+  const note = stderr.trim();
+  return note.length > 0 ? `: ${note}` : "";
+}
+
+/**
+ * Spawn one gated child with its own IPC channel and return a handle whose
+ * steps synchronize on the messages the child actually sends — never on sleeps.
+ * A wait rejects when the child exits, dies, times out or sends an unexpected
+ * message (each with the captured stderr), so contention that silently never
+ * happens fails the test instead of passing it.
+ */
+function spawnGated(stateFile, models) {
+  const child = spawn(
+    process.execPath,
+    [helper, stateFile, "slow", models.join(","), "on", "1", "--main-rotation-gated"],
+    { cwd: root, stdio: ["ignore", "pipe", "pipe", "ipc"] },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const pending = [];
+  const inbox = [];
+  let exitState = null;
+  const fail = (why) => {
+    const error = new Error(`${why}${stderrNote(stderr)}`);
+    for (const w of pending.splice(0)) w.reject(error);
+    return error;
+  };
+  const serve = () => {
+    for (const w of pending.splice(0)) w();
+  };
+  child.on("message", (message) => {
+    inbox.push(message);
+    serve();
+  });
+  child.on("error", (err) => fail(`gated child failed to spawn: ${err.message}`));
+  child.on("exit", (code, signal) => {
+    exitState = { code, signal };
+    fail(`gated child exited (code ${code}, signal ${signal}) before the test finished`);
+  });
+  const wait = (type) => new Promise((resolve, reject) => {
+    let timer;
+    const next = () => {
+      const message = inbox.shift();
+      if (message === undefined) {
+        timer = setTimeout(() => {
+          pending.splice(pending.indexOf(next), 1);
+          reject(new Error(`timed out after ${GATED_WAIT_MS}ms waiting for ${JSON.stringify(type)} from the gated child`));
+        }, GATED_WAIT_MS);
+        pending.push(() => {
+          clearTimeout(timer);
+          next();
+        });
+        return;
+      }
+      clearTimeout(timer);
+      if (message === null || typeof message !== "object" || message.type !== type) {
+        reject(new Error(`gated child sent ${JSON.stringify(message)} while the test waited for ${JSON.stringify(type)}`));
+        return;
+      }
+      resolve(message);
+    };
+    next();
+  });
+  const release = (accept) => {
+    if (child.connected !== true) {
+      throw new Error(`gated child's IPC channel is closed; cannot release its pick with accept=${accept}`);
+    }
+    child.send({ type: "release", accept });
+  };
+  const exitPromise = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  const report = async () => {
+    const { code } = await exitPromise;
+    if (code !== 0) throw new Error(`gated child exited with code ${code}${stderrNote(stderr)}`);
+    const lines = stdout.trim().split("\n").filter((line) => line.trim().length > 0);
+    const last = lines[lines.length - 1];
+    if (last === undefined) throw new Error(`gated child printed no report${stderrNote(stderr)}`);
+    let parsed;
+    try {
+      parsed = JSON.parse(last);
+    } catch (err) {
+      throw new Error(`gated child report is not JSON (${err.message}): ${last}`);
+    }
+    if (
+      parsed === null || typeof parsed !== "object" ||
+      typeof parsed.pid !== "number" || typeof parsed.model !== "string" || !Array.isArray(parsed.picks)
+    ) {
+      throw new Error(`gated child report has an unexpected shape: ${last}`);
+    }
+    return parsed;
+  };
+  const kill = () => {
+    if (exitState === null) child.kill();
+  };
+  // `wait` resolves the full typed message; assertions care about its model payload.
+  const waitModel = async (type) => (await wait(type)).model;
+  return { child, wait, waitModel, release, report, kill };
+}
+
 describe("cross-process rotation (separate OS processes)", () => {
   it("continues 0→1→0 across three node processes when persistence is on", () => {
     const { file, cleanup } = tmpStateFile();
@@ -69,6 +179,71 @@ describe("cross-process rotation (separate OS processes)", () => {
       assert.deepEqual(picks, ["p/a", "p/a", "p/a"]);
       assert.equal(fs.existsSync(file), false);
     } finally {
+      cleanup();
+    }
+  });
+
+  it("holds the state-file lock through a gated pick: the contender waits, then receives B", async () => {
+    const { file, cleanup } = tmpStateFile();
+    fs.writeFileSync(file, SEED_STATE);
+    const one = spawnGated(file, ["p/a", "p/b"]);
+    try {
+      assert.equal(await one.waitModel("in-set-model"), "p/a", "child 1 reports its pending pick over IPC");
+      const seeded = fs.readFileSync(file, "utf8");
+      assert.equal(fs.existsSync(`${file}.lock`), true, "child 1 holds the state-file lock while the pick is pending");
+      const two = spawnGated(file, ["p/a", "p/b"]);
+      try {
+        // Child 2 must be refused the lock child 1 still holds before anything
+        // else happens: if the lock ever left child 1 early, child 2 would
+        // acquire it and enter its own setModel instead.
+        await two.wait("lock-contended");
+        assert.equal(fs.readFileSync(file, "utf8"), seeded, "state bytes are unchanged while the pick is pending");
+        one.release(true);
+        const oneReport = await one.report();
+        assert.equal(oneReport.model, "p/a", "child 1 starts on the accepted pick");
+        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1, "child 1's acceptance is durable before child 2 proceeds");
+        assert.equal(await two.waitModel("in-set-model"), "p/b", "child 2 receives B only after child 1 committed");
+        two.release(true);
+        const twoReport = await two.report();
+        assert.equal(twoReport.model, "p/b", "child 2 starts on the next slot");
+        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0, "final durable cursor after both picks");
+        assert.equal(new Set([oneReport.pid, twoReport.pid]).size, 2, "both picks are distinct OS processes");
+      } finally {
+        two.kill();
+      }
+    } finally {
+      one.kill();
+      cleanup();
+    }
+  });
+
+  it("holds the state-file lock through a gated pick: a refusal commits nothing, the contender still receives A", async () => {
+    const { file, cleanup } = tmpStateFile();
+    fs.writeFileSync(file, SEED_STATE);
+    const one = spawnGated(file, ["p/a", "p/b"]);
+    try {
+      assert.equal(await one.waitModel("in-set-model"), "p/a", "child 1 reports its pending pick over IPC");
+      const seeded = fs.readFileSync(file, "utf8");
+      assert.equal(fs.existsSync(`${file}.lock`), true, "child 1 holds the state-file lock while the pick is pending");
+      const two = spawnGated(file, ["p/a", "p/b"]);
+      try {
+        await two.wait("lock-contended");
+        assert.equal(fs.readFileSync(file, "utf8"), seeded, "state bytes are unchanged while the pick is pending");
+        one.release(false);
+        const oneReport = await one.report();
+        assert.equal(oneReport.model, "p/a", "child 1 attempted the pick the host refused");
+        assert.equal(fs.readFileSync(file, "utf8"), seeded, "a refusal commits nothing to the state file");
+        assert.equal(await two.waitModel("in-set-model"), "p/a", "child 2 receives A: the refused pick consumed nothing");
+        two.release(true);
+        const twoReport = await two.report();
+        assert.equal(twoReport.model, "p/a", "child 2 starts on the slot the refusal left open");
+        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 1, "final durable cursor after the refusal and child 2's pick");
+        assert.equal(new Set([oneReport.pid, twoReport.pid]).size, 2, "both picks are distinct OS processes");
+      } finally {
+        two.kill();
+      }
+    } finally {
+      one.kill();
       cleanup();
     }
   });

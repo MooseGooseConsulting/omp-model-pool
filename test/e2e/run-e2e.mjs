@@ -1,4 +1,4 @@
-// Deterministic real-OMP E2E: three loopback-fixture cases, no credentials.
+// Deterministic real-OMP E2E: loopback-fixture cases, no credentials.
 //
 // Every step runs a REAL `omp` process against a REAL loopback HTTP server
 // (test/e2e/loopback.mjs). There is no fake host and no fallback: a missing
@@ -44,6 +44,13 @@ const PROVIDER = FIXTURE_PROVIDER;
 const PIN_SELECTOR = `${PROVIDER}/pin`;
 const MAIN_POOL = [`${PROVIDER}/b:high`, `${PROVIDER}/a`];
 const SLOW_POOL = [`${PROVIDER}/slow-a:high`, `${PROVIDER}/slow-b`];
+/**
+ * Three-entry slow pool for the bounded-chain coverage. The third entry reuses
+ * the main pool's undecorated `a` row (never `pin`, which is the parent's own
+ * model), so a chain that oversteps its cap is caught by a served wire request
+ * for a model that should have been unreachable instead of by a hang.
+ */
+const SLOW_POOL_THREE = [`${PROVIDER}/slow-a:high`, `${PROVIDER}/slow-b`, `${PROVIDER}/a`];
 const PROMPT = "Reply with exactly: OK";
 const DELEGATE_PROMPT = "E2E_DELEGATE";
 
@@ -286,7 +293,13 @@ function capturesSince(index) {
 
 function describeCaptures(window) {
   return window
-    .map((c) => `${c.model}${c.reasoningEffort !== undefined ? `@effort=${String(c.reasoningEffort)}` : ""}${c.tools.length > 0 ? ` [${c.tools.join(",")}]` : ""}`)
+    .map((c) => {
+      const effort = c.reasoningEffort !== undefined ? `@effort=${String(c.reasoningEffort)}` : "";
+      const tools = c.tools.length > 0 ? ` [${c.tools.join(",")}]` : "";
+      // Injected fixture failures are part of the story a failing detail tells.
+      const outcome = c.outcome === "error" ? ` !${String(c.status)}` : "";
+      return `${c.model}${effort}${tools}${outcome}`;
+    })
     .join("; ");
 }
 
@@ -451,18 +464,23 @@ async function caseInMemoryRotation() {
  * Re-enable the host's model fallback for one case, and only for that case.
  *
  * The shared overlay disables retry so every other case stays deterministic.
+ * `maxRetries` is 0 deliberately: `enabled`/`modelFallback` must still drive
+ * the real chain consult immediately, but the host's own same-model retry
+ * loops must not stack extra attempts on top of the pool's failover — with
+ * the loopback answering in milliseconds that is what keeps the whole chain
+ * inside the 20-second per-process ceiling (PROCESS_TIMEOUT_MS is not raised).
  * The replacement is asserted: if the generated block changes shape, this case
  * fails loudly instead of silently testing nothing.
  */
-function enableModelFallback(overlayFile) {
+function enableModelFallback(overlayFile, label) {
   const before = readFileSync(overlayFile, "utf8");
   const after = before.replace(
     "retry:\n  enabled: false\n  modelFallback: false\n  fallbackChains: {}",
-    "retry:\n  enabled: true\n  modelFallback: true\n  fallbackOn: any\n  maxRetries: 2\n  baseDelayMs: 50",
+    "retry:\n  enabled: true\n  modelFallback: true\n  fallbackOn: any\n  maxRetries: 0\n  baseDelayMs: 50",
   );
   expect(
     after !== before,
-    "case 2d: overlay retry block patched",
+    `${label}: overlay retry block patched`,
     "retry block replaced with modelFallback enabled",
   );
   writeFileSync(overlayFile, after, "utf8");
@@ -476,9 +494,13 @@ async function caseFailoverChain() {
     async (isolated) => {
       writeModelsYaml(isolated.agentDir, fixture.port);
       writeScoutAgent(isolated.agentDir);
-      enableModelFallback(isolated.overlayFile);
+      enableModelFallback(isolated.overlayFile, "case 2d");
       // Every attempt on the first pool entry fails: only a failover to
-      // slow-b can produce a completed child.
+      // slow-b can produce a completed child. maxFallbacks stays unset, so
+      // the extension default (1) bounds the chain — which the two-entry pool
+      // satisfies with slow-b. Forced-failure counts are asserted as "one or
+      // more": the host's own per-model retry count is its business, not this
+      // suite's claim.
       fixture.failModel("slow-a", { status: 500 });
 
       const { before, captureStart } = await runDelegationParent(
@@ -495,29 +517,252 @@ async function caseFailoverChain() {
 
       const child = readTranscript(children[0]);
       expect(
-        child.assistantModels.length > 0 && child.assistantModels.at(-1) === PROVIDER + "/slow-b",
-        "case 2d: child completed on the next pool entry",
+        child.header.parentSession === parents[0],
+        "case 2d: child parentSession points at the new parent",
+        `${path.basename(String(child.header.parentSession))} vs parent ${path.basename(parents[0])}`,
+      );
+      // A completed failover records the forced error entries too, so the
+      // history need not be uniform — but its LAST identity must be the
+      // successful fallback model. The ordered wire window below already
+      // proves exactly one success and no later child model, so a passing
+      // error-bearing entry cannot sneak past this assertion.
+      const lastChildModel = child.assistantModels.at(-1);
+      expect(
+        child.assistantModels.length > 0 && lastChildModel === `${PROVIDER}/slow-b`,
+        "case 2d: child history ends on the successful fallback model",
         child.assistantModels.join(", ") || "(none)",
       );
+
+      // The parent always rides `pin` (main-session rotation is off) and the
+      // host's thinking-ladder probes are tool-less, so every non-pin
+      // conversation request in the window is the child's attempt chain.
+      const attempts = turnRequests(capturesSince(captureStart)).filter((c) => c.model !== "pin");
+      const forced = attempts.filter((c) => c.model === "slow-a" && c.outcome === "error" && c.status === 500);
+      expect(
+        forced.length >= 1,
+        "case 2d: one or more forced slow-a failures",
+        `${forced.length} forced failure(s); window: ${describeCaptures(attempts)}`,
+      );
+      const served = attempts.filter((c) => c.model === "slow-b" && c.outcome === "ok");
+      expect(
+        served.length === 1,
+        "case 2d: exactly one successful slow-b child request",
+        describeCaptures(attempts),
+      );
+      const last = attempts.at(-1);
+      expect(
+        last !== undefined && last.model === "slow-b" && last.outcome === "ok",
+        "case 2d: no later child model after the fallback success",
+        describeCaptures(attempts),
+      );
+
       // A model identity alone could be an error entry: require the task to have
       // actually completed with the expected output, like the rotation case does.
       const done = toolResultTexts(parents[0]).filter(
         (t) => TASK_RESULT_DONE.test(t) && TASK_OUTPUT_OK.test(t),
       );
       expect(done.length === 1, "case 2d: the delegated task completed", `${done.length} completed task-result envelope(s)`);
-      const turns = turnRequests(capturesSince(captureStart));
+      const lastAssistant = assistantTurns(parents[0]).slice(-1)[0];
       expect(
-        turns.some((c) => c.model === "slow-a"),
-        "case 2d: the first pool entry was attempted",
-        describeCaptures(turns),
+        lastAssistant?.content === "OK",
+        "case 2d: parent terminal OK",
+        `last assistant content: ${JSON.stringify(lastAssistant?.content ?? null)}`,
       );
       expect(
-        turns.some((c) => c.model === "slow-b"),
-        "case 2d: the following pool entry served the turn",
-        describeCaptures(turns),
+        readCursor(isolated.stateFile, "slow") === 1,
+        "case 2d: durable slow cursor is 1",
+        `state cursor: ${String(readCursor(isolated.stateFile, "slow"))}`,
       );
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Case 2e — bounded failover chains over a three-entry slow pool.
+//
+// Case 2d proves failover happens; this one proves the pool's `maxFallbacks`
+// cap bounds it. The third entry reuses the main pool's undecorated `a` row, so
+// a chain that oversteps its cap shows up as a served wire request for a model
+// that should have been unreachable instead of as a hang. Each scenario gets
+// its own isolated root, so `maxFallbacks` rides that root's
+// OMP_MODEL_POOLS_JSON and the per-case failure reset still applies as before.
+// ---------------------------------------------------------------------------
+
+/** The slow-role overlay every bounded scenario shares. */
+const BOUNDED_SLOW_OVERLAY = ["modelRoles:", `  slow: ${PIN_SELECTOR}`];
+
+/**
+ * One bounded-chain scenario: a parent that delegates once to the three-entry
+ * slow pool with `maxFallbacks` (undefined = extension default) and every model
+ * in `forced` failing every attempt with the injected status.
+ *
+ * Shared invariants, independent of the cap: exactly one parent and one child
+ * transcript, the child's `parentSession` is the new parent file, the chain
+ * starts at the picked slot, each forced model fails at least once (never an
+ * exact count — the host's per-model retry budget is not this suite's claim),
+ * the parent still finishes with a terminal OK, and the pick consumed exactly
+ * one durable slot. Scenario-specific wire claims and the child's final model
+ * identity come in via `assertWindow` and `childIdentity` (undefined when the
+ * child is expected to fail and so has no successful identity to assert).
+ */
+async function runBoundedScenario({ label, maxFallbacks, forced, childIdentity, expectCompleted = true, assertWindow }) {
+  const step = `case 2e ${label}`;
+  const poolConfig = { slow: SLOW_POOL_THREE, enableMainSessionRotation: false, persistCounters: true };
+  if (maxFallbacks !== undefined) poolConfig.maxFallbacks = maxFallbacks;
+  await inIsolatedRoot(`case-2e bounded ${label}`, caseOptions(poolConfig, { overlayExtra: BOUNDED_SLOW_OVERLAY }), async (isolated) => {
+    writeModelsYaml(isolated.agentDir, fixture.port);
+    enableModelFallback(isolated.overlayFile, step);
+    for (const model of forced) fixture.failModel(model, { status: 500 });
+
+    const { before, captureStart } = await runDelegationParent(isolated, [{ name: "pool-review", agent: "reviewer" }], step);
+    const fresh = newTranscripts(before, isolated);
+    const parents = fresh.filter((f) => readTranscript(f).header?.parentSession === undefined);
+    const children = fresh.filter((f) => readTranscript(f).header?.parentSession !== undefined);
+    expect(parents.length === 1, `${step}: exactly one new parent transcript`, `${parents.length}: ${parents.join(", ")}`);
+    if (parents.length !== 1) return;
+    if (expectCompleted) {
+      // A child that completes always leaves a transcript (established by the
+      // delegation case); a child that fails on every model may legitimately
+      // leave none, so only the failed-spawn scenario tolerates zero.
+      expect(children.length === 1, `${step}: exactly one new child transcript`, `${children.length}: ${children.join(", ")}`);
+    } else {
+      expect(
+        children.length <= 1,
+        `${step}: at most one child transcript for the failed spawn`,
+        `${children.length}: ${children.join(", ")}`,
+      );
+    }
+    if (children.length === 1) {
+      const child = readTranscript(children[0]);
+      expect(
+        child.header.parentSession === parents[0],
+        `${step}: child parentSession points at the new parent`,
+        `${path.basename(String(child.header.parentSession))} vs parent ${path.basename(parents[0])}`,
+      );
+      if (childIdentity !== undefined) {
+        // Error entries may sit earlier in the history; only the LAST
+        // identity must be the expected successful model.
+        const lastChildModel = child.assistantModels.at(-1);
+        expect(
+          child.assistantModels.length > 0 && lastChildModel === `${PROVIDER}/${childIdentity}`,
+          `${step}: child history ends on ${PROVIDER}/${childIdentity}`,
+          child.assistantModels.join(", ") || "(none)",
+        );
+      }
+    }
+
+    // The parent always rides `pin` (main-session rotation is off) and the
+    // host's thinking-ladder probes are tool-less, so every non-pin
+    // conversation request in the window is the child's attempt chain.
+    const attempts = turnRequests(capturesSince(captureStart)).filter((c) => c.model !== "pin");
+    expect(attempts.length > 0, `${step}: the child reached the fixture`, "(no child wire request)");
+    expect(
+      attempts[0]?.model === "slow-a",
+      `${step}: the chain started at the picked slot slow-a`,
+      describeCaptures(attempts),
+    );
+    for (const model of forced) {
+      const failures = attempts.filter((c) => c.model === model && c.outcome === "error" && c.status === 500);
+      expect(
+        failures.length >= 1,
+        `${step}: one or more forced ${model} failures`,
+        `${failures.length} forced failure(s); window: ${describeCaptures(attempts)}`,
+      );
+    }
+    assertWindow(attempts, step);
+
+    const done = toolResultTexts(parents[0]).filter((t) => TASK_RESULT_DONE.test(t) && TASK_OUTPUT_OK.test(t));
+    expect(
+      done.length === (expectCompleted ? 1 : 0),
+      `${step}: ${expectCompleted ? "one completed task-result envelope" : "no completed task result without a fallback"}`,
+      `${done.length} completed task-result envelope(s)`,
+    );
+    const lastAssistant = assistantTurns(parents[0]).slice(-1)[0];
+    expect(
+      lastAssistant?.content === "OK",
+      `${step}: parent terminal OK`,
+      `last assistant content: ${JSON.stringify(lastAssistant?.content ?? null)}`,
+    );
+    expect(
+      readCursor(isolated.stateFile, "slow") === 1,
+      `${step}: durable slow cursor is 1`,
+      `state cursor: ${String(readCursor(isolated.stateFile, "slow"))}`,
+    );
+  });
+}
+
+async function caseBoundedChain() {
+  // (a) Extension default (maxFallbacks unset → 1): after the picked slot
+  // fails, exactly one fallback runs and the third entry is never attempted.
+  await runBoundedScenario({
+    label: "default cap",
+    forced: ["slow-a"],
+    childIdentity: "slow-b",
+    assertWindow(attempts, step) {
+      expect(
+        attempts.every((c) => c.model === "slow-a" || c.model === "slow-b"),
+        `${step}: the chain stayed inside the first two entries`,
+        describeCaptures(attempts),
+      );
+      expect(
+        !attempts.some((c) => c.model === "a"),
+        `${step}: default maxFallbacks 1 never reaches the third entry`,
+        describeCaptures(attempts),
+      );
+      const served = attempts.filter((c) => c.model === "slow-b" && c.outcome === "ok");
+      expect(
+        served.length === 1,
+        `${step}: exactly one successful slow-b child request`,
+        describeCaptures(attempts),
+      );
+      const last = attempts.at(-1);
+      expect(
+        last !== undefined && last.model === "slow-b" && last.outcome === "ok",
+        `${step}: no child request after the fallback success`,
+        describeCaptures(attempts),
+      );
+    },
+  });
+
+  // (b) maxFallbacks 0 restores the old single-model return: no second entry,
+  // the child fails after the host's own retries, the parent still finishes,
+  // and the failed pick consumed exactly one slot — not two.
+  await runBoundedScenario({
+    label: "cap 0",
+    maxFallbacks: 0,
+    forced: ["slow-a"],
+    expectCompleted: false,
+    assertWindow(attempts, step) {
+      expect(
+        attempts.every((c) => c.model === "slow-a" && c.outcome === "error"),
+        `${step}: maxFallbacks 0 never reaches a second entry`,
+        describeCaptures(attempts),
+      );
+    },
+  });
+
+  // (c) maxFallbacks 2: the chain crosses the injected failures on the first
+  // two entries and finishes on the third.
+  await runBoundedScenario({
+    label: "cap 2",
+    maxFallbacks: 2,
+    forced: ["slow-a", "slow-b"],
+    childIdentity: "a",
+    assertWindow(attempts, step) {
+      const served = attempts.filter((c) => c.model === "a" && c.outcome === "ok");
+      expect(
+        served.length === 1,
+        `${step}: maxFallbacks 2 reached the third entry exactly once`,
+        describeCaptures(attempts),
+      );
+      const last = attempts.at(-1);
+      expect(
+        last !== undefined && last.model === "a" && last.outcome === "ok",
+        `${step}: no child request after the third entry`,
+        describeCaptures(attempts),
+      );
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1192,7 @@ async function main() {
     await caseInMemoryRotation();
     await caseDelegation();
     await caseFailoverChain();
+    await caseBoundedChain();
     await caseFailOpenAndStrict();
     await caseMistralRefresh();
 

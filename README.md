@@ -16,8 +16,9 @@ in its own package README.
 Install each package you want:
 
 ```bash
-omp install packages/model-pool
-omp install packages/mistral-live
+omp install ./packages/model-pool
+omp install ./packages/mistral-live
+# or, from a package dir in a dev checkout: `omp install .`
 # or, for a dev checkout:
 omp --extension ./packages/model-pool/src/index.ts
 ```
@@ -50,9 +51,10 @@ retired static bundled IDs that fail at runtime with `HTTP 400 invalid_model`.
   `apiKey`.
 - **Fail-safe cache fallback:** network/auth/schema failures throw so OMP keeps
   its last cached catalog rather than emptying Mistral models.
-- **Controls:** set `OMP_MISTRAL_LIVE_BASE_URL` for a custom Mistral-compatible
-  endpoint, or `OMP_MISTRAL_LIVE_DISABLE=1` to disable the extension without
-  uninstalling the package.
+- **Controls:** set `OMP_MISTRAL_LIVE_BASE_URL` to replace the Mistral base
+  URL for discovery **and** chat inference, or `OMP_MISTRAL_LIVE_DISABLE=1` to
+  disable the extension without uninstalling the package. Details in the
+  package README.
 
 ## Configure
 
@@ -70,7 +72,8 @@ Only roles you configure cycle.
   "mainSessionRole": "default",      // role rotated by session_start (bare name)
   "enableMainSessionRotation": true, // false keeps subagent cycling only
   "strict": false,                   // true | ["slow"] blocks empty-pool spawns
-  "persistCounters": false           // true shares the cycle across OMP processes
+  "persistCounters": false,          // true shares the cycle across OMP processes
+  "maxFallbacks": 1                  // nonnegative safe integer: picked slot + N more eligible entries (0 = picked slot only); other values normalize to 1
 }
 ```
 
@@ -114,7 +117,7 @@ its agent directory with `omp config init-xdg`.
 ```bash
 export OMP_MODEL_POOL_CONFIG=./model-pool.json
 export OMP_MODEL_POOLS_JSON='{"slow":["anthropic/claude-haiku-4-5","openai/gpt-5-mini"]}'
-omp --extension ./omp-model-pool
+omp --extension ./packages/model-pool/src/index.ts
 ```
 
 ### First-run setup
@@ -242,24 +245,99 @@ unreadable registry from a readable empty one, and performs no writes.
   gets a compatibility warning instead of failing. Commands that mutate state
   require an interactive main session; non-interactive contexts never open
   dialogs or mutate configuration.
-- A spawn returns the **whole rotation**, not one model: the picked slot first,
-  then the rest of the eligible pool in cursor order (wrapping, duplicates
-  folded, unavailable entries dropped). `before_subagent_spawn` treats a
-  returned list as the child's attempt order, so a provider error on the chosen
-  model retries the next pool entry instead of the same one. The counter still
-  advances exactly once per child, because the event fires once per spawn. A
-  pool with a single usable entry returns a bare string.
-- Core fallback is preserved: the returned list keeps role identity, so
-  `retry.fallbackChains` / prewalk / advisor semantics still apply on top of the
-  pool chain. `retry.enabled` and `retry.modelFallback` decide whether the host
-  retries at all; with retries off, the chain is accepted but never used. If the
-  requirement ever becomes "model must never change mid-instance", verify
-  `retry.fallbackChains` + prewalk handoff behavior first — that is a separate
-  follow-up, not this extension.
-- There is no cap on pool size: the cursor is an index modulo the pool length and
-  every entry is preserved. Practical limits come from the host — each spawn
-  offers the pool as its retry chain, so a very large pool buys longer failover
-  at the cost of each retry attempt.
+- A spawn returns a **bounded chain**, not the whole pool: the picked slot
+  first, then up to `maxFallbacks` further eligible entries in cursor order
+  (wrapping, exact duplicate selectors dropped, unavailable entries skipped) —
+  see [Bounded failover](#bounded-failover-maxfallbacks).
+  `before_subagent_spawn` treats a returned list as the child's attempt order,
+  so a provider error on the chosen model retries the next entry instead of the
+  same one. The counter still advances exactly once per child, because the
+  event fires once per spawn. A pool with a single usable entry returns a bare
+  string.
+- Composition with the host's inherited chains is decided by OMP after it
+  expands and resolves the returned selectors and deduplicates the candidates,
+  not by the shape of the returned array: `maxFallbacks` caps returned pool
+  slots, never host attempts, and `maxFallbacks: 0` does not by itself
+  preserve the inherited `retry.fallbackChains` — see
+  [Bounded failover](#bounded-failover-maxfallbacks) for the exact contract.
+  `retry.enabled` and `retry.modelFallback` still decide whether the host
+  retries at all; with retries off, a returned chain is accepted but never
+  used. If the requirement ever becomes "model must never change
+  mid-instance", verify the child-specific chain handoff first — it replaces,
+  rather than merges with, the inherited chain.
+- There is no cap on configured pool size: the cursor is an index modulo the
+  pool length and every entry is preserved. The returned chain, however, is
+  bounded by `maxFallbacks`, so a very large pool buys failover breadth only up
+  to that bound — each additional fallback is another host retry attempt, with
+  its own latency and cost implications (see
+  [Bounded failover](#bounded-failover-maxfallbacks)).
+
+### Bounded failover (`maxFallbacks`)
+
+The chain a spawn returns is the picked slot plus up to `maxFallbacks` further
+eligible entries after it, in cursor order. Default `1`: one additional entry,
+so a provider error on the picked model falls over exactly once more instead of
+retrying the same model.
+
+- `0` — only the picked slot is returned.
+- any larger nonnegative safe integer — the picked slot plus that many more
+  eligible entries, bounded by what the pool has available.
+- any other value — negative, fractional, non-numeric, `NaN`, or beyond the
+  safe-integer range — normalizes to the default `1`.
+
+Exact chain semantics:
+
+- Order follows the cursor: the picked slot is the cursor's current pick, and
+  further entries are taken in configured order after it, wrapping.
+- Exact duplicate selector strings are deduped; the first occurrence wins.
+- Returned selectors are the raw configured strings, verbatim — never
+  rewritten.
+- Unavailable (unresolvable or unauthenticated) entries are skipped without
+  re-phasing the rotation; they consume no cursor step.
+- Host per-model retries (`retry.*` attempt counts) are separate: the returned
+  chain only orders candidates, and the retry counts are the host's own policy,
+  counted independently of the chain length.
+
+Composition with the host's inherited chains:
+
+- `maxFallbacks` caps the **returned pool slots**, not host attempts: the
+  extension returns at most `1 + maxFallbacks` configured slots, and how many
+  attempts each candidate receives is the host's own `retry.*` policy.
+- OMP decides what those slots become only after expanding and resolving them
+  (a comma-separated slot becomes several alternatives, aliases resolve to
+  concrete models) and deduplicating the resulting candidates. When more than
+  one candidate remains, OMP v19.2.1 installs them as the child's own
+  failover chain and does **not** append the inherited
+  `retry.fallbackChains`; when a single candidate remains, the inherited
+  role/default `retry.fallbackChains` may still apply.
+- So a comma-separated slot can expand into a child-specific chain even with
+  `maxFallbacks: 0`, and a multi-slot return can collapse to a single
+  candidate through aliases or dedupe: `maxFallbacks: 0` does not by itself
+  preserve the inherited chain, and a multi-slot return does not by itself
+  replace it. `retry.enabled` and `retry.modelFallback` still decide whether
+  the host retries at all; with retries off, a returned chain is accepted but
+  never used.
+
+Config shape and the option name:
+
+- In the nested shape (`pools` wrapper) `maxFallbacks` sits beside `pools`, so
+  no role name can collide with it.
+- In the flat shape a **scalar** `maxFallbacks` is the option; an
+  **array-valued** `maxFallbacks` remains a legacy role pool — a role
+  literally named `maxFallbacks` from the old flat role-map format — and does
+  not configure the cap.
+- The flat editor's reserved-key protection still applies: the editor refuses
+  to create, edit, or delete a role named `maxFallbacks` (or any other
+  top-level option key) in a flat file, so an accepted edit can never
+  overwrite the option key or silently drop that legacy role.
+
+Implications: every additional fallback is another host retry attempt — more
+resilience against a single provider outage, but more latency before a turn
+fails over, and later attempts run on different providers with their own cost
+and latency. Cost grows with the chain only when an attempt actually fails; a
+successful turn costs exactly one request. Switching providers mid-chain also
+means the fallback inherits the new provider's context handling, not the failed
+model's.
 
 ## Counter semantics
 
@@ -331,7 +409,7 @@ unreadable registry from a readable empty one, and performs no writes.
 
 ## Validate
 
-1. `omp --extension ./omp-model-pool`; check `/extensions`.
+1. `omp install ./packages/model-pool`; check `/extensions`.
 2. Pool of 2–3 authenticated models on `slow`; dispatch the same agent
    (`reviewer` → `@slow`) 4+ times; task rows show rotating model + note.
 3. Dispatch different agents sharing `@slow`; the shared counter advances.
@@ -449,10 +527,9 @@ free-only:
   boolean and null pricing are unknown, never free. IDs must be concrete
   `owner/model:free` entries — routing aliases and upstream pins are rejected;
 - credentials come from `KILO_API_KEY` / `OPENROUTER_API_KEY` /
-  `MISTRAL_API_KEY` when exported, otherwise from the same Doppler secrets OMP
-  itself uses (`doppler secrets get KILO_GATEWAY_API --project ai-automation
-  --config dev --plain`). A key is never printed, never written to disk and
-  never placed in the sandbox environment;
+  `MISTRAL_API_KEY` when exported. Credentials are environment-only: they are
+  never extracted from OMP's configuration or profile, a key is never printed,
+  never written to disk and never placed in the sandbox environment;
 - a test-only loopback relay admits only the allowlisted chat path and exact
   model id, forwards only `messages`, `model`, `stream` and a bounded
   `max_tokens` with the real bearer, and never retries; the sandbox knows only

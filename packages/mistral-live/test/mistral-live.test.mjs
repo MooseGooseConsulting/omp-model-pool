@@ -226,7 +226,123 @@ describe("mistral-live extension", () => {
     assert.equal(result[0].reasoning, true);
   });
 
-  it("falls back to AbortController when AbortSignal.timeout is unavailable", async () => {
+  it("registered fetchDynamicModels rejects a 200 payload with a valid row followed by a malformed row", async () => {
+    const calls = [];
+    const { pi, registered } = makeHost();
+    mod.default(pi, {
+      env: {},
+      fetch: async (url, init) => {
+        calls.push({ url, init });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: "mistral-fresh-2030",
+                max_context_length: 128000,
+                capabilities: { completion_chat: true },
+              },
+              { name: "row-without-id" },
+            ],
+          }),
+        };
+      },
+    });
+
+    // The valid first row must not be published as a partial roster.
+    await assert.rejects(
+      () => registered[0].config.fetchDynamicModels("sk-live-123"),
+      /malformed model entry/,
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  it("registered fetchDynamicModels rejects invalid JSON and never fetches on a blank credential", async () => {
+    let fetchCount = 0;
+    const { pi, registered } = makeHost();
+    mod.default(pi, {
+      env: {},
+      fetch: async () => {
+        fetchCount += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError(`Unexpected token '<', "<html>..." is not valid JSON`);
+          },
+        };
+      },
+    });
+
+    // Malformed JSON must reject so oh-my-pi keeps its cached catalog.
+    await assert.rejects(
+      () => registered[0].config.fetchDynamicModels("sk-live-123"),
+      SyntaxError,
+    );
+    assert.equal(fetchCount, 1);
+
+    // Blank/missing credentials fail before any network work.
+    await assert.rejects(
+      () => registered[0].config.fetchDynamicModels("   "),
+      /missing Mistral API key/,
+    );
+    await assert.rejects(
+      () => registered[0].config.fetchDynamicModels(undefined),
+      /missing Mistral API key/,
+    );
+    assert.equal(fetchCount, 1);
+  });
+
+  // Fetch double that settles only when its abort signal fires, so a request
+  // that is never aborted fails the test (sentinel rejection) instead of hanging it.
+  function abortWaitingFetch(observed) {
+    return async (_url, init) => {
+      const signal = init?.signal;
+      if (!(signal instanceof AbortSignal)) {
+        throw new Error("mistral-live test: fetch double received no AbortSignal");
+      }
+      observed.push(signal);
+      await new Promise((resolve, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason ?? new Error("mistral-live test: already aborted"));
+          return;
+        }
+        const bail = setTimeout(() => {
+          reject(new Error("mistral-live test: fetch double was never aborted"));
+        }, 2000);
+        bail.unref?.();
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(bail);
+            reject(signal.reason ?? new Error("mistral-live test: aborted without reason"));
+          },
+          { once: true },
+        );
+      });
+    };
+  }
+
+  it("registered fetchDynamicModels rejects when the real AbortSignal.timeout fires mid-request", async () => {
+    const { pi, registered } = makeHost();
+    const observed = [];
+    mod.default(pi, {
+      env: {},
+      timeoutMs: 40,
+      fetch: abortWaitingFetch(observed),
+    });
+
+    await assert.rejects(
+      () => registered[0].config.fetchDynamicModels("sk-live-timeout"),
+      (err) => err?.name === "TimeoutError" || /timed out|aborted/i.test(String(err?.message ?? "")),
+    );
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].aborted, true);
+    assert.equal(observed[0].reason?.name, "TimeoutError");
+  });
+
+  it("falls back to AbortController when AbortSignal.timeout is unavailable and rejects via the fallback timer", async () => {
     const originalTimeout = AbortSignal.timeout;
     Object.defineProperty(AbortSignal, "timeout", {
       value: undefined,
@@ -234,24 +350,21 @@ describe("mistral-live extension", () => {
       writable: true,
     });
     try {
-      let seenSignal;
-      const result = await mod.fetchMistralLiveModels("sk-live-fallback", {
-        timeoutMs: 5000,
-        fetch: async (_url, init) => {
-          seenSignal = init.signal;
-          return {
-            ok: true,
-            status: 200,
-            json: async () => ({
-              data: [{ id: "mistral-small-latest", capabilities: { completion_chat: true } }],
-            }),
-          };
-        },
+      const { pi, registered } = makeHost();
+      const observed = [];
+      mod.default(pi, {
+        env: {},
+        timeoutMs: 40,
+        fetch: abortWaitingFetch(observed),
       });
-      assert.ok(seenSignal instanceof AbortSignal);
-      assert.equal(seenSignal.aborted, false);
-      assert.equal(result.length, 1);
-      assert.equal(result[0].id, "mistral-small-latest");
+
+      await assert.rejects(
+        () => registered[0].config.fetchDynamicModels("sk-live-fallback"),
+        /request timed out/,
+      );
+      assert.equal(observed.length, 1);
+      assert.equal(observed[0].aborted, true);
+      assert.match(String(observed[0].reason?.message ?? ""), /request timed out/);
     } finally {
       Object.defineProperty(AbortSignal, "timeout", {
         value: originalTimeout,

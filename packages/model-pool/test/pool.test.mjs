@@ -38,6 +38,25 @@ function patchRename(impl) {
   };
 }
 
+/** Patch several `node:fs` builtins at once; the returned fn restores them all.
+ *
+ * Each override is installed DIRECTLY as the builtin — never a factory — so an
+ * implementation takes the real call signature and must close over the original
+ * captured before patching. (`patchRename` keeps factory semantics for its
+ * existing callers; the two conventions are never mixed.) */
+function patchNodeFs(overrides) {
+  const originals = {};
+  for (const [name, impl] of Object.entries(overrides)) {
+    originals[name] = nodeFs[name];
+    nodeFs[name] = impl;
+  }
+  syncBuiltinESMExports();
+  return () => {
+    for (const [name, original] of Object.entries(originals)) nodeFs[name] = original;
+    syncBuiltinESMExports();
+  };
+}
+
 function makeHarness() {
   const handlers = {};
   const logs = [];
@@ -216,10 +235,13 @@ describe("per-role round robin", () => {
     const models = makeModels(["p/a", "p/b", "p/c"]);
     const spawn = () => handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
     // A single string would leave a failed call with no pool fallback; the
-    // host treats every returned entry after the first as a retry.
-    assert.deepEqual(spawn().model, ["p/a", "p/b", "p/c"]);
-    assert.deepEqual(spawn().model, ["p/b", "p/c", "p/a"], "the chain rotates with the cursor");
-    assert.deepEqual(spawn().model, ["p/c", "p/a", "p/b"]);
+    // host treats every returned entry after the first as a retry. The
+    // default cap of one additional eligible selector keeps a provider error
+    // on the picked model from retrying it; per-model host retries stay a
+    // separate mechanism.
+    assert.deepEqual(spawn().model, ["p/a", "p/b"]);
+    assert.deepEqual(spawn().model, ["p/b", "p/c"], "the chain rotates with the cursor");
+    assert.deepEqual(spawn().model, ["p/c", "p/a"]);
   });
 
   it("omits unavailable entries and folds duplicates from the failover chain", () => {
@@ -227,7 +249,8 @@ describe("per-role round robin", () => {
     mod.default(pi, { pools: { slow: ["p/a", "p/gone", "p/c", "p/a"] } });
     const models = makeModels(["p/a", "p/c"]);
     // `p/gone` is unauthenticated and `p/a` repeats: retrying either adds a
-    // request that cannot succeed or cannot differ.
+    // request that cannot succeed or cannot differ. The default cap of one
+    // fallback still reaches `p/c` because unavailable entries occupy no slot.
     assert.deepEqual(handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models)).model, ["p/a", "p/c"]);
   });
 
@@ -263,6 +286,124 @@ describe("per-role round robin", () => {
     assert.equal(headOf(handlers.before_subagent_spawn(ev, subCtx(models)).model), "p/a");
     mod.resetCounters(); // restart: in-memory counters are gone
     assert.equal(headOf(handlers.before_subagent_spawn(ev, subCtx(models)).model), "p/a");
+  });
+});
+
+describe("bounded failover chain", () => {
+  const spawnSlow = (handlers, models) =>
+    handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+
+  it("caps the chain at the picked slot plus one additional selector by default", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c", "p/d"] } });
+    const models = makeModels(["p/a", "p/b", "p/c", "p/d"]);
+    const result = spawnSlow(handlers, models);
+    assert.deepEqual(result.model, ["p/a", "p/b"], "one fallback slot by default, not the whole pool");
+    assert.equal(result.note, "pool slow[1/4]: p/a");
+  });
+
+  it("restores the single-model return at 0", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, maxFallbacks: 0 });
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    const first = spawnSlow(handlers, models);
+    assert.equal(first.model, "p/a", "0 restores the single-model return");
+    assert.equal(first.note, "pool slow[1/3]: p/a");
+    // The rotation still advances by exactly one per event.
+    assert.equal(spawnSlow(handlers, models).model, "p/b");
+  });
+
+  it("treats a flat array-valued maxFallbacks as a legacy role, not the option", () => {
+    const { pi, handlers } = makeHarness();
+    // A flat `{maxFallbacks: [...]}` predates the wrapper options: the array
+    // names a role pool (like any other key), while the fallback cap itself
+    // keeps the documented default of one additional selector.
+    mod.default(pi, { maxFallbacks: ["p/a", "p/b"] });
+    assert.deepEqual(Object.keys(mod.getPools()), ["maxFallbacks"]);
+    assert.deepEqual(mod.getPools().maxFallbacks, ["p/a", "p/b"]);
+    const r = handlers.before_subagent_spawn(
+      { type: "before_subagent_spawn", agent: "reviewer", invocationKind: "task", modelRole: "@maxFallbacks", patterns: ["@maxFallbacks"] },
+      subCtx(makeModels(["p/a", "p/b"])),
+    );
+    // Two pool entries, default cap 1: the picked slot plus one fallback.
+    assert.deepEqual(r.model, ["p/a", "p/b"]);
+    assert.equal(r.note, "pool maxFallbacks[1/2]: p/a");
+  });
+
+  it("keeps a flat scalar maxFallbacks an option and preserves the slow single-model return", () => {
+    const { pi, handlers } = makeHarness();
+    // A scalar 0 configures the cap and never becomes a role pool, so the
+    // ordinary slow role keeps its single-model return.
+    mod.default(pi, { maxFallbacks: 0, slow: ["p/a", "p/b"] });
+    assert.deepEqual(Object.keys(mod.getPools()), ["slow"]);
+    const models = makeModels(["p/a", "p/b"]);
+    const first = spawnSlow(handlers, models);
+    assert.equal(first.model, "p/a", "cap 0 keeps the slow role's single-model return");
+    assert.equal(first.note, "pool slow[1/2]: p/a");
+    // The rotation still advances by exactly one per event.
+    assert.equal(spawnSlow(handlers, models).model, "p/b");
+  });
+
+  it("returns the whole eligible rotation at 2", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, maxFallbacks: 2 });
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/a", "p/b", "p/c"]);
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/b", "p/c", "p/a"], "the chain rotates with the cursor");
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/c", "p/a", "p/b"]);
+  });
+
+  it("returns every distinct eligible entry when the cap exceeds the pool", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] }, maxFallbacks: 9 });
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/a", "p/b", "p/c"], "no padding past the pool");
+  });
+
+  it("normalizes invalid caps to the default of 1", () => {
+    const { pi, handlers } = makeHarness();
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    // configurePools alone never delivers the spawn event: register the
+    // harness once, then only reconfigure and restart per value.
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
+    for (const maxFallbacks of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "2", null]) {
+      mod.configurePools({ pools: { slow: ["p/a", "p/b", "p/c"] }, maxFallbacks });
+      mod.resetCounters();
+      assert.deepEqual(
+        spawnSlow(handlers, models).model,
+        ["p/a", "p/b"],
+        `maxFallbacks ${String(maxFallbacks)} must normalize to the default of 1`,
+      );
+    }
+  });
+
+  it("fills fallback slots with eligible entries only", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/gone", "p/c", "p/d"] }, maxFallbacks: 2 });
+    // `p/gone` is unauthenticated and occupies no fallback slot, so the cap
+    // counts eligible selectors only.
+    assert.deepEqual(spawnSlow(handlers, makeModels(["p/a", "p/c", "p/d"])).model, ["p/a", "p/c", "p/d"]);
+  });
+
+  it("folds duplicate selectors without spending fallback budget", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b", "p/a", "p/c"] }, maxFallbacks: 2 });
+    // The repeated `p/a` — including a repeat of the picked slot — adds
+    // nothing, so the budget still reaches `p/c`.
+    assert.deepEqual(spawnSlow(handlers, makeModels(["p/a", "p/b", "p/c"])).model, ["p/a", "p/b", "p/c"]);
+  });
+
+  it("keeps suffixed and routed fallback selectors byte-for-byte", () => {
+    const { pi, handlers } = makeHarness();
+    mod.default(pi, { pools: { slow: ["p/a", "p/b:high", "p/c:low@upstream"] }, maxFallbacks: 2 });
+    const models = makeModels(["p/a", "p/b", "p/c"]);
+    // A suffix is an effort request attached to the entry, not a different
+    // model: the child must receive the raw configured text, byte-for-byte,
+    // because core resolution re-parses each entry itself.
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/a", "p/b:high", "p/c:low@upstream"]);
+    assert.deepEqual(spawnSlow(handlers, models).model, ["p/b:high", "p/c:low@upstream", "p/a"]);
+    // Both routed spellings resolve the underlying registry row.
+    assert.deepEqual(models.resolve("p/c@upstream:low"), { provider: "p", id: "c" });
   });
 });
 
@@ -855,6 +996,11 @@ function deferred() {
   return { promise, resolve: () => release() };
 }
 
+/** Let queued macrotasks run; used to prove a promise stays pending across turns. */
+async function eventLoopTurns(n = 5) {
+  for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
 // ---------------------------------------------------------------------------
 // Main-session acceptance gate (persistCounters + stateFile)
 //
@@ -1012,76 +1158,148 @@ describe("main-session acceptance gate", () => {
   });
 
   it("queues a same-role spawn behind the startup pick and gives it the next slot", async () => {
+    const entered = deferred();
     const gate = deferred();
-    let calls = 0;
-    const harness = makeHarness();
-    harness.pi.setModel = async () => {
-      calls += 1;
-      await gate.promise;
-      return undefined;
-    };
-    mod.default(harness.pi, {
-      pools: { slow: ["p/a", "p/b"] },
-      mainSessionRole: "slow",
-    });
-    const models = makeModels(["p/a", "p/b"]);
-    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
-    const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-    assert.equal(await Promise.race([spawn.then(() => "settled"), Promise.resolve("open")]), "open",
-      "a same-role spawn waits for the startup pick to settle");
-    gate.resolve();
-    await startup;
-    assert.equal(headOf((await spawn).model), "p/b", "the accepted pick consumed slot 0");
-    assert.equal(calls, 1);
+    let setterEntered = 0;
+    try {
+      const harness = makeHarness();
+      harness.pi.setModel = async (model) => {
+        setterEntered += 1;
+        entered.resolve(); // barrier: the test observes only once the pick is in flight
+        await gate.promise;
+        harness.setModels.push(model);
+        return undefined;
+      };
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      await entered.promise;
+      const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(typeof spawn.then, "function", "a same-role spawn queues behind the startup turn");
+      let settled = false;
+      void spawn.then(() => { settled = true; });
+      await eventLoopTurns();
+      assert.equal(settled, false, "the queued spawn stays pending while the startup pick is in flight");
+      assert.deepEqual(mod.getCounters(), {}, "the cursor is unchanged before the pick settles");
+      gate.resolve();
+      await startup;
+      const result = await spawn;
+      assert.deepEqual(result.model, ["p/b", "p/a"], "the accepted pick consumed slot 0, chain complete");
+      assert.equal(result.note, "pool slow[2/2]: p/b");
+      assert.equal(setterEntered, 1, "the queued spawn never calls the setter");
+      assert.deepEqual(mod.getCounters(), { slow: 0 });
+    } finally {
+      // A failed assertion must not leave a gate the suite would wait on.
+      entered.resolve();
+      gate.resolve();
+    }
   });
 
   it("gives a queued same-role spawn the same slot when the startup pick is refused", async () => {
+    const entered = deferred();
     const gate = deferred();
-    const harness = makeHarness();
-    harness.pi.setModel = async () => {
-      await gate.promise;
-      return false;
-    };
-    mod.default(harness.pi, {
-      pools: { slow: ["p/a", "p/b"] },
-      mainSessionRole: "slow",
-    });
-    const models = makeModels(["p/a", "p/b"]);
-    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
-    const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-    gate.resolve();
-    await startup;
-    assert.equal(headOf((await spawn).model), "p/a", "a refusal consumed nothing, so the spawn sees slot 0");
+    try {
+      const harness = makeHarness();
+      harness.pi.setModel = async () => {
+        entered.resolve();
+        await gate.promise;
+        return false;
+      };
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b"]);
+      const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      await entered.promise;
+      const spawn = harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
+      assert.equal(typeof spawn.then, "function", "a same-role spawn queues behind the startup turn");
+      let settled = false;
+      void spawn.then(() => { settled = true; });
+      await eventLoopTurns();
+      assert.equal(settled, false, "the queued spawn stays pending while the startup pick is in flight");
+      assert.deepEqual(mod.getCounters(), {}, "a refusal consumes nothing, so the cursor is unchanged before release");
+      gate.resolve();
+      await startup;
+      const result = await spawn;
+      assert.deepEqual(result.model, ["p/a", "p/b"], "a refusal consumed nothing, so the spawn sees slot 0");
+      assert.equal(result.note, "pool slow[1/2]: p/a");
+      assert.deepEqual(
+        mod.getCounters(),
+        { slow: 1 },
+        "the spawn's pick advanced the cursor; the refused startup consumed no separate slot",
+      );
+    } finally {
+      // A failed assertion must not leave a gate the suite would wait on.
+      entered.resolve();
+      gate.resolve();
+    }
   });
 
   it("does not block a different role while a startup pick is in flight", async () => {
+    const entered = deferred();
     const gate = deferred();
-    const harness = makeHarness();
-    harness.pi.setModel = async () => {
-      await gate.promise;
-      return undefined;
-    };
-    mod.default(harness.pi, {
-      pools: { slow: ["p/a", "p/b"], other: ["p/x"] },
-      mainSessionRole: "slow",
-    });
-    const models = makeModels(["p/a", "p/b", "p/x"]);
-    const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
-    const other = await harness.handlers.before_subagent_spawn(
-      { type: "before_subagent_spawn", agent: "scout", invocationKind: "task", modelRole: "@other", patterns: ["@other"] },
-      subCtx(models),
-    );
-    assert.equal(headOf(other?.model), "p/x", "an unrelated role is not serialized behind another role's turn");
-    gate.resolve();
-    await startup;
+    try {
+      const harness = makeHarness();
+      harness.pi.setModel = async () => {
+        entered.resolve();
+        await gate.promise;
+        return undefined;
+      };
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"], other: ["p/x"] },
+        mainSessionRole: "slow",
+      });
+      const models = makeModels(["p/a", "p/b", "p/x"]);
+      const startup = handleSessionStart(harness, mainCtx(models, [], freshHeader()));
+      await entered.promise;
+      // Inspected WITHOUT await: a plain result object here is the proof that
+      // the unrelated role was not serialized behind another role's turn.
+      const other = harness.handlers.before_subagent_spawn(
+        { type: "before_subagent_spawn", agent: "scout", invocationKind: "task", modelRole: "@other", patterns: ["@other"] },
+        subCtx(models),
+      );
+      assert.notEqual(typeof other.then, "function", "an unrelated role is dispatched synchronously");
+      assert.equal(other.model, "p/x", "the unrelated role's chain is complete, read without await");
+      assert.equal(other.note, "pool other[1/1]: p/x");
+      gate.resolve();
+      await startup;
+    } finally {
+      // A failed assertion must not leave a gate the suite would wait on.
+      entered.resolve();
+      gate.resolve();
+    }
   });
 
   it("applies the model once and mirrors the cursor when the durable write fails", async () => {
     const { dir, file } = tmpStateFile();
-    const restore = patchRename(() => () => {
-      const err = new Error("denied");
-      err.code = "EACCES";
-      throw err;
+    const seeded = `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`;
+    fs.writeFileSync(file, seeded, "utf8");
+    const tmpWrites = [];
+    let attempts = 0;
+    // A nonsharing code (EACCES) is not a sharing violation: it is attempted
+    // exactly once, on the live replacement only, with no retry schedule.
+    // The overrides are installed directly, so they take the builtins' real
+    // signatures and close over the originals captured above the patch.
+    const originalRename = nodeFs.renameSync;
+    const originalWrite = nodeFs.writeFileSync;
+    const restore = patchNodeFs({
+      renameSync: (from, to) => {
+        if (String(to) !== file) return originalRename(from, to);
+        attempts += 1;
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      },
+      writeFileSync: (target, data, options) => {
+        if (String(target).endsWith(".tmp") && String(target).startsWith(dir)) {
+          tmpWrites.push({ path: String(target), exclusive: options === "wx" || options?.flag === "wx" });
+        }
+        return originalWrite(target, data, options);
+      },
     });
     try {
       const harness = makeHarness();
@@ -1093,10 +1311,64 @@ describe("main-session acceptance gate", () => {
       await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
       assert.equal(harness.setModels.length, 1, "the accepted model is applied exactly once");
       assert.deepEqual(mod.getCounters(), { default: 1 }, "the in-memory cursor mirrors the acceptance");
-      assert.equal(fs.existsSync(file), false);
+      assert.equal(attempts, 1, "a nonsharing error is attempted once, on every platform");
+      assert.deepEqual(tmpWrites.map((t) => t.exclusive), [true], "one exclusive temp write");
+      assert.equal(fs.readFileSync(file, "utf8"), seeded, "the seeded live bytes are never replaced or unlinked");
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")),
+        [],
+        "no temp file survives the failure",
+      );
       assert.ok(
         harness.logs.some(([l, m]) => l === "warn" && /(could not be written|in-memory)/.test(m)),
         "the durable failure is reported instead of claimed as a rotation",
+      );
+    } finally {
+      restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the seeded v1 bytes live and publishes the backup when the write fails post-acceptance", async () => {
+    const { dir, file } = tmpStateFile();
+    const v1 = JSON.stringify({ version: 1, counters: { slow: 4 } });
+    fs.writeFileSync(file, v1, "utf8");
+    let attempts = 0;
+    // Only the live replacement is faulted; the backup rename to `.v1.bak` is
+    // a different destination and must go through.
+    const originalRename = nodeFs.renameSync;
+    const restore = patchNodeFs({
+      renameSync: (from, to) => {
+        if (String(to) !== file) return originalRename(from, to);
+        attempts += 1;
+        const err = new Error("denied");
+        err.code = "EACCES";
+        throw err;
+      },
+    });
+    try {
+      const harness = makeHarness();
+      mod.default(harness.pi, {
+        pools: { slow: ["p/a", "p/b"] },
+        persistCounters: true,
+        stateFile: file,
+        mainSessionRole: "slow",
+      });
+      await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.equal(harness.setModels.length, 1, "the host accepted the pick before the write failed");
+      assert.deepEqual(mod.getCounters(), { slow: 1 }, "the in-memory cursor mirrors the acceptance");
+      assert.equal(attempts, 1, "a nonsharing error is attempted once");
+      assert.equal(fs.readFileSync(`${file}.v1.bak`, "utf8"), v1, "the v1 backup holds the seeded bytes");
+      assert.equal(fs.readFileSync(file, "utf8"), v1, "the v1 bytes are still live — copied aside, never moved");
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")),
+        [],
+        "no temp file survives the failure",
+      );
+      assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
+      assert.ok(
+        harness.logs.some(([l, m]) => l === "warn" && m.includes("could not be written")),
+        "the durable failure is reported",
       );
     } finally {
       restore();
@@ -1367,7 +1639,8 @@ describe("main-session acceptance gate", () => {
       // same-role spawn: its persisted attempt also fails and falls back to the
       // in-memory counter, which it advances to 0 and reports b.
       const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-      assert.equal(headOf(spawn?.model), "p/b");
+      assert.deepEqual(spawn?.model, ["p/b", "p/a"], "the spawned chain is complete");
+      assert.equal(spawn?.note, "pool slow[2/2]: p/b");
       // Next startup must follow that shared counter back to a. A private copy
       // of the mirror would still read 1 here and repeat b.
       await handleSessionStart(harness, mainCtx(models, [], freshHeader()));
@@ -1490,7 +1763,8 @@ describe("main-session acceptance gate", () => {
       // succeed, so it must still read the mirror rather than the stale file.
       failing = false;
       const spawn = await harness.handlers.before_subagent_spawn(SLOW_EVENT_FOR_SLOW, subCtx(models));
-      assert.equal(headOf(spawn?.model), "p/b");
+      assert.deepEqual(spawn?.model, ["p/b", "p/a"], "the spawned chain is complete");
+      assert.equal(spawn?.note, "pool slow[2/2]: p/b");
       assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.slow, 0);
       assert.equal(fs.existsSync(`${file}.lock`), false, "the lock is released");
     } finally {
@@ -1608,31 +1882,55 @@ describe("main-session acceptance gate", () => {
       gate.resolve();
       await startup;
       const result = await spawn;
-      assert.equal(headOf(result?.model), "p/b", "the queued spawn still uses the pool it captured");
+      assert.deepEqual(result.model, ["p/b", "p/a"], "the queued spawn still uses the pool it captured");
+      assert.equal(result.note, "pool slow[2/2]: p/b");
       // The startup committed the slot b (cursor 1); the queued spawn then
       // consumed b and wrapped its captured file to 0. Had it followed the
       // rebind, this file would still read 1 and the new file would exist.
       assert.equal(JSON.parse(fs.readFileSync(first.file, "utf8")).counters.slow, 0);
       assert.equal(fs.existsSync(second.file), false, "the rebound state file is not touched by the old pool");
     } finally {
+      gate.resolve();
       fs.rmSync(first.dir, { recursive: true, force: true });
       fs.rmSync(second.dir, { recursive: true, force: true });
     }
   });
 
-  it("retries a transient rename and commits once from the same temp file", async () => {
+  it("retries a transient sharing violation and commits once from the same temp file", async () => {
     const { dir, file } = tmpStateFile();
+    const seeded = `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`;
+    fs.writeFileSync(file, seeded, "utf8");
     const temps = [];
+    const liveReads = [];
+    const tmpWrites = [];
     let attempts = 0;
-    const restore = patchRename((original) => (from, to) => {
-      attempts += 1;
-      temps.push(String(from));
-      if (attempts <= 2) {
-        const err = new Error("sharing violation");
-        err.code = "EPERM";
-        throw err;
-      }
-      return original(from, to);
+    // EBUSY is the other sharing-violation code, and the fault applies only
+    // to the live replacement: nothing else may be retried or touched.
+    const originalRename = nodeFs.renameSync;
+    const originalWrite = nodeFs.writeFileSync;
+    const restore = patchNodeFs({
+      renameSync: (from, to) => {
+        if (String(to) !== file) return originalRename(from, to);
+        attempts += 1;
+        temps.push(String(from));
+        if (attempts <= 2) {
+          try {
+            liveReads.push(fs.readFileSync(file, "utf8"));
+          } catch (err) {
+            liveReads.push(`threw ${err?.code ?? err?.message}`);
+          }
+          const error = new Error("sharing violation");
+          error.code = "EBUSY";
+          throw error;
+        }
+        return originalRename(from, to);
+      },
+      writeFileSync: (target, data, options) => {
+        if (String(target).endsWith(".tmp") && String(target).startsWith(dir)) {
+          tmpWrites.push({ path: String(target), exclusive: options === "wx" || options?.flag === "wx" });
+        }
+        return originalWrite(target, data, options);
+      },
     });
     try {
       const harness = makeHarness();
@@ -1642,31 +1940,65 @@ describe("main-session acceptance gate", () => {
         stateFile: file,
       });
       await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
+      assert.ok(
+        liveReads.length > 0 && liveReads.every((bytes) => bytes === seeded),
+        "the seeded bytes remain readable after each failed attempt",
+      );
+      assert.deepEqual(tmpWrites.map((t) => t.exclusive), [true], "one exclusive temp write, one commit");
       if (process.platform === "win32") {
         assert.equal(attempts, 3, "two transient failures then a commit");
-        assert.equal(new Set(temps).size, 1, "every retry renames the same temp file");
-        assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).counters.default, 1);
+        assert.equal(new Set(temps).size, 1, "every retry renames the same temp file — the temp is never rewritten");
+        assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 2, counters: { default: 1 } });
       } else {
         // The retry is Windows-only by design: elsewhere the first failure is final.
         assert.equal(attempts, 1);
-        assert.deepEqual(mod.getCounters(), { default: 1 });
+        assert.deepEqual(mod.getCounters(), { default: 1 }, "the in-memory cursor mirrors the acceptance");
+        assert.equal(fs.readFileSync(file, "utf8"), seeded, "the live bytes are never replaced or unlinked");
       }
+      assert.deepEqual(
+        fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")),
+        [],
+        "no temp file survives a commit or an exhausted retry",
+      );
+      assert.equal(harness.setModels.length, 1);
     } finally {
       restore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("leaves the live bytes untouched and removes the temp when the rename never succeeds", async () => {
+  it("leaves the live bytes untouched, writes the temp once, and cleans up when the rename never succeeds", async () => {
     const { dir, file } = tmpStateFile();
     const before = `${JSON.stringify({ version: 2, counters: { default: 0 } }, null, 2)}\n`;
-    fs.writeFileSync(file, before);
+    fs.writeFileSync(file, before, "utf8");
+    const temps = [];
+    const liveReads = [];
+    const tmpWrites = [];
     let attempts = 0;
-    const restore = patchRename(() => () => {
-      attempts += 1;
-      const err = new Error("still locked");
-      err.code = "EPERM";
-      throw err;
+    // Only the live replacement is faulted, with EPERM: the other sharing
+    // code (EBUSY) is covered by the retry case above.
+    const originalRename = nodeFs.renameSync;
+    const originalWrite = nodeFs.writeFileSync;
+    const restore = patchNodeFs({
+      renameSync: (from, to) => {
+        if (String(to) !== file) return originalRename(from, to);
+        attempts += 1;
+        temps.push(String(from));
+        try {
+          liveReads.push(fs.readFileSync(file, "utf8"));
+        } catch (err) {
+          liveReads.push(`threw ${err?.code ?? err?.message}`);
+        }
+        const error = new Error("still locked");
+        error.code = "EPERM";
+        throw error;
+      },
+      writeFileSync: (target, data, options) => {
+        if (String(target).endsWith(".tmp") && String(target).startsWith(dir)) {
+          tmpWrites.push({ path: String(target), exclusive: options === "wx" || options?.flag === "wx" });
+        }
+        return originalWrite(target, data, options);
+      },
     });
     try {
       const harness = makeHarness();
@@ -1677,10 +2009,15 @@ describe("main-session acceptance gate", () => {
       });
       await handleSessionStart(harness, mainCtx(makeModels(["p/a", "p/b"]), [], freshHeader()));
       assert.equal(fs.readFileSync(file, "utf8"), before, "the live state file is never replaced or unlinked");
+      assert.ok(
+        liveReads.length > 0 && liveReads.every((bytes) => bytes === before),
+        "the original bytes remain readable after each failed attempt",
+      );
+      assert.deepEqual(tmpWrites, [{ path: temps[0], exclusive: true }], "one exclusive temp write; no retry rewrites it");
       assert.deepEqual(
         fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")),
         [],
-        "the temp file is cleaned up",
+        "the temp file is cleaned up after exhaustion",
       );
       assert.equal(harness.setModels.length, 1);
       if (process.platform === "win32") assert.equal(attempts, 5, "one attempt plus the four bounded retries");

@@ -395,7 +395,7 @@ describe("/model-pool edit", () => {
     assert.deepEqual(counters(), {});
   });
 
-  it("deletes a pool only after confirmation", async () => {
+  it("deletes a pool only after confirmation, returning to a chooser without it", async () => {
     const host = createFakeHost();
     mod.default(host.pi, { pools: { slow: ["p/a"] } });
     host.pushSelect("Delete pool");
@@ -405,6 +405,140 @@ describe("/model-pool edit", () => {
     assert.deepEqual(pools(), {});
     assert.equal(host.calls.confirm.length, 1);
     assert.ok(host.notified.some(([msg]) => msg.includes("runtime-only")));
+    assert.deepEqual(counters(), {});
+    // The next screen is the role chooser, and the deleted role is gone from it.
+    assert.equal(host.calls.select.length, 2, "a successful delete reopens the role chooser");
+    assert.match(host.calls.select[1][0], /Role pools/);
+    // The chooser's options are labelled objects, not sentinel strings.
+    const chooserOptions = host.calls.select[1][1];
+    assert.deepEqual(
+      chooserOptions.map((item) => item?.label ?? item),
+      ["New role…", "Back"],
+      "the chooser offers the editor's built-in actions",
+    );
+    assert.ok(
+      !chooserOptions.some(
+        (item) => `${item?.label ?? ""}${item?.description ?? ""}${item?.value ?? ""}`.includes("@slow"),
+      ),
+      "the chooser offers no deleted role",
+    );
+  });
+
+  it("removes the final slot only after confirmation, returning to a chooser without the role", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    host.pushSelect("Remove entry…");
+    host.pushSelect("1. p/a");
+    host.pushConfirm(true);
+    await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
+
+    assert.deepEqual(pools(), {}, "the last slot's removal deletes the role pool");
+    assert.equal(host.calls.confirm.length, 1, "removing the final slot confirms first");
+    assert.equal(host.calls.select.length, 3, "the editor returns to the role chooser");
+    const [, , chooser] = host.calls.select;
+    assert.ok(
+      !chooser[1].some((item) => `${item?.value ?? ""}${item?.label ?? ""}`.includes("slow")),
+      "the removed role is not offered again",
+    );
+  });
+
+  it("reopens the existing role when the delete confirmation is declined", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    host.pushSelect("Delete pool");
+    host.pushConfirm(false);
+    await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
+
+    assert.deepEqual(pools(), { slow: ["p/a"] }, "a declined confirmation deletes nothing");
+    assert.equal(host.calls.confirm.length, 1);
+    assert.equal(host.notified.length, 1, "no save was attempted, so no outcome is reported");
+    // A declined confirmation reopens the role editor — the third screen the
+    // user sees is the same role's actions — and then the chooser.
+    assert.equal(
+      host.calls.select.length,
+      3,
+      "a declined confirmation reopens the role editor, then the chooser",
+    );
+    assert.match(host.calls.select[1][0], /@slow/);
+    assert.ok(
+      host.calls.select[1][1].some((item) => (item?.label ?? item) === "Delete pool"),
+      "the editor still offers the declined action",
+    );
+    assert.ok(
+      host.calls.select[2][1].some((item) => `${item?.label ?? ""}${item?.value ?? ""}`.includes("@slow")),
+      "the reopened chooser still offers the undeleted role",
+    );
+  });
+
+  it("reopens the existing role when the save fails, reporting the failure", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    host.pushSelect("Delete pool");
+    // A concurrent edit commits while the confirmation dialog is open, so the
+    // editor's captured revision is stale and the save is refused.
+    host.pushConfirm(() => {
+      mod.configurePools({ pools: { slow: ["p/a"] } });
+      return true;
+    });
+    await runCommand(host, "edit slow", host.mainCtx(host.models(["p/a"])));
+
+    assert.deepEqual(pools(), { slow: ["p/a"] }, "a failed save changes nothing");
+    assert.ok(
+      host.notified.some(
+        ([msg, type]) => type === "error" && msg.includes("configuration changed since this edit started"),
+      ),
+      "the failed save is reported",
+    );
+    assert.ok(
+      !host.notified.some(([msg]) => msg.includes("deleted @slow")),
+      "the failure is not reported as a delete",
+    );
+    // A failed save reopens the role editor — the third screen is the same
+    // role's actions — and then the chooser.
+    assert.equal(host.calls.select.length, 3, "a failed save reopens the role editor, then the chooser");
+    assert.match(host.calls.select[1][0], /@slow/);
+    assert.ok(
+      host.calls.select[2][1].some((item) => `${item?.label ?? ""}${item?.value ?? ""}`.includes("@slow")),
+      "the reopened chooser still offers the unsaved role",
+    );
+    assert.ok(
+      host.calls.select[1][1].some((item) => (item?.label ?? item) === "Delete pool"),
+      "the editor still offers its actions after a failed save",
+    );
+  });
+
+  it("shows a fresh summary when Back is followed by reselecting the role after registry changes", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a", "p/b"] } });
+    const models = host.models(["p/a", "p/b"]);
+    // p/b loses authentication while the chooser is open; `list()` is what the
+    // editor's summaries read, so the change is visible to them only.
+    let listed = models.list();
+    models.list = () => listed.map((m) => ({ ...m }));
+
+    // The chooser offers labelled roles and `pickLabeled` looks the answer up
+    // by label, so the queue must return "@slow", not the bare role key.
+    host.pushSelect(() => {
+      listed = listed.filter((m) => m.id !== "b");
+      return "Back";
+    });
+    host.pushSelect("@slow");
+    host.pushSelect("Back");
+    await runCommand(host, "edit slow", host.mainCtx(models));
+
+    const summaries = host.notified.filter(([msg]) => msg.includes("order:"));
+    assert.equal(summaries.length, 2, "re-entering the role announces a fresh summary");
+    assert.match(summaries[0][0], /2\. p\/b \(available\)/, "the first summary saw the old registry");
+    assert.match(summaries[1][0], /1\. p\/a \(available\)/, "the second summary sees the change");
+    assert.match(
+      summaries[1][0],
+      /2\. p\/b \(unavailable: not authenticated \(p\/b is not in the registry list\)\)/,
+      "the second summary is not the stale one",
+    );
+    // Back re-enters the role's editor and only then returns to the chooser.
+    assert.match(host.calls.select[2][0], /@slow/, "the reselected role reopens its editor");
+    assert.equal(host.calls.select[3][0].includes("Role pools"), true, "Back reopens the role chooser");
+    assert.deepEqual(pools(), { slow: ["p/a", "p/b"] });
     assert.deepEqual(counters(), {});
   });
 
@@ -475,191 +609,101 @@ describe("/model-pool status, doctor, help", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Self-contained host: the errors show the shared helper is broken, so these
-// tests build everything inline (per the assignment).
+// `/model-pool doctor`: the registered command's actual output.
+//
+// Every assertion reads what the command reports, never the helper's return
+// value, so a mislabelled reason or a second registry read cannot hide behind
+// it. The file-level hooks isolate the agent dir, clear the pool config and
+// reset the counters, so this suite needs none of its own.
 // ---------------------------------------------------------------------------
-function parseSelector(spec) {
-  const slash = spec.indexOf("/");
-  return slash >= 0
-    ? { provider: spec.slice(0, slash), id: spec.slice(slash + 1) }
-    : { provider: "", id: spec };
-}
+describe("/model-pool doctor (registered command)", () => {
+  it("judges every entry against one snapshot, resolving each entry once", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["@fallback", "p/ghost", "p/idless", "p/unlisted"] } });
+    const models = host
+      .mainCtx(host.models(["p/a", "p/b"], undefined, { fallback: ["p/a", "p/b"] }))
+      .models;
+    const listCalls = [];
+    const resolveCalls = [];
+    const rawList = models.list;
+    const rawResolve = models.resolve;
+    models.list = () => {
+      listCalls.push(1);
+      return rawList();
+    };
+    models.resolve = (spec) => {
+      resolveCalls.push(String(spec));
+      // `p/idless` is an entry the host resolves to a row with no id at all,
+      // and `p/unlisted` one it resolves although it never lists it.
+      if (spec === "p/idless") return { provider: "p", id: "" };
+      if (spec === "p/unlisted") return { provider: "p", id: "unlisted" };
+      return rawResolve(spec);
+    };
 
-function makeInlineHost(available, currentSpec) {
-  const parsed = (available ?? []).map(parseSelector);
-  let current = currentSpec !== undefined && currentSpec !== null ? parseSelector(currentSpec) : undefined;
+    await runCommand(host, "doctor", host.mainCtx(models));
 
-  const models = {
-    list: () => parsed.map((m) => ({ ...m })),
-    current: () => (current ? { ...current } : undefined),
-    resolve: (spec) => find(spec),
-    setCurrent: (spec) => {
-      current = spec === undefined || spec === null ? undefined : find(spec);
-    },
-  };
-
-  function find(spec) {
-    const text = String(spec).trim();
-    if (text.startsWith("@")) return undefined;
-    return (
-      parsed.find((m) => `${m.provider}/${m.id}` === text || m.id === text) ?? undefined
+    assert.equal(listCalls.length, 1, "one registry listing per invocation");
+    assert.deepEqual(
+      resolveCalls,
+      ["@fallback", "p/ghost", "p/idless", "p/unlisted"],
+      "one resolution per configured entry",
     );
-  }
 
-  const calls = { select: [], input: [], confirm: [] };
-  const notified = [];
-  const logs = [];
-  const setModels = [];
-  const queues = { select: [], input: [], confirm: [] };
-
-  const ui = {
-    select: async (title, opts) => {
-      calls.select.push([title, opts]);
-      if (queues.select.length === 0) return undefined;
-      const next = queues.select.shift();
-      return typeof next === "function" ? next(title, opts) : next;
-    },
-    input: async (title, placeholder) => {
-      calls.input.push([title, placeholder]);
-      if (queues.input.length === 0) return undefined;
-      const next = queues.input.shift();
-      return typeof next === "function" ? next(title, placeholder) : next;
-    },
-    confirm: async (title, message) => {
-      calls.confirm.push([title, message]);
-      if (queues.confirm.length === 0) return false;
-      const next = queues.confirm.shift();
-      return typeof next === "function" ? next(title, message) : next;
-    },
-    notify: (message, type) => {
-      notified.push([message, type]);
-    },
-  };
-
-  const pi = {
-    on: (event, handler) => {
-      handlers[event] = handler;
-    },
-    registerCommand: (name, opts) => {
-      command.registered = true;
-      command.name = name;
-      command.options = opts;
-    },
-    setModel: async (model) => {
-      setModels.push(model);
-      return true;
-    },
-    logger: {
-      info: (...args) => logs.push(["info", args.join(" ")]),
-      warn: (...args) => logs.push(["warn", args.join(" ")]),
-      error: (...args) => logs.push(["error", args.join(" ")]),
-      debug: (...args) => logs.push(["debug", args.join(" ")]),
-    },
-  };
-
-  const handlers = {};
-  const command = { registered: false, name: undefined, options: undefined };
-  return { pi, models, ui, calls, notified, logs, setModels, handlers, command, queues };
-}
-
-const savedEnvKeys = [
-  "OMP_MODEL_POOLS_JSON",
-  "OMP_MODEL_POOL_CONFIG",
-  "OMP_MODEL_POOL_STATE",
-  "PI_CODING_AGENT_DIR",
-  "OMP_PROFILE",
-  "PI_PROFILE",
-  "PI_CONFIG_DIR",
-];
-let inlineSavedEnv = {};
-let inlineTmpDirs = [];
-
-describe("doctor diagnosis (inline registries)", () => {
-  // These hooks belong to this block only: file-level hooks would clobber the
-  // shared `tmpDir` and env the earlier command suites depend on.
-  beforeEach(() => {
-    inlineSavedEnv = {};
-    for (const key of savedEnvKeys) {
-      inlineSavedEnv[key] = process.env[key];
-      delete process.env[key];
-    }
-    inlineTmpDirs = [];
-    // Keep the outer suite's `tmpDir` intact: these tests never use it, and the
-    // outer afterEach is the only thing that removes it.
-    inlineTmpDirs.push(fs.mkdtempSync(path.join(os.tmpdir(), "omp-cmd-")));
+    // The actual output: the alias falls back to its first configured entry and
+    // reports that row's identity; unresolved, identity-less and unlisted
+    // entries each say so, and only the registry's own note describes it.
+    const text = host.notified.at(-1)[0];
+    assert.match(text, /registry: registry readable, 2 authenticated model\(s\)/);
+    assert.match(text, /ok: @fallback — authenticated as p\/a\b/);
+    assert.match(text, /unavailable: p\/ghost — unresolved\b/);
+    assert.match(text, /unavailable: p\/idless — resolved without an identity\b/);
+    assert.match(
+      text,
+      /unavailable: p\/unlisted — not authenticated \(p\/unlisted is not in the registry list\)/,
+    );
+    assert.ok(!text.includes("@fallback — not authenticated"), "the fallback entry is never mislabelled");
   });
 
-  afterEach(() => {
-    for (const key of savedEnvKeys) {
-      if (inlineSavedEnv[key] === undefined) delete process.env[key];
-      else process.env[key] = inlineSavedEnv[key];
-    }
-    for (const dir of inlineTmpDirs) fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("judges every entry against one snapshot and reads the registry once", () => {
-    const host = makeInlineHost();
-    mod.default(host.pi, { pools: { slow: ["p/a", "p/b", "p/c"] } });
-    let listCalls = 0;
-    const models = {
-      list: () => {
-        listCalls += 1;
-        return listCalls === 1
-          ? [{ provider: "p", id: "a" }, { provider: "p", id: "b" }, { provider: "p", id: "c" }]
-          : [];
-      },
-      current: () => undefined,
-      resolve: (spec) => (["p/a", "p/b", "p/c"].includes(String(spec)) ? { provider: "p", id: String(spec).slice(2) } : undefined),
+  it("distinguishes an unreadable from an empty registry in its actual output", async () => {
+    const host = createFakeHost();
+    mod.default(host.pi, { pools: { slow: ["p/a"] } });
+    const models = host.mainCtx(host.models(["p/a"])).models;
+    let throwsNow = true;
+    models.list = () => {
+      if (throwsNow) throw new Error("registry down");
+      return [];
     };
-    const report = mod.diagnosePools(models);
-    assert.equal(listCalls, 1, "one registry listing per diagnosePools invocation");
-    const entries = report.roles.find((r) => r.role === "slow").entries;
-    assert.equal(entries.length, 3);
-    for (const entry of entries) {
-      assert.equal(entry.eligible, true, `${entry.selector}: ${entry.reason}`);
-    }
+
+    await runCommand(host, "doctor", host.mainCtx(models));
+    const unreadable = host.notified.at(-1)[0];
+    assert.match(unreadable, /registry: registry read failed: registry down/);
+    assert.match(unreadable, /unavailable: p\/a — registry unreadable/);
+    assert.ok(!unreadable.includes("not authenticated"), "unreadable is never unauthenticated");
+
+    throwsNow = false;
+    await runCommand(host, "doctor", host.mainCtx(models));
+    const empty = host.notified.at(-1)[0];
+    assert.match(empty, /registry: registry readable, no authenticated models/);
+    assert.match(empty, /unavailable: p\/a — not authenticated \(p\/a is not in the registry list\)/);
+    assert.ok(!empty.includes("registry unreadable"), "an empty registry is not unreadable");
   });
 
-  it("labels entries of a throwing registry as unreadable, not unauthenticated", () => {
-    const host = makeInlineHost();
+  it("preserves absent-registry reporting and mutates nothing", async () => {
+    const host = createFakeHost();
     mod.default(host.pi, { pools: { slow: ["p/a"] } });
-    const report = mod.diagnosePools({
-      list: () => {
-        throw new Error("registry down");
-      },
-      current: () => undefined,
-      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
-    });
-    assert.equal(report.registryReadable, false);
-    const entries = report.roles.find((r) => r.role === "slow").entries;
-    assert.equal(entries[0].eligible, false);
-    assert.match(entries[0].reason, /registry unreadable/);
-    assert.ok(!entries[0].reason.includes("not authenticated"));
-  });
+    const beforeCounters = counters();
 
-  it("reports a readable but empty registry as unauthenticated", () => {
-    const host = makeInlineHost();
-    mod.default(host.pi, { pools: { slow: ["p/a"] } });
-    const models = {
-      list: () => [],
-      current: () => undefined,
-      resolve: (spec) => (spec === "p/a" ? { provider: "p", id: "a" } : undefined),
-    };
-    const report = mod.diagnosePools(models);
-    assert.equal(report.registryReadable, true);
-    const entries = report.roles.find((r) => r.role === "slow").entries;
-    assert.equal(entries[0].eligible, false);
-    assert.match(entries[0].reason, /not authenticated/);
-  });
+    await runCommand(host, "doctor", host.mainCtx(undefined));
 
-  it("preserves absent-registry reporting when no registry is passed", () => {
-    const host = makeInlineHost();
-    mod.default(host.pi, { pools: { slow: ["p/a"] } });
-    const report = mod.diagnosePools(undefined);
-    assert.equal(report.registryReadable, false);
-    assert.match(report.registryNote, /unavailable/);
-    const entries = report.roles.find((r) => r.role === "slow").entries;
-    assert.equal(entries[0].eligible, false);
-    assert.match(entries[0].reason, /registry unavailable/);
+    const text = host.notified.at(-1)[0];
+    assert.match(text, /registry: model registry unavailable/);
+    assert.match(text, /unavailable: p\/a — registry unavailable/);
+    assert.ok(!text.includes("not authenticated"));
+    assert.deepEqual(counters(), beforeCounters, "doctor never advances a counter");
+    assert.equal(
+      fs.existsSync(mod.resolveDefaultConfigFilePath()),
+      false,
+      "doctor writes no config file",
+    );
   });
 });

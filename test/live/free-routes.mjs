@@ -1,9 +1,10 @@
 // Free-route verification for the optional internet smoke suite.
 //
 // Contract, in order of importance:
-//   * credentials come from the suite's own resolution — an explicit env var
-//     (CI override) or the suite's Doppler project; they are never printed,
-//     never placed in the sandbox child environment, and never written to disk;
+//   * credentials come only from the invoking environment's explicit vars
+//     (KILO_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY); they are never
+//     printed, never placed in the sandbox child environment, and never
+//     written to disk;
 //   * a route is serviced only when the provider's live catalog proves it
 //     free: an explicit `:free` marker, a zero prompt/completion price (the
 //     live APIs send prices as strings, so a numeric string equal to zero is
@@ -13,9 +14,6 @@
 //     unverifiable route is a skip, a proven-unfree or malformed explicit
 //     route is a failure, and automatic selection below three candidates is
 //     a skip.
-import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
-import path from "node:path";
 /** 15 seconds: provider catalogs are cheap GETs; anything slower is unavailable. */
 export const CATALOG_TIMEOUT_MS = 15_000;
 
@@ -47,20 +45,6 @@ export const PROVIDERS = {
 /** Derive the ordered provider list so selector parsing and iteration can never drift apart. */
 export const PROVIDER_NAMES = Object.keys(PROVIDERS);
 
-/** Where the suite's keys live when the invoking environment provides none. */
-const DOPPLER_DEFAULTS = {
-  project: "ai-automation",
-  config: "dev",
-  secretByKind: {
-    kilo: "KILO_GATEWAY_API",
-    openrouter: "OPENROUTER_API_KEY",
-    mistral: "MISTRAL_API_KEY",
-  },
-};
-
-/** Memoized per kind: one `doppler secrets get` spawn per credential per process. */
-const credentialMemo = new Map();
-
 function envCredentialName(kind) {
   return `${kind.toUpperCase()}_API_KEY`;
 }
@@ -74,66 +58,17 @@ export function envProviderKey(env, kind) {
   return typeof raw === "string" ? raw.trim() : "";
 }
 
-/** Locate `doppler(?.exe)` on the parent PATH; "" when absent. Never a shell. */
-function findDopplerExecutable() {
-  const suffixes = process.platform === "win32" ? [".exe", ""] : [""];
-  const rawPath = process.env.PATH ?? process.env.Path ?? "";
-  for (const dir of rawPath.split(path.delimiter)) {
-    if (dir.length === 0) continue;
-    for (const suffix of suffixes) {
-      const candidate = path.join(dir, `doppler${suffix}`);
-      try {
-        if (statSync(candidate).isFile()) return candidate;
-      } catch {
-        // Not here; keep scanning in PATH order.
-      }
-    }
-  }
-  return "";
-}
-
-/**
- * `doppler secrets get <name> --plain` with shell:false and a 15s cap.
- * The command line carries only the secret NAME. Any failure (unauthenticated,
- * missing binary, timeout) or empty output resolves ""; the caller turns that
- * into a skip. stderr is deliberately dropped — it may echo invocation context.
- */
-function runDopplerSecret(secretName, { project, config, env = process.env }) {
-  const explicit = findDopplerExecutable();
-  const command = explicit.length > 0 ? explicit : "doppler";
-  return new Promise((resolve) => {
-    execFile(
-      command,
-      ["secrets", "get", secretName, "--project", project, "--config", config, "--plain"],
-      { shell: false, timeout: 15_000, windowsHide: true, env },
-      (err, stdout) => {
-        resolve(err === null || err === undefined ? String(stdout).trim() : "");
-      },
-    );
-  });
-}
-
 /**
  * Resolve the suite's credential for `kind` ("kilo" | "openrouter" | "mistral").
  *
- * Order: the invoking environment's explicit var first (a CI override), then
- * the suite's Doppler project/config (`OMP_LIVE_DOPPLER_PROJECT` /
- * `OMP_LIVE_DOPPLER_CONFIG` may repoint the latter). Any failure or empty
- * output yields `undefined`, which every consumer reports as
- * "no credential for <kind>" — a skip, never an error and never a print.
+ * The invoking environment's explicit var (`KILO_API_KEY` …) is the only
+ * source. A missing or empty var yields `undefined`, which every consumer
+ * reports as "no credential for <kind>" — a skip, never an error and never a
+ * print.
  */
 export async function resolveProviderCredential(kind, env = process.env) {
-  if (!Object.hasOwn(DOPPLER_DEFAULTS.secretByKind, kind)) return undefined;
-  if (credentialMemo.has(kind)) return credentialMemo.get(kind);
-  let key = envProviderKey(env, kind);
-  if (key.length === 0) {
-    const project = env.OMP_LIVE_DOPPLER_PROJECT?.trim() || DOPPLER_DEFAULTS.project;
-    const config = env.OMP_LIVE_DOPPLER_CONFIG?.trim() || DOPPLER_DEFAULTS.config;
-    key = await runDopplerSecret(DOPPLER_DEFAULTS.secretByKind[kind], { project, config });
-  }
-  const resolved = key.length > 0 ? key : undefined;
-  credentialMemo.set(kind, resolved);
-  return resolved;
+  const key = envProviderKey(env, kind);
+  return key.length > 0 ? key : undefined;
 }
 
 /** Extra money-bearing pricing fields: when present, they must be zero too. */

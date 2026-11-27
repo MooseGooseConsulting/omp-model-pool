@@ -11,7 +11,8 @@
 //   * Nothing that could identify a credential is recorded or printed: the
 //     Authorization header is only ever compared against the dummy fixture
 //     key, and requests are reduced to routing facts
-//     (`path`, `model`, `reasoningEffort`, `tools`, `hasToolMessage`).
+//     (`path`, `model`, `reasoningEffort`, `tools`, `hasToolMessage`) plus the
+//     response outcome (`outcome`, `status`) — never bodies or headers.
 //   * Proxy-shaped traffic (absolute-form request line, CONNECT) is destroyed
 //     without a response and without dialing out, so a mis-routed ambient
 //     catalog probe from the sandbox cannot open an outbound connection.
@@ -84,8 +85,11 @@ function normalizeEffort(value) {
  * Returns live captures/rejections arrays plus the small control surface the
  * suite needs (roster queue per refresh, delegation script per run, stats,
  * close). The returned `captures` match the capture contract:
- * `{ path, model, reasoningEffort }` plus the two response-shaping facts
- * (`tools`, `hasToolMessage`) the model-match assertions need.
+ * `{ path, model, reasoningEffort, outcome, status }` plus the two
+ * response-shaping facts (`tools`, `hasToolMessage`) the model-match
+ * assertions need. `outcome` is `"ok"` for a served SSE answer and `"error"`
+ * for an injected failure, whose `status` is the status the fixture actually
+ * sent — so a case can count forced failures without parsing rejections.
  */
 export async function startLoopbackFixture({ provider = FIXTURE_PROVIDER, apiKey = FIXTURE_API_KEY, mistralApiKey = MISTRAL_FIXTURE_API_KEY, maxCapturedRequests = 300 } = {}) {
   const state = {
@@ -136,8 +140,10 @@ export async function startLoopbackFixture({ provider = FIXTURE_PROVIDER, apiKey
     },
     /**
      * Fail requests for one model with `status`. `times` defaults to every
-     * attempt; the request is still captured, so a case can prove the host
-     * tried it before falling over to the next pool entry.
+     * attempt; the request is still captured — with `outcome: "error"` and
+     * the forced `status` — so a case can prove the host saw the attempt,
+     * count the injected failures, and prove it moved on to the next pool
+     * entry without ever seeing a credential.
      */
     failModel(model, { status = 500, times = Infinity } = {}) {
       state.failModels.set(model, { status, remaining: times });
@@ -278,28 +284,31 @@ function serveChatCompletion(res, state, body, { provider }) {
   const hasToolMessage =
     Array.isArray(body.messages) &&
     body.messages.some((m) => m !== null && typeof m === "object" && m.role === "tool");
+  state.chatRequests += 1;
+
+  // A failure armed for this model: the request is still captured — with its
+  // injected `outcome`/`status` — so a case can prove the host saw the attempt
+  // and then moved on. Used to exercise the spawn's failover chain with the
+  // real retry machinery.
+  const armed = state.failModels.get(model);
+  const forced = armed !== undefined && armed.remaining > 0;
   state.captures.push({
     path: CHAT_PATH,
     model,
     reasoningEffort: normalizeEffort(body.reasoning_effort),
     tools,
     hasToolMessage,
+    outcome: forced ? "error" : "ok",
+    status: forced ? armed.status : 200,
   });
-  state.chatRequests += 1;
 
-  // A failure armed for this model: the request is already captured, so a case
-  // can prove the host saw the attempt and then moved on. Used to exercise the
-  // spawn's failover chain with the real retry machinery.
-  const armed = state.failModels.get(model);
-  if (armed !== undefined) {
-    if (armed.remaining > 0) {
-      // `Infinity` fails every attempt; a finite count fails exactly that many.
-      if (armed.remaining !== Infinity) armed.remaining -= 1;
-      rejectRequest(res, state, `fixture forced ${armed.status} for ${model}`, armed.status);
-      return;
-    }
-    state.failModels.delete(model);
+  if (forced) {
+    // `Infinity` fails every attempt; a finite count fails exactly that many.
+    if (armed.remaining !== Infinity) armed.remaining -= 1;
+    rejectRequest(res, state, `fixture forced ${armed.status} for ${model}`, armed.status);
+    return;
   }
+  if (armed !== undefined) state.failModels.delete(model);
 
   const chunks = buildChunks(state, model, tools, hasToolMessage);
   state.responseCounter += 1;
