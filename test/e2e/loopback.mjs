@@ -233,7 +233,7 @@ async function serveRequest(req, res, state, { provider, apiKey, mistralApiKey, 
       return;
     }
 
-    serveChatCompletion(res, state, body, { provider });
+    serveChatCompletion(res, state, body, { provider, req });
   } catch {
     // Never leak raw request errors to the suite log; the recorded rejection
     // reason (static text, no bodies) is the audit trail.
@@ -274,7 +274,14 @@ function serveMistralRoster(req, res, state, apiKey) {
   res.end(JSON.stringify(payload));
 }
 
-function serveChatCompletion(res, state, body, { provider }) {
+function redactAuthorization(header) {
+  if (typeof header !== "string") return undefined;
+  const space = header.indexOf(" ");
+  const scheme = space === -1 ? "<redacted>" : header.slice(0, space);
+  return scheme + ":len" + header.length;
+}
+
+function serveChatCompletion(res, state, body, { provider, req }) {
   const model = toFixtureModel(body.model, provider);
   if (model === undefined) {
     rejectRequest(res, state, `fixture received a request for an unknown model (${typeof body.model === "string" ? body.model : "non-string"})`, 400);
@@ -299,6 +306,10 @@ function serveChatCompletion(res, state, body, { provider }) {
     tools,
     hasToolMessage,
     outcome: forced ? "error" : "ok",
+    userAgent: typeof req?.headers?.["user-agent"] === "string" ? req.headers["user-agent"] : undefined,
+    // Never the raw credential: captures get logged and asserted on. Scheme +
+    // length pin the command-credential pipeline without leaking key material.
+    authorization: redactAuthorization(req?.headers?.authorization),
     status: forced ? armed.status : 200,
     // Wall-clock arrival: diagnostics only; assertions stay on shapes.
     at: Date.now(),

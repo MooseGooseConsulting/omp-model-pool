@@ -37,6 +37,60 @@ requests are sent there too. Point it at a Mistral-compatible gateway only when
 that gateway serves both `/v1/models` and `/v1/chat/completions`; a catalog-only
 mirror is not what it does.
 
+## Running on the Mistral Vibe quota
+
+Mistral's plans carry two separate monthly allowances — Vibe and API — and the
+[subscription documentation](https://docs.mistral.ai/admin/billing-usage/subscriptions)
+states that usage through non-Mistral products such as third-party coding
+tools counts toward the **API** allowance. As of 2026-11 that split is not yet
+enforced: keys minted by the Vibe browser sign-in (`vibe --setup`)
+bill against the Vibe allowance no matter which client sends them — verified
+experimentally against `/v1/billing/budget`. Per Mistral's notice, third-party
+harness usage stops drawing on the Vibe allowance on **2026-12-01** and is
+taken from the API allowance instead — when that is exhausted, requests fail
+unless pay-as-you-go credits are enabled. Until then, the
+setup below routes OMP's Mistral traffic to the Vibe allowance; treat it as a
+bridge with that expiry date, and watch `/v1/billing/budget` (or the
+console) if you depend on it.
+
+OMP does not read the Vibe keyring itself, but `models.yml` command-credentials
+bridge it. Drop this resolver next to your config as
+`~/.omp/agent/mistral-keyprint.py`:
+
+```python
+import os
+from vibe.utils.api_keys import resolve_api_key
+# An exported MISTRAL_API_KEY outranks the keyring in vibe's resolution order;
+# force keyring resolution so a stray console key cannot silently win.
+os.environ.pop("MISTRAL_API_KEY", None)
+k = resolve_api_key("MISTRAL_API_KEY")
+if k:
+    print(k)
+```
+
+then point the mistral provider at it (tier 2 in the credential cascade, so it
+outranks any stored `/login` credential — no need to delete old keys). Quote
+both paths; user directories often contain spaces:
+
+```yaml
+providers:
+  mistral:
+    apiKey: "!\"<vibe-venv-python>\" \"<home>/.omp/agent/mistral-keyprint.py\""
+```
+
+with `<vibe-venv-python>` the Python of the uv tool environment that has
+`mistral-vibe` installed (e.g.
+`C:/Users/<you>/AppData/Roaming/uv/tools/mistral-vibe/Scripts/python.exe` on
+Windows, `~/.local/share/uv/tools/mistral-vibe/bin/python` elsewhere).
+
+Two lifecycle caveats. OMP caches a successful command output for the process
+lifetime, so a `vibe` re-login only reaches sessions started (or explicitly
+credential-refreshed) afterwards. And any OMP session already running keeps
+the credential it resolved at startup — restart sessions to move them onto the
+Vibe key. This extension composes as-is: discovery receives the same
+command-resolved key through `fetchDynamicModels`.
+
+
 ## Test
 
 ```bash
