@@ -5,8 +5,9 @@
 // without ever printing a credential.
 //
 // Isolation strategy, and why it is this one:
-//   * `--profile` isolates auth too, which would leave the run with no
-//     credentials at all, so the default profile is used for auth *read-only*.
+//   * a fresh home plus a private agent directory mean the child starts with
+//     no credentials at all: owner auth is never read, inherited, or copied,
+//     and no owner credential state enters the child environment.
 //   * `--session-dir` isolates session storage, so transcripts land in the test
 //     root instead of the owner's sessions tree.
 //   * a unique temp cwd keeps any per-project state in its own bucket.

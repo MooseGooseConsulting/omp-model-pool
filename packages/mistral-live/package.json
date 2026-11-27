@@ -1,0 +1,28 @@
+{
+  "name": "omp-mistral-live",
+  "version": "0.1.0",
+  "description": "Authoritative live Mistral model discovery for oh-my-pi.",
+  "type": "module",
+  "main": "./dist/mistral-live.js",
+  "types": "./dist/mistral-live.d.ts",
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "omp": {
+    "extensions": [
+      "./src/mistral-live.ts"
+    ]
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

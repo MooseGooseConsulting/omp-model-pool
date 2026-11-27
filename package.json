@@ -1,32 +1,18 @@
 {
-  "name": "omp-model-pool",
+  "name": "omp-extensions",
   "version": "0.1.0",
-  "description": "Per-role round-robin model cycling for oh-my-pi subagent spawns (and opt-in main-session rotation).",
+  "private": true,
+  "description": "Two independent oh-my-pi extensions: per-role model rotation and live Mistral discovery.",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist/",
-    "src/",
-    "model-pool.example.json",
-    "README.md"
+  "workspaces": [
+    "packages/*"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run build && node --test \"packages/*/test/*.test.mjs\" \"test/**/*.test.mjs\"",
     "test:e2e": "node test/e2e/run-e2e.mjs",
-    "test:live": "npm run build && node test/live/run-live.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test:live": "npm run build && node test/live/run-live.mjs"
   },
-  "omp": {
-    "extensions": [
-      "./src/index.ts",
-      "./src/mistral-live.ts"
-    ]
-  },
-  "license": "MIT",
-  "devDependencies": {
-    "@types/node": "^26.6.6",
-    "typescript": "^7.0.2"
-  }
+  "license": "MIT"
 }

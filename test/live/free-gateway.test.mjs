@@ -1,8 +1,9 @@
 // Offline proof for the free-gateway relay and the free-route predicates.
 //
-// Runs under plain `node --test test/*.test.mjs` with NO network: the relay's
-// outbound fetch is injected, so every assertion here is local (the only
-// sockets are loopback). These tests guard the safety invariants of the
+// Runs under plain `node --test` (the `test` script globs
+// `packages/*/test/*.test.mjs` and `test/**/*.test.mjs`) with NO network: the
+// relay's outbound fetch is injected, so every assertion here is local (the
+// only sockets are loopback). These tests guard the safety invariants of the
 // optional live suite:
 //   * money: live prices are numeric STRINGS — "0" authorizes, "0.000"
 //     authorizes, "-1", blank, boolean, null, absent, and positive values do

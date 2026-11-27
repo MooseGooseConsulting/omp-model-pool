@@ -22,8 +22,9 @@
 //
 // Anything unproven is reported as skipped with the reason, never as a pass.
 // Secrets, headers, env values, and raw request errors are never printed.
-// Credentials resolve inside this process only (env override, else the suite's
-// Doppler project — see free-routes.mjs) and never reach the sandbox child.
+// Credentials resolve inside this process only — KILO_API_KEY,
+// OPENROUTER_API_KEY, and MISTRAL_API_KEY from the invoking environment — and
+// never reach the sandbox child.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import path from "node:path";
@@ -50,6 +51,8 @@ import {
 } from "./free-gateway.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+/** The pool extension package; the live harness itself stays at the root. */
+const POOL_PACKAGE = path.join(repoRoot, "packages", "model-pool");
 const PROMPT = "Reply with exactly: OK";
 const OMP_RUN_TIMEOUT_MS = 240_000;
 /** Credential env overrides that may exist in the invoking environment, never in the sandbox. */
@@ -124,14 +127,14 @@ function summarize() {
  * reason; a malformed success payload or an empty chat roster is a failure.
  */
 async function checkMistralLive() {
-  // The invoking environment's MISTRAL_API_KEY overrides Doppler; either way
-  // the key never leaves this process except in the outbound bearer header.
+  // The invoking environment's MISTRAL_API_KEY is the only source; the key
+  // never leaves this process except in the outbound bearer header.
   const key = (await resolveProviderCredential("mistral")) ?? "";
   if (key.length === 0) {
     record("mistral live discovery", "skip", "no credential for mistral");
     return;
   }
-  const distFile = path.join(repoRoot, "dist", "mistral-live.js");
+  const distFile = path.join(repoRoot, "packages", "mistral-live", "dist", "mistral-live.js");
   let fetchMistralLiveModels;
   try {
     ({ fetchMistralLiveModels } = await import(pathToFileURL(distFile).href));
@@ -409,7 +412,7 @@ async function main() {
     isolated = createIsolatedEnv(
       {
         poolConfig: { pools: {}, persistCounters: true, enableMainSessionRotation: true, mainSessionRole: "default" },
-        repoRoot,
+        repoRoot: POOL_PACKAGE,
         label: "free-smoke",
       },
     );
@@ -419,10 +422,6 @@ async function main() {
       startedAt: new Date().toISOString(),
       host: { platform: process.platform, node: process.version },
       credentialEnvOverrides: keyPresence,
-      doppler: {
-        project: process.env.OMP_LIVE_DOPPLER_PROJECT?.trim() || "ai-automation",
-        config: process.env.OMP_LIVE_DOPPLER_CONFIG?.trim() || "dev",
-      },
       ompLiveRoutes: (process.env.OMP_LIVE_ROUTES ?? "").trim() || null,
     });
     if (manifestPath === undefined) {
@@ -458,8 +457,8 @@ async function main() {
     );
 
     // Relay up before anything else is generated: models.yml needs the port.
-    // The keys were already proven resolvable by the route verification; the
-    // resolver memoizes, so no second doppler spawn happens.
+    // The keys were already proven resolvable by the route verification;
+    // resolving again re-reads the same invoking-environment variable.
     const providerKeys = {};
     for (const provider of ["kilo", "openrouter"]) {
       if (verifiedTrio.some((route) => route.provider === provider)) {
@@ -557,13 +556,13 @@ async function main() {
         }
       }
     }
-    // Exit status is committed here, not after the try/finally: an early
-    // `return` inside the body (a failed route selection, an unlisted
-    // selector) used to skip the summary and leave a recorded FAIL with exit
-    // code 0.
+    // Exit status is committed here, inside the finally: an early `return`
+    // inside the body (a failed route selection, an unlisted selector) still
+    // runs this block, so the summary is printed and a recorded FAIL cannot
+    // exit 0. Every handle is closed above, so a plain exitCode suffices — no
+    // forced exit that could truncate output or kill a still-draining child.
     summarize();
     process.exitCode = failures === 0 ? 0 : 1;
-    setTimeout(() => process.exit(failures === 0 ? 0 : 1), 250).unref?.();
   }
 }
 

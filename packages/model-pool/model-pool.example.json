@@ -12,5 +12,6 @@
   "mainSessionRole": "default",
   "strict": false,
   "enableMainSessionRotation": true,
-  "persistCounters": false
+  "persistCounters": false,
+  "maxFallbacks": 1
 }

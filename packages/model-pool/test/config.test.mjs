@@ -1,6 +1,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import nodeFs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -8,7 +10,7 @@ import * as path from "node:path";
 const headOf = (model) => (Array.isArray(model) ? model[0] : model);
 
 
-const mod = await import("../../dist/index.js");
+const mod = await import("../dist/index.js");
 
 // Every test isolates itself: a fresh temp dir is the OMP agent dir (so the
 // default config path can never be the real ~/.omp), the pool-config env vars
@@ -505,6 +507,50 @@ describe("automatic save transactions", () => {
     assert.match(outcome.error, /invalid JSON/);
     assert.equal(mod.getConfigRevision(), revision);
     assert.deepEqual(mod.getPools().slow, ["p/a"]);
+  });
+
+  it("F24: a failed file-backed save changes no bytes, pools, provenance or revision", async () => {
+    const file = path.join(freshDir(), "failed-write.json");
+    writeJson(file, { pools: { slow: ["p/a"] }, persistCounters: false, custom: { keep: true } });
+    process.env.OMP_MODEL_POOL_CONFIG = file;
+    const { pi } = makeHarness();
+    mod.default(pi);
+
+    const bytesBefore = fs.readFileSync(file, "utf8");
+    const sourceBefore = mod.getConfigSource();
+    const revision = mod.getConfigRevision();
+    const poolsBefore = { ...mod.getPools() };
+
+    // The write itself fails (a full disk, say). The live file keeps its bytes,
+    // and the exclusive temp file is cleaned up without touching the destination.
+    const originalWrite = nodeFs.writeFileSync;
+    nodeFs.writeFileSync = (...args) => {
+      if (String(args[0] ?? "").endsWith(".tmp")) {
+        const err = new Error("disk full");
+        err.code = "ENOSPC";
+        throw err;
+      }
+      return originalWrite(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      const outcome = await mod.savePoolEdit("slow", ["p/a", "p/b"]);
+      assert.equal(outcome.ok, false);
+      assert.match(outcome.error, /disk full/);
+    } finally {
+      nodeFs.writeFileSync = originalWrite;
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(fs.readFileSync(file, "utf8"), bytesBefore, "the config bytes are unchanged");
+    assert.deepEqual({ ...mod.getPools() }, poolsBefore, "the active pools are unchanged");
+    assert.deepEqual(mod.getConfigSource(), sourceBefore, "the provenance is unchanged");
+    assert.equal(mod.getConfigRevision(), revision, "the expected revision is unchanged");
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith(".tmp")),
+      [],
+      "the refused temp file is cleaned up",
+    );
   });
 
   it("C19: a config path equal to the state path is refused", async () => {

@@ -10,16 +10,21 @@
 // Counters are module-level (`Record<string, number>`) so every session bound
 // in this process shares them; separate OMP processes do not share counters.
 // Parallel spawns advance in handler-execution order (nondeterministic under
-// concurrency). Counters are in-memory only and reset on restart.
+// concurrency). Counters are in-memory unless `persistCounters` is on, and
+// reset on restart.
 //
 // Model validation reuses core resolution: every pool entry goes through
 // `ctx.models.resolve(spec)` and must also appear in `ctx.models.list()`.
 // Unresolvable / unauthenticated entries are filtered; an emptied pool leaves
 // the spawn unmodified (fail open) unless a strict block policy is configured.
 //
-// Returned single `model` replaces the spawn's attempt-ordered patterns while
-// keeping role identity, so core `retry.fallbackChains` / prewalk / advisor
-// semantics are preserved, not replaced.
+// Returned `model` — the picked slot first, then up to `maxFallbacks` further
+// eligible entries in rotation order — replaces the spawn's attempt-ordered
+// patterns while keeping role identity. The extension caps the returned pool
+// slots; OMP resolves and expands those selectors before deciding whether any
+// candidates remain for a child-specific chain or whether the inherited
+// role/default `retry.fallbackChains` applies, so the cap does not by itself
+// pick between the two.
 
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -205,7 +210,14 @@ function resolveExplicitThinking(
     // a row whose id is `model:high`) means the writer did not ask for effort.
     // A name that merely ends in the level word (`p/b-high`) is still an
     // explicit `:high` request, because nobody types that suffix by accident.
-    if (first.identity.endsWith(`:${token}`)) return {};
+    // The colon is what keeps `b-high:high` applying (`b-high` ends in
+    // `-high`, not `:high`), while a prefix token (`b:hi`) resolving to a
+    // literal `b:high` row is suppressed by the canonical-level check.
+    if (
+      first.identity.endsWith(`:${token}`) ||
+      (canonical !== undefined && first.identity.endsWith(`:${canonical}`))
+    )
+      return {};
   }
   if (canonical !== undefined) return { level: canonical };
   if (token === "auto") return { autoExplicit: true };
@@ -294,6 +306,11 @@ export interface ModelPoolConfig {
   persistCounters?: boolean;
   /** State file for `persistCounters`. Default: `OMP_MODEL_POOL_STATE` or `~/.omp/agent/model-pool-state.json`. */
   stateFile?: string;
+  /**
+   * How many additional eligible pool entries may follow the picked slot in a
+   * spawn's fallback chain. Default 1; 0 restores the single-model return.
+   */
+  maxFallbacks?: number;
 }
 
 /** Where the active pool configuration came from. */
@@ -393,6 +410,7 @@ const activeConfig: Required<Omit<ModelPoolConfig, "strict">> & { strict: boolea
   enableMainSessionRotation: true,
   strict: false,
   persistCounters: false,
+  maxFallbacks: 1,
   stateFile: resolveStateFilePath(),
 };
 
@@ -429,6 +447,7 @@ function applyNormalized(normalized: ReturnType<typeof normalizeConfig>): void {
   activeConfig.enableMainSessionRotation = normalized.enableMainSessionRotation;
   activeConfig.strict = normalized.strict;
   activeConfig.persistCounters = normalized.persistCounters;
+  activeConfig.maxFallbacks = normalized.maxFallbacks;
   activeConfig.stateFile = normalized.stateFile;
 }
 
@@ -1101,17 +1120,21 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
   enableMainSessionRotation: boolean;
   strict: boolean | string[];
   persistCounters: boolean;
+  maxFallbacks: number;
   stateFile: string;
 } {
   const pools: Record<string, string[]> = Object.create(null);
   const rawPools: unknown = raw?.pools ?? raw;
   if (rawPools !== null && typeof rawPools === "object" && !Array.isArray(rawPools)) {
     for (const [k, v] of Object.entries(rawPools as Record<string, unknown>)) {
-      // Skip the wrapper-level option keys when a flat config is passed.
+      // Skip wrapper-level option keys when a flat config is passed. An array
+      // `maxFallbacks` is a role pool, not the option; only a non-array value
+      // configures the fallback cap.
       if (
         raw?.pools === undefined &&
         (k === "mainSessionRole" ||
           k === "enableMainSessionRotation" ||
+          (k === "maxFallbacks" && !Array.isArray(v)) ||
           k === "strict" ||
           k === "persistCounters" ||
           k === "stateFile")
@@ -1133,6 +1156,14 @@ function normalizeConfig(raw: ModelPoolConfig | undefined | null): {
     // Opt-in must be exactly boolean true: a stray `"false"` string would be
     // truthy and would silently start writing a shared state file.
     persistCounters: raw?.persistCounters === true,
+    // Only a nonnegative safe integer is a real cap; a string, a negative, a
+    // fraction or NaN falls back to the documented default.
+    maxFallbacks:
+      typeof raw?.maxFallbacks === "number" &&
+      Number.isSafeInteger(raw.maxFallbacks) &&
+      raw.maxFallbacks >= 0
+        ? raw.maxFallbacks
+        : 1,
     stateFile: resolveStateFilePath(raw?.stateFile),
   };
 }
@@ -1294,7 +1325,7 @@ function optionsSignature(normalized: ReturnType<typeof normalizeConfig>): strin
     .map((role) => `${role}=${(normalized.pools[role] ?? []).join(",")}`)
     .join(";");
   const strict = Array.isArray(normalized.strict) ? normalized.strict.join(",") : String(normalized.strict);
-  return `${pools}|${normalized.mainSessionRole}|${normalized.enableMainSessionRotation}|${strict}|${normalized.persistCounters}|${normalized.stateFile}`;
+  return `${pools}|${normalized.mainSessionRole}|${normalized.enableMainSessionRotation}|${strict}|${normalized.maxFallbacks}|${normalized.persistCounters}|${normalized.stateFile}`;
 }
 
 /** Signature that decides whether a re-bind must reload the environment source. */
@@ -1325,6 +1356,7 @@ const RESERVED_FLAT_KEYS = new Set([
   "pools",
   "mainSessionRole",
   "enableMainSessionRotation",
+  "maxFallbacks",
   "strict",
   "persistCounters",
   "stateFile",
@@ -1796,26 +1828,35 @@ function describePick(roleKey: string, picked: string, index: number, total: num
 }
 
 /**
- * The spawn's model chain: the picked slot first, then the rest of the pool in
- * rotation order.
+ * The spawn's model chain: the picked slot first, then at most `maxFallbacks`
+ * further eligible entries in rotation order. The extension caps the returned
+ * pool slots; OMP resolves and expands them before deciding whether any
+ * candidates remain for a child-specific chain or whether the inherited
+ * role/default `retry.fallbackChains` applies — a cap of 0 does not by itself
+ * determine inheritance.
  *
  * `before_subagent_spawn` treats a returned `model` as the child's
- * attempt-ordered list, so a single string leaves a failed call with no pool
- * fallback. Returning the whole eligible rotation means a provider error on the
- * chosen model retries the next pool entry instead of the same one. The counter
- * still advances by exactly one: the event fires once per child.
+ * attempt-ordered list, so a single returned slot leaves a failed call with
+ * only that one candidate after resolution; a larger cap bounds how many
+ * further entries a provider error on the chosen model retries before giving
+ * up. The counter still advances by exactly one: the event fires once per
+ * child.
  *
- * Duplicate selectors are folded to their first occurrence — the rotation keeps
- * them as distinct slots, but retrying an identical model adds nothing.
+ * Duplicate selectors are folded to their first occurrence and unavailable
+ * entries are skipped — neither consumes a fallback slot — while every raw
+ * selector is preserved verbatim for core resolution.
  */
 function fallbackChain(
   pool: readonly string[],
   eligible: readonly boolean[],
   start: number,
+  maxFallbacks: number,
 ): string | string[] {
-  const chain: string[] = [];
-  const seen = new Set<string>();
-  for (let offset = 0; offset < pool.length; offset++) {
+  const picked = pool[start];
+  if (picked === undefined) return "";
+  const chain: string[] = [picked];
+  const seen = new Set<string>([picked]);
+  for (let offset = 1; offset < pool.length && chain.length - 1 < maxFallbacks; offset++) {
     const index = (start + offset) % pool.length;
     if (eligible[index] !== true) continue;
     const selector = pool[index];
@@ -1823,8 +1864,7 @@ function fallbackChain(
     seen.add(selector);
     chain.push(selector);
   }
-  if (chain.length === 0) return pool[start] ?? "";
-  return chain.length === 1 ? (chain[0] as string) : chain;
+  return chain.length === 1 ? picked : chain;
 }
 
 /**
@@ -2016,10 +2056,12 @@ function handleBeforeSubagentSpawn(
       return undefined;
     }
 
-    // Persistence mode and state path belong to the pool captured above. A
-    // factory rebind that lands while this spawn waits in the role queue must
-    // not write the old pool's cursor into the new state file.
+    // Persistence mode, state path and the fallback cap belong to the pool
+    // captured above. A factory rebind that lands while this spawn waits in
+    // the role queue must not write the old pool's cursor into the new state
+    // file, and a queued spawn must not combine an old pool with a new limit.
     const persistAtSpawn = { enabled: activeConfig.persistCounters, stateFile: activeConfig.stateFile };
+    const maxFallbacksAtSpawn = activeConfig.maxFallbacks;
 
     if (persistAtSpawn.enabled) {
       // A persisted pick is one serialized turn: selection, persistence and the
@@ -2031,7 +2073,7 @@ function handleBeforeSubagentSpawn(
           if (pick === undefined) return undefined;
           const note = describePick(roleKey, pick.picked, pick.index, pool.length);
           safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length} persisted=${pick.persisted}`);
-          return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
+          return { model: fallbackChain(pool, availability.eligible, pick.index, maxFallbacksAtSpawn), note } satisfies BeforeSubagentSpawnResult;
         } catch (err) {
           // A rejected async dispatch fails open, like the sync path.
           safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
@@ -2044,7 +2086,7 @@ function handleBeforeSubagentSpawn(
       if (pick === undefined) return undefined;
       const note = describePick(roleKey, pick.picked, pick.index, pool.length);
       safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-      return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
+      return { model: fallbackChain(pool, availability.eligible, pick.index, maxFallbacksAtSpawn), note } satisfies BeforeSubagentSpawnResult;
     }
     return enqueueRoleTurn(roleKey, async () => {
       try {
@@ -2052,7 +2094,7 @@ function handleBeforeSubagentSpawn(
         if (pick === undefined) return undefined;
         const note = describePick(roleKey, pick.picked, pick.index, pool.length);
         safeLog(pi, "info", `[model-pool] role=${roleKey} agent=${event.agent} kind=${event.invocationKind} picked=${pick.picked} index=${pick.index} total=${pool.length}`);
-        return { model: fallbackChain(pool, availability.eligible, pick.index), note } satisfies BeforeSubagentSpawnResult;
+        return { model: fallbackChain(pool, availability.eligible, pick.index, maxFallbacksAtSpawn), note } satisfies BeforeSubagentSpawnResult;
       } catch (err) {
         safeLog(pi, "warn", `[model-pool] handler error; failing open: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
@@ -2878,6 +2920,7 @@ function runStatus(pi: ExtensionApiLike, ctx: ExtensionContextLike): void {
     `strict: ${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(", ") || "none" : String(activeConfig.strict)}`,
   );
   lines.push(`persistence: ${activeConfig.persistCounters ? activeConfig.stateFile : "off (in-memory counters only)"}`);
+  lines.push(`fallbacks: ${activeConfig.maxFallbacks} after the picked slot (0 = single-model return)`);
   lines.push(
     `pools: ${roles.length === 0 ? "none configured" : roles.map((r) => `@${r}[${pools[r]?.length ?? 0}]`).join(", ")}`,
   );
@@ -3043,7 +3086,7 @@ export default function modelPoolExtension(pi: ExtensionApiLike, options?: Model
   safeLog(
     pi,
     "info",
-    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"} source=${configSource.kind}`,
+    `[model-pool] loaded roles=[${roles.join(", ")}] mainRole=${activeConfig.mainSessionRole} mainRotation=${activeConfig.enableMainSessionRotation ? "on" : "off"} strict=${Array.isArray(activeConfig.strict) ? activeConfig.strict.join(",") : String(activeConfig.strict)} persist=${activeConfig.persistCounters ? activeConfig.stateFile : "off"} fallbacks=${activeConfig.maxFallbacks} source=${configSource.kind}`,
   );
 
   // Routing hooks are registered first and independently of the command

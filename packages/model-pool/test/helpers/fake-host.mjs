@@ -20,20 +20,19 @@ function parseSelector(spec) {
 // `provider/id@upstream:high` all mean "set level `level` for `provider/id`".
 function parseEffortSelector(spec) {
   const text = String(spec ?? "").trim();
+  const at = text.indexOf("@");
   const colon = text.indexOf(":");
-  if (colon < 0) return { body: text, upstream: undefined, level: undefined };
-  const at = text.indexOf("@", colon);
-  if (at >= 0) {
-    return {
-      body: text.slice(0, at),
-      upstream: text.slice(at + 1),
-      level: text.slice(colon + 1, at),
-    };
-  }
+  // Each segment spans one delimiter up to the next one behind it; a delimiter
+  // that comes first ends the segment, otherwise it runs to the end.
+  const segment = (start, stop) =>
+    start < 0
+      ? undefined
+      : text.slice(start + 1, stop < 0 ? undefined : stop) || undefined;
+  const head = Math.min(at < 0 ? text.length : at, colon < 0 ? text.length : colon);
   return {
-    body: text.slice(0, colon),
-    upstream: undefined,
-    level: text.slice(colon + 1),
+    body: text.slice(0, head),
+    upstream: segment(at, colon > at ? colon : -1),
+    level: segment(colon, at > colon ? at : -1),
   };
 }
 
@@ -76,7 +75,16 @@ export function makeModels(available, currentSpec, roles = {}) {
   function resolveCanonical(text) {
     const want = String(text ?? "").trim();
     if (!want || want.startsWith("@")) return undefined;
-    return findPlain(want) ?? findPlain(want.replace(/^.*\//, "")) ?? undefined;
+    // Exact literal identities only: the row whose `provider/id` equals the
+    // whole selector, or — when the selector itself is bare — the row whose
+    // bare id equals it. A selector that names a route never falls back to its
+    // tail, so a listed colon-tier id (`p/x:free`) resolves as the whole
+    // literal and its tail is never mistaken for a bare id.
+    return (
+      parsed.find((m) => `${m.provider}/${m.id}` === want) ??
+      (want.includes("/") ? undefined : parsed.find((m) => m.id === want)) ??
+      undefined
+    );
   }
 
   function resolveAlias(base, level) {
@@ -111,12 +119,12 @@ export function makeModels(available, currentSpec, roles = {}) {
       return hit ? { ...hit } : undefined;
     }
 
-    // Concrete or bare id, optionally with an effort suffix. Literal ids win,
-    // and the caller receives exactly the registry row: a real host hands the
-    // extension its own model object, so a double that decorates it with
-    // bookkeeping fields would make "the applied model" a different object
-    // than the one a host stores.
-    return resolveCanonical(body) ?? undefined;
+    // Full literal identities, including colon-tier ids, win before any
+    // effort-suffix parsing: a listed id that carries a colon is the model the
+    // writer pinned, and the caller receives exactly that registry row. Only a
+    // selector with no literal row of its own falls back to its suffix-stripped
+    // body, so `p/x:high` still resolves `p/x` for the effort request.
+    return resolveCanonical(text) ?? resolveCanonical(body) ?? undefined;
   }
 
   if (currentSpec !== undefined && currentSpec !== null) current = find(currentSpec);
