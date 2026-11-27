@@ -37,6 +37,43 @@ requests are sent there too. Point it at a Mistral-compatible gateway only when
 that gateway serves both `/v1/models` and `/v1/chat/completions`; a catalog-only
 mirror is not what it does.
 
+## Running on the Mistral Vibe quota
+
+Mistral bills by the API key, not by client identity: keys minted by the Vibe
+browser sign-in (`vibe --setup` / `vibe /login`) bill against the Vibe Code
+subscription allowance, while keys created in the console bill pay-as-you-go —
+verified experimentally against `/v1/billing/budget` (2026-11). Headers and
+User-Agent make no difference; which key you use is the entire story.
+
+OMP does not read the Vibe keyring itself, but `models.yml` command-credentials
+bridge it. Drop this resolver next to your config as
+`~/.omp/agent/mistral-keyprint.py`:
+
+```python
+from vibe.utils.api_keys import resolve_api_key
+k = resolve_api_key("MISTRAL_API_KEY")
+if k:
+    print(k)
+```
+
+then point the mistral provider at it (tier 2 in the credential cascade, so it
+outranks any stored `/login` credential — no need to delete old keys):
+
+```yaml
+providers:
+  mistral:
+    apiKey: "!<vibe-venv-python> <home>/.omp/agent/mistral-keyprint.py"
+```
+
+with `<vibe-venv-python>` the Python of the uv tool environment that has
+`mistral-vibe` installed (e.g.
+`C:/Users/<you>/AppData/Roaming/uv/tools/mistral-vibe/Scripts/python.exe` on
+Windows, `~/.local/share/uv/tools/mistral-vibe/bin/python` elsewhere). The key
+is re-read at request time, so a `vibe` re-login propagates without touching
+OMP. This extension composes as-is: discovery receives the same
+command-resolved key through `fetchDynamicModels`, and the catalog it returns
+for a Vibe-minted key matches what the subscription entitles.
+
 ## Test
 
 ```bash
