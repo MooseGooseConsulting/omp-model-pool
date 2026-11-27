@@ -42,12 +42,14 @@ mirror is not what it does.
 Mistral's plans carry two separate monthly allowances — Vibe and API — and the
 [subscription documentation](https://docs.mistral.ai/admin/billing-usage/subscriptions)
 states that usage through non-Mistral products such as third-party coding
-tools counts toward the **API** allowance. As of 2026-11 that split is not yet
-enforced client-side: keys minted by the Vibe browser sign-in (`vibe --setup`)
+enforced: keys minted by the Vibe browser sign-in (`vibe --setup`)
 bill against the Vibe allowance no matter which client sends them — verified
-experimentally against `/v1/billing/budget`. Until enforcement begins, the
+experimentally against `/v1/billing/budget`. Per Mistral's notice, third-party
+harness usage stops drawing on the Vibe allowance on **2026-12-01** and is
+taken from the API allowance instead — when that is exhausted, requests fail
+unless pay-as-you-go credits are enabled. Until then, the
 setup below routes OMP's Mistral traffic to the Vibe allowance; treat it as a
-bridge, not a permanent arrangement, and watch `/v1/billing/budget` (or the
+bridge with that expiry date, and watch `/v1/billing/budget` (or the
 console) if you depend on it.
 
 OMP does not read the Vibe keyring itself, but `models.yml` command-credentials
